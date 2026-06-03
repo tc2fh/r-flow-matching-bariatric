@@ -7,7 +7,9 @@
 runs/
 *.pt
 
+# Real database exports
+data/
+
 # R and test caches
 .pytest_cache/
 __pycache__/
-

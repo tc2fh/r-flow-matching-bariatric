@@ -85,6 +85,41 @@ MACE targets are derived from `MACE`, `MACEinterval`, and `ActiveEndInterval`.
 If follow-up has not reached a horizon and no event was observed before that
 horizon, that target is masked during training.
 
+## Cosmos Data
+
+If you already loaded the collaborator's database query into an R data frame
+named `mbs`, you can train directly from that object in an interactive R session:
+
+```r
+source("train_flow_matching.R")
+
+cfg <- default_flow_config(num_steps = 1000, batch_size = 32)
+train_flow_model(cfg, data_frame = mbs, source_label = "Cosmos MBSCohort")
+```
+
+To export a CSV from the loaded `mbs` object and then train from the command
+line:
+
+```r
+source("R/config.R")
+source("R/data.R")
+write_flow_input_csv(mbs, "data/cosmos_mbs_flow_input.csv")
+```
+
+```sh
+Rscript train_flow_matching.R --csv data/cosmos_mbs_flow_input.csv
+```
+
+The helper script `load_cosmos_flow_data.R` also contains a corrected SQL Server
+loader for MBSCohort:
+
+```sh
+Rscript load_cosmos_flow_data.R --output data/cosmos_mbs_flow_input.csv
+```
+
+The `data/` directory is git-ignored because real Cosmos exports may contain
+sensitive records. Do not commit database exports.
+
 ## Tests
 
 After installing `testthat`, run:

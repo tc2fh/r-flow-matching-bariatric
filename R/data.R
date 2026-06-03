@@ -25,6 +25,48 @@ encode_sex_male <- function(sex) {
   out
 }
 
+normalize_column_name <- function(name) {
+  tolower(gsub("[^A-Za-z0-9]", "", name))
+}
+
+find_compatible_column <- function(existing_names, canonical_name) {
+  if (canonical_name %in% existing_names) {
+    return(canonical_name)
+  }
+
+  normalized_existing <- normalize_column_name(existing_names)
+  normalized_canonical <- normalize_column_name(canonical_name)
+
+  exact_case_insensitive <- which(normalized_existing == normalized_canonical)
+  if (length(exact_case_insensitive) > 0) {
+    return(existing_names[exact_case_insensitive[1]])
+  }
+
+  suffixes <- c(
+    ".y",
+    "_y",
+    ".mbs",
+    "_mbs",
+    ".mbscohort",
+    "_mbscohort",
+    ".x",
+    "_x",
+    ".glp1",
+    "_glp1",
+    ".glp1cohort",
+    "_glp1cohort"
+  )
+  for (suffix in suffixes) {
+    normalized_candidate <- normalize_column_name(paste0(canonical_name, suffix))
+    suffix_match <- which(normalized_existing == normalized_candidate)
+    if (length(suffix_match) > 0) {
+      return(existing_names[suffix_match[1]])
+    }
+  }
+
+  NA_character_
+}
+
 required_wide_columns <- function() {
   unique(c(
     "PatKey",
@@ -40,6 +82,21 @@ required_wide_columns <- function() {
     "ActiveEndInterval",
     make_target_metadata()$source_column
   ))
+}
+
+canonicalize_flow_columns <- function(df) {
+  required_cols <- required_wide_columns()
+  original_names <- names(df)
+
+  for (canonical_name in required_cols) {
+    matched_name <- find_compatible_column(original_names, canonical_name)
+    if (!is.na(matched_name) && matched_name != canonical_name) {
+      names(df)[names(df) == matched_name] <- canonical_name
+      original_names[original_names == matched_name] <- canonical_name
+    }
+  }
+
+  df
 }
 
 assert_required_columns <- function(df, required_cols, source_path) {
@@ -119,18 +176,10 @@ make_surgery_one_hot <- function(surgery_type) {
   one_hot
 }
 
-load_flow_dataset <- function(csv_path = default_flow_config()$csv_path) {
+prepare_flow_dataset <- function(df, source_path = "loaded data frame") {
   metadata <- make_target_metadata()
-  if (!file.exists(csv_path)) {
-    stop("CSV not found: ", csv_path, call. = FALSE)
-  }
-  df <- read.csv(
-    csv_path,
-    stringsAsFactors = FALSE,
-    na.strings = c("", "NA", "NaN"),
-    colClasses = c(PatKey = "character", CptCode = "character")
-  )
-  assert_required_columns(df, required_wide_columns(), csv_path)
+  df <- canonicalize_flow_columns(df)
+  assert_required_columns(df, required_wide_columns(), source_path)
 
   df$cpt_code_normalized <- normalize_cpt_code(df$CptCode)
   df$surgery_type <- map_surgery_type(df$cpt_code_normalized)
@@ -175,7 +224,7 @@ load_flow_dataset <- function(csv_path = default_flow_config()$csv_path) {
   surgery_idx <- match(df$surgery_type, SURGERY_LEVELS)
 
   list(
-    source_path = csv_path,
+    source_path = source_path,
     data = df,
     subject_ids = as.character(df$PatKey),
     surgery_type = df$surgery_type,
@@ -187,6 +236,34 @@ load_flow_dataset <- function(csv_path = default_flow_config()$csv_path) {
     mask = targets$mask,
     target_metadata = metadata
   )
+}
+
+load_flow_dataset_from_data_frame <- function(df, source_label = "loaded data frame") {
+  prepare_flow_dataset(df, source_path = source_label)
+}
+
+load_flow_dataset <- function(csv_path = default_flow_config()$csv_path) {
+  if (!file.exists(csv_path)) {
+    stop("CSV not found: ", csv_path, call. = FALSE)
+  }
+  df <- read.csv(
+    csv_path,
+    stringsAsFactors = FALSE,
+    na.strings = c("", "NA", "NaN"),
+    colClasses = "character"
+  )
+  prepare_flow_dataset(df, source_path = csv_path)
+}
+
+write_flow_input_csv <- function(df, output_path) {
+  df <- canonicalize_flow_columns(df)
+  assert_required_columns(df, required_wide_columns(), "loaded data frame")
+  output_dir <- dirname(output_path)
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  }
+  write.csv(df, output_path, row.names = FALSE, na = "")
+  output_path
 }
 
 split_counts <- function(n, train_frac, val_frac) {

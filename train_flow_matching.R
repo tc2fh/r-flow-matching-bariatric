@@ -79,7 +79,7 @@ select_prediction_split <- function(arrays) {
   "train"
 }
 
-train_flow_model <- function(config = default_flow_config()) {
+train_flow_model <- function(config = default_flow_config(), data_frame = NULL, source_label = NULL) {
   validate_flow_config(config)
   set.seed(config$seed)
   torch::torch_manual_seed(config$seed)
@@ -88,8 +88,14 @@ train_flow_model <- function(config = default_flow_config()) {
   run_dir <- make_run_dir(config$output_dir)
   checkpoint_path <- file.path(run_dir, "model_state.pt")
 
-  message("Loading data from ", config$csv_path)
-  dataset <- load_flow_dataset(config$csv_path)
+  if (is.null(data_frame)) {
+    message("Loading data from ", config$csv_path)
+    dataset <- load_flow_dataset(config$csv_path)
+  } else {
+    source_label <- if (is.null(source_label)) "loaded data frame" else source_label
+    message("Loading data from ", source_label)
+    dataset <- load_flow_dataset_from_data_frame(data_frame, source_label = source_label)
+  }
   splits <- make_patient_splits(dataset, config)
   assert_no_patient_leakage(dataset, splits)
   preprocessing <- fit_preprocessing(dataset, splits$train_idx)
@@ -291,5 +297,8 @@ train_flow_model <- function(config = default_flow_config()) {
   ))
 }
 
-config <- parse_cli_args(default_flow_config())
-train_flow_model(config)
+is_direct_script <- any(grepl("train_flow_matching[.]R$", commandArgs(trailingOnly = FALSE)))
+if (is_direct_script) {
+  config <- parse_cli_args(default_flow_config())
+  train_flow_model(config)
+}
