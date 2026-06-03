@@ -35,13 +35,40 @@ detect_project_root <- function() {
 
 PROJECT_ROOT <- detect_project_root()
 
-require_package <- function(package_name, purpose = "this script") {
-  if (!requireNamespace(package_name, quietly = TRUE)) {
-    stop("Package '", package_name, "' is required for ", purpose, ".", call. = FALSE)
+require_torch_for_training <- function() {
+  if (requireNamespace("torch", quietly = TRUE)) {
+    return(invisible(TRUE))
   }
+
+  installed_names <- rownames(utils::installed.packages())
+  torch_like <- installed_names[grepl("torch|reticulate", installed_names, ignore.case = TRUE)]
+  torch_like_msg <- if (length(torch_like) > 0) {
+    paste(torch_like, collapse = ", ")
+  } else {
+    "none found"
+  }
+
+  stop(
+    "The R package 'torch' is required for this R training script, but this R ",
+    "session cannot load it.\n\n",
+    "Important: Cosmos documentation may refer to Python/PyTorch. That is not ",
+    "the same thing as the R package 'torch' checked by requireNamespace('torch').\n\n",
+    "R library paths visible to this session:\n  ",
+    paste(.libPaths(), collapse = "\n  "),
+    "\n\nTorch-like R packages currently installed: ",
+    torch_like_msg,
+    "\n\nIn the Cosmos R console, check with:\n",
+    "  R.version.string\n",
+    "  .libPaths()\n",
+    "  requireNamespace('torch', quietly = TRUE)\n",
+    "  installed.packages()[grep('torch', rownames(installed.packages()), ignore.case = TRUE), ]\n\n",
+    "If Python PyTorch is installed but R torch is not, this script still needs ",
+    "R torch installed or made available on an R library path.",
+    call. = FALSE
+  )
 }
 
-require_package("torch", "training")
+require_torch_for_training()
 
 # ---- Config and schema ----
 
