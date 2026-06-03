@@ -1,0 +1,13 @@
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+
+# Training outputs and model checkpoints
+runs/
+*.pt
+
+# R and test caches
+.pytest_cache/
+__pycache__/
+

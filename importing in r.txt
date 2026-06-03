@@ -1,0 +1,62 @@
+library(DBI)
+library(odbc)
+library(dplyr)
+
+projects <- dbconnect (odbc(), .connection_string =
+    "Driver={ODBC Driver 17 for SQL Server};
+    Server=tcp: PROJECTS;
+    Database=ProjectD332AFD;
+    Trusted_Connection=yes;",
+    timeout = 1000)
+
+getqp <- function(sql, con=projects)
+    dbGetQuery(statement = sql, conn = con)
+
+glp1 <- getqp("SELECT * FROM GLP1Cohort WHERE Sex NOT IN (N'#Masked' , N'*Unspecified' ,N'Unknown', N'other')
+                                             AND CoverageClass NOT IN (N'*Not Applicable', N'*Unspecified')
+                                             AND BMIatEvent < WeightAtEvent
+                                             AND BMIatEvent BETWEEN 35 AND 75
+                                             AND (eGFRatEvent IS NULL OR eGFRatEvent >= 20)
+                                             AND PMH_dialysis_transplant = 0
+                                             AND (NephropathyInterval IS NULL OR NephropathyInterval >= 0)
+                                             AND GLP1Name IN (N'semaglutide', N'tirzepatide', N'dulaglutide', N'liraglutide', N'exenatide microspheres')
+                                             AND PMH_PriorMBS = 0
+                                             AND MBSduringGLP1 = 0
+                                             AND PMH_DM2 = 1
+                                             AND PMH_retinopathy = 0
+                                             AND ActiveEndInterval >= 700
+                                             AND GLP1StartDate <= '2023-05-01'")
+
+mbs <- getqp("SELECT * FROM MBSCohort WHERE Sex NOT IN (N'#Masked' , N' *Unspecified' ,N'Unknown' , N'other')
+                                           AND CoverageClass NOT IN (N'*Not Applicable', N'*Unspecified')
+                                           AND BMIatEvent < WeightAtEvent
+                                           AND BMIatEvent BETWEEN 35 AND 75
+                                           AND (eGFRatEvent IS NULL OR eGFRatEvent >= 20)
+                                           AND PMH_dialysis_transplant = 0
+                                           AND (NephropathyInterval IS NULL OR NephropathyInterval >= 0)
+                                           AND PMH_PriorMBS = 0
+                                           AND PriorGLP1 = 0
+                                           AND PMH_DM2 = 1
+                                           AND PMH_retinopathy = 0
+                                           AND ActiveEndInterval >= 700
+                                           AND ProcDatevalue <= '2023-05-01'")
+
+dbDisconnect (projects)
+
+merged <- full_join(glp1, mbs,
+                    by = c("Patkey", "AgeAtEvent", "sex", "Coverageclass", "PriorGLP1",
+                            "FirstRace", "SecondRace", "MultiRacial", "PreferredLanguage",
+                            "StateorProvince", "RUCA", "svioverall", "SviHousehold", "sviTransportation",
+                            "sviMinority", "SvisES", "PMH_DM2", "PMH_hypertension", "PMH_OSA",
+                            "PMH_retinopathy", "PMH_dyslipidemia", "PMH_VTE", "PMH_MI", "PMH_stroke",
+                            "PMH_dialysis_transplant", "Insulinstatus", "BiguanideStatus", "SGLT25tatus",
+                            "BMIatEvent", "BMI3mPostEvent", "BMI6mPostEvent", "BMI9mPostEvent", "BMI12mPostEvent",
+                            "BMI2yPostEvent", "BMI3yPostEvent", "BMI4yPostEvent", "BMI5yPostEvent", "BMI6yPostEvent",
+                            "WeightAtEvent", "Weight3mPostEvent", "Weight6mPostEvent", "Weight9mPostEvent", "Weight12mPostEvent",
+                            "Weight2yPostEvent", "Weight3yPostEvent", "Weight4yPostEvent", "Weight5yPostEvent", "Weight6yPostEvent",
+                            "HbA1cAtEvent", "HbA1c12mPostEvent", "HbA1c2yPostEvent", "HbA1c3yPostEvent", "HbA1c4yPostEvent",
+                            "HbA1c5yPostEvent", "HbA1c6yPostEvent", "CreatinineAtEvent",
+                            "eGFRatEvent", "Nephropathy", "NephropathyInterval", "KidneyFailureInterval",
+                            "DialysisInterval", "TransplantInterval", "Retinopathy", "RetinopathyInterval",
+                            "Deceased", "DeathInterval", "CVdeath", "MACE", "MACEtype", "MACEdate",
+                            "MACEinterval", "ActiveEndInterval"))
