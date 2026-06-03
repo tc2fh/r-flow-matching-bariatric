@@ -35,12 +35,12 @@ HBA1C_TARGETS <- data.frame(
   stringsAsFactors = FALSE
 )
 
-MACE_TARGETS <- data.frame(
-  group = "mace",
-  horizon_label = c("1y", "3y", "5y"),
-  horizon_months = c(12, 36, 60),
-  horizon_days = c(365, 1095, 1825),
-  source_column = "MACEinterval",
+EVENT_TARGETS <- data.frame(
+  group = c("retinopathy", "nephropathy", "mace"),
+  horizon_label = "ever",
+  horizon_months = NA_integer_,
+  horizon_days = NA_integer_,
+  source_column = c("Retinopathy", "Nephropathy", "MACE"),
   stringsAsFactors = FALSE
 )
 
@@ -64,7 +64,7 @@ SURGERY_LEVELS <- c("sleeve", "rnygb")
 SURGERY_CPT_MAP <- c("43775" = "sleeve", "43644" = "rnygb", "43846" = "rnygb")
 
 make_target_metadata <- function() {
-  metadata <- rbind(BMI_TARGETS, HBA1C_TARGETS, MACE_TARGETS)
+  metadata <- rbind(BMI_TARGETS, HBA1C_TARGETS, EVENT_TARGETS)
   metadata$dim <- seq_len(nrow(metadata))
   metadata$name <- paste(metadata$group, metadata$horizon_label, sep = "_")
   metadata <- metadata[

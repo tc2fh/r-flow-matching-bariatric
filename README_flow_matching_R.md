@@ -8,7 +8,7 @@ The model predicts an 18-dimensional flattened target vector:
 
 - BMI at 3m, 6m, 9m, 12m, 2y, 3y, 4y, 5y, 6y
 - HbA1c at 12m, 2y, 3y, 4y, 5y, 6y
-- cumulative MACE any-event indicators by 1y, 3y, 5y
+- binary occurrence indicators for retinopathy, nephropathy, and MACE
 
 ## Dependencies
 
@@ -81,16 +81,36 @@ Conditioning fields are:
 - `BMIatEvent`
 - `InsulinStatus`
 
-MACE targets are derived from `MACE`, `MACEinterval`, and `ActiveEndInterval`.
-If follow-up has not reached a horizon and no event was observed before that
-horizon, that target is masked during training.
+Retinopathy, nephropathy, and MACE targets are read directly from
+`Retinopathy`, `Nephropathy`, and `MACE`. Values coded as `1` are treated as an
+event; values coded as `0` or missing are treated as no event. These event
+targets are therefore always included in the training mask.
 
 ## Cosmos Data
 
-If you already loaded the collaborator's database query into an R data frame
-named `mbs`, you can train directly from that object in an interactive R session:
+`train_flow_matching.R` is monolithic: it contains the full data preparation,
+model definition, training loop, sampler, and model-saving pipeline. If the
+collaborator's database query creates an R data frame named `mbs`, add this to
+the end of the data loading script:
 
 ```r
+flow_config_overrides <- list(
+  num_steps = 1000,
+  batch_size = 32,
+  output_dir = "runs/cosmos_flow_matching"
+)
+
+source("train_flow_matching.R")
+```
+
+When sourced, the script looks for a loaded data frame named `mbs`, `mbscoh`,
+`mbs_cohort`, `cosmos_mbs`, or `merged`. It trains automatically from the first
+one it finds and saves run artifacts under `output_dir`.
+
+You can still call the training function manually after sourcing:
+
+```r
+flow_auto_run <- FALSE
 source("train_flow_matching.R")
 
 cfg <- default_flow_config(num_steps = 1000, batch_size = 32)
@@ -101,8 +121,7 @@ To export a CSV from the loaded `mbs` object and then train from the command
 line:
 
 ```r
-source("R/config.R")
-source("R/data.R")
+source("train_flow_matching.R")
 write_flow_input_csv(mbs, "data/cosmos_mbs_flow_input.csv")
 ```
 

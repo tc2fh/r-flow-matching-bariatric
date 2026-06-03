@@ -77,9 +77,6 @@ required_wide_columns <- function() {
     "HbA1cAtEvent",
     "BMIatEvent",
     "InsulinStatus",
-    "MACE",
-    "MACEinterval",
-    "ActiveEndInterval",
     make_target_metadata()$source_column
   ))
 }
@@ -112,22 +109,13 @@ assert_required_columns <- function(df, required_cols, source_path) {
   }
 }
 
-derive_mace_by_horizon <- function(mace, mace_interval, active_end_interval, horizon_days) {
-  mace <- suppressWarnings(as.numeric(mace))
-  mace_interval <- suppressWarnings(as.numeric(mace_interval))
-  active_end_interval <- suppressWarnings(as.numeric(active_end_interval))
+is_binary_event_target <- function(group) {
+  group %in% c("retinopathy", "nephropathy", "mace")
+}
 
-  value <- rep(NA_real_, length(mace))
-  event_with_time <- !is.na(mace) & mace == 1 & !is.na(mace_interval)
-
-  value[event_with_time & mace_interval <= horizon_days] <- 1
-  value[event_with_time & mace_interval > horizon_days] <- 0
-
-  observed_to_horizon <- !is.na(active_end_interval) & active_end_interval >= horizon_days
-  no_observed_event_by_horizon <- is.na(value) & observed_to_horizon & (is.na(mace) | mace != 1)
-  value[no_observed_event_by_horizon] <- 0
-
-  value
+binary_event_from_column <- function(x) {
+  value <- suppressWarnings(as.numeric(x))
+  as.numeric(!is.na(value) & value == 1)
 }
 
 build_target_matrix <- function(df, metadata = make_target_metadata()) {
@@ -137,17 +125,13 @@ build_target_matrix <- function(df, metadata = make_target_metadata()) {
   colnames(mask) <- paste0(metadata$name, "_observed")
 
   for (i in seq_len(nrow(metadata))) {
-    if (metadata$group[i] == "mace") {
-      value <- derive_mace_by_horizon(
-        df$MACE,
-        df$MACEinterval,
-        df$ActiveEndInterval,
-        metadata$horizon_days[i]
-      )
+    if (is_binary_event_target(metadata$group[i])) {
+      value <- binary_event_from_column(df[[metadata$source_column[i]]])
+      observed <- rep(TRUE, length(value))
     } else {
       value <- suppressWarnings(as.numeric(df[[metadata$source_column[i]]]))
+      observed <- !is.na(value)
     }
-    observed <- !is.na(value)
     x[observed, i] <- value[observed]
     mask[observed, i] <- 1
   }

@@ -61,11 +61,12 @@ summarize_samples <- function(samples_original, metadata) {
   p10_flat <- apply(samples_original, c(1, 3), stats::quantile, probs = 0.10)
   p90_flat <- apply(samples_original, c(1, 3), stats::quantile, probs = 0.90)
 
+  event_dims <- metadata$dim[metadata$group %in% c("retinopathy", "nephropathy", "mace")]
   mace_dims <- metadata$dim[metadata$group == "mace"]
-  if (length(mace_dims) > 0) {
-    mean_flat[, mace_dims] <- clip01(mean_flat[, mace_dims])
-    p10_flat[, mace_dims] <- clip01(p10_flat[, mace_dims])
-    p90_flat[, mace_dims] <- clip01(p90_flat[, mace_dims])
+  if (length(event_dims) > 0) {
+    mean_flat[, event_dims] <- clip01(mean_flat[, event_dims])
+    p10_flat[, event_dims] <- clip01(p10_flat[, event_dims])
+    p90_flat[, event_dims] <- clip01(p90_flat[, event_dims])
   }
 
   list(
@@ -74,6 +75,8 @@ summarize_samples <- function(samples_original, metadata) {
     p90_flat = p90_flat,
     bmi = mean_flat[, metadata$dim[metadata$group == "bmi"], drop = FALSE],
     hba1c = mean_flat[, metadata$dim[metadata$group == "hba1c"], drop = FALSE],
+    event_probability = mean_flat[, event_dims, drop = FALSE],
+    event_class = 1 * (mean_flat[, event_dims, drop = FALSE] >= 0.5),
     mace_probability = mean_flat[, mace_dims, drop = FALSE],
     mace_class = 1 * (mean_flat[, mace_dims, drop = FALSE] >= 0.5)
   )
