@@ -23,7 +23,7 @@ from dataclasses import fields
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 import warnings
 
 os.environ.setdefault("MPLCONFIGDIR", "/private/tmp/matplotlib")
@@ -36,10 +36,32 @@ import torch
 
 import train_flow_matching as fm
 
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - keeps Cosmos execution portable if tqdm is absent.
+    tqdm = None
+
 
 N_SHOW_PER_PROCEDURE = 3
 MAX_SAMPLE_LINES = 50
 INDEX_TO_SURGERY = {idx: name for name, idx in fm.SURGERY_TO_INDEX.items()}
+
+
+class NullProgress:
+    def update(self, n: int = 1) -> None:
+        return None
+
+    def __enter__(self) -> "NullProgress":
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        return None
+
+
+def progress_bar(total: int, desc: str, unit: str, disabled: bool):
+    if disabled or tqdm is None:
+        return NullProgress()
+    return tqdm(total=total, desc=desc, unit=unit, dynamic_ncols=True)
 
 
 def find_latest_run(log_dir: Path) -> Path | None:
@@ -200,6 +222,7 @@ def sample_with_surgery(
     initial_noise: torch.Tensor,
     n_steps: int,
     device: torch.device,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> np.ndarray:
     n_patients, n_samples, x_dim = initial_noise.shape
     total = n_patients * n_samples
@@ -215,6 +238,8 @@ def sample_with_surgery(
         for step in range(n_steps):
             t = torch.full((total,), step * dt, dtype=torch.float32, device=device)
             x = x + dt * model(x, t, surgery, features)
+            if progress_callback is not None:
+                progress_callback(1)
     return x.detach().cpu().numpy().reshape(n_patients, n_samples, x_dim)
 
 
@@ -228,6 +253,7 @@ def sample_factual_counterfactual(
     x_dim: int,
     seed: int,
     device: torch.device,
+    show_progress: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
     patient_features = fm.transform_patient_features(
         dataset.patient_features_raw[patient_idx],
@@ -245,22 +271,30 @@ def sample_factual_counterfactual(
         device=device,
     )
 
-    factual_std = sample_with_surgery(
-        model=model,
-        surgery_idx=actual,
-        patient_features=patient_features,
-        initial_noise=initial_noise,
-        n_steps=n_steps,
-        device=device,
-    )
-    counterfactual_std = sample_with_surgery(
-        model=model,
-        surgery_idx=counterfactual,
-        patient_features=patient_features,
-        initial_noise=initial_noise,
-        n_steps=n_steps,
-        device=device,
-    )
+    with progress_bar(
+        total=2 * n_steps,
+        desc="Sampling selected factual/counterfactual plots",
+        unit="step",
+        disabled=not show_progress,
+    ) as pbar:
+        factual_std = sample_with_surgery(
+            model=model,
+            surgery_idx=actual,
+            patient_features=patient_features,
+            initial_noise=initial_noise,
+            n_steps=n_steps,
+            device=device,
+            progress_callback=pbar.update,
+        )
+        counterfactual_std = sample_with_surgery(
+            model=model,
+            surgery_idx=counterfactual,
+            patient_features=patient_features,
+            initial_noise=initial_noise,
+            n_steps=n_steps,
+            device=device,
+            progress_callback=pbar.update,
+        )
     return (
         fm.unstandardize(factual_std, preprocessing).astype(np.float32),
         fm.unstandardize(counterfactual_std, preprocessing).astype(np.float32),
@@ -278,6 +312,7 @@ def sample_factual_point_predictions(
     seed: int,
     device: torch.device,
     batch_size: int,
+    show_progress: bool,
 ) -> np.ndarray:
     """Return median factual predictions for patients under their observed procedure."""
     if batch_size < 1:
@@ -287,28 +322,37 @@ def sample_factual_point_predictions(
     if device.type == "cuda":
         torch.cuda.manual_seed_all(seed)
 
-    for start in range(0, len(patient_idx), batch_size):
-        end = min(start + batch_size, len(patient_idx))
-        batch_idx = patient_idx[start:end]
-        patient_features = fm.transform_patient_features(
-            dataset.patient_features_raw[batch_idx],
-            preprocessing,
-        )
-        initial_noise = torch.randn(
-            (len(batch_idx), n_samples, x_dim),
-            dtype=torch.float32,
-            device=device,
-        )
-        samples_std = sample_with_surgery(
-            model=model,
-            surgery_idx=dataset.surgery_idx[batch_idx].astype(np.int64),
-            patient_features=patient_features,
-            initial_noise=initial_noise,
-            n_steps=n_steps,
-            device=device,
-        )
-        samples_original = fm.unstandardize(samples_std, preprocessing).astype(np.float32)
-        point_predictions[start:end] = np.median(samples_original, axis=1)
+    batch_starts = range(0, len(patient_idx), batch_size)
+    n_batches = len(range(0, len(patient_idx), batch_size))
+    with progress_bar(
+        total=n_batches * n_steps,
+        desc=f"Sampling test metrics ({len(patient_idx)} patients)",
+        unit="step",
+        disabled=not show_progress,
+    ) as pbar:
+        for start in batch_starts:
+            end = min(start + batch_size, len(patient_idx))
+            batch_idx = patient_idx[start:end]
+            patient_features = fm.transform_patient_features(
+                dataset.patient_features_raw[batch_idx],
+                preprocessing,
+            )
+            initial_noise = torch.randn(
+                (len(batch_idx), n_samples, x_dim),
+                dtype=torch.float32,
+                device=device,
+            )
+            samples_std = sample_with_surgery(
+                model=model,
+                surgery_idx=dataset.surgery_idx[batch_idx].astype(np.int64),
+                patient_features=patient_features,
+                initial_noise=initial_noise,
+                n_steps=n_steps,
+                device=device,
+                progress_callback=pbar.update,
+            )
+            samples_original = fm.unstandardize(samples_std, preprocessing).astype(np.float32)
+            point_predictions[start:end] = np.median(samples_original, axis=1)
 
     return point_predictions
 
@@ -520,6 +564,7 @@ def evaluate_run(
     max_sample_lines: int,
     metric_batch_size: int,
     device_name: str,
+    show_progress: bool,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
     output_dir = run_dir if output_dir is None else Path(output_dir)
@@ -562,6 +607,7 @@ def evaluate_run(
         x_dim=x_dim,
         seed=seed,
         device=device,
+        show_progress=show_progress,
     )
 
     selected_path = output_dir / "eval_selected_test_patients.csv"
@@ -582,6 +628,7 @@ def evaluate_run(
         seed=seed + 1,
         device=device,
         batch_size=metric_batch_size,
+        show_progress=show_progress,
     )
     timepoint_metrics = timepoint_metric_table(dataset, test_idx, test_point_predictions)
     timepoint_metrics.to_csv(metrics_path, index=False)
@@ -667,6 +714,7 @@ def main() -> None:
     parser.add_argument("--max-sample-lines", type=int, default=MAX_SAMPLE_LINES)
     parser.add_argument("--metric-batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>.")
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     args = parser.parse_args()
     if args.n_samples < 1:
         raise SystemExit("--n-samples must be at least 1.")
@@ -674,6 +722,9 @@ def main() -> None:
         raise SystemExit("--n-steps must be at least 1.")
     if args.metric_batch_size < 1:
         raise SystemExit("--metric-batch-size must be at least 1.")
+    show_progress = not args.no_progress
+    if show_progress and tqdm is None:
+        warnings.warn("tqdm is not installed; progress bars are disabled.", stacklevel=2)
 
     run_dir = resolve_run_dir(args.run, args.log_dir)
     summary = evaluate_run(
@@ -687,6 +738,7 @@ def main() -> None:
         max_sample_lines=args.max_sample_lines,
         metric_batch_size=args.metric_batch_size,
         device_name=args.device,
+        show_progress=show_progress,
     )
 
     print(f"Run: {summary['run_dir']}")
