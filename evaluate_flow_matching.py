@@ -280,6 +280,7 @@ def plot_timecourse_factual_counterfactual(
     output_path: Path,
     title: str,
     max_sample_lines: int,
+    y_limits: tuple[float, float] | None = None,
 ) -> None:
     dims, months = target_dims(dataset, group)
     n_rows = len(patient_idx)
@@ -311,6 +312,8 @@ def plot_timecourse_factual_counterfactual(
         ax.set_title(panel_title)
         ax.set_xlabel("Months post-op")
         ax.set_ylabel(y_label)
+        if y_limits is not None:
+            ax.set_ylim(*y_limits)
         ax.grid(alpha=0.25)
 
     for row, global_idx in enumerate(patient_idx):
@@ -492,6 +495,7 @@ def evaluate_run(
             f"({n_show_per_procedure} sleeve, {n_show_per_procedure} RNYGB)"
         ),
         max_sample_lines=max_sample_lines,
+        y_limits=(15, 90.0),
     )
     plot_timecourse_factual_counterfactual(
         dataset=dataset,
