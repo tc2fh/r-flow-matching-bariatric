@@ -9,6 +9,7 @@ For a CSV export, pass:
 
 Outputs in the run directory by default:
     eval_selected_test_patients.csv
+    eval_timepoint_metrics_test.csv
     eval_bmi_factual_counterfactual_examples_test.png
     eval_hba1c_factual_counterfactual_examples_test.png
     eval_mace_factual_counterfactual_histograms_test.png
@@ -266,6 +267,92 @@ def sample_factual_counterfactual(
     )
 
 
+def sample_factual_point_predictions(
+    model: fm.VectorFieldNet,
+    dataset: fm.FlowDataset,
+    patient_idx: np.ndarray,
+    preprocessing: fm.Preprocessing,
+    n_samples: int,
+    n_steps: int,
+    x_dim: int,
+    seed: int,
+    device: torch.device,
+    batch_size: int,
+) -> np.ndarray:
+    """Return median factual predictions for patients under their observed procedure."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
+    point_predictions = np.zeros((len(patient_idx), x_dim), dtype=np.float32)
+    torch.manual_seed(seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(seed)
+
+    for start in range(0, len(patient_idx), batch_size):
+        end = min(start + batch_size, len(patient_idx))
+        batch_idx = patient_idx[start:end]
+        patient_features = fm.transform_patient_features(
+            dataset.patient_features_raw[batch_idx],
+            preprocessing,
+        )
+        initial_noise = torch.randn(
+            (len(batch_idx), n_samples, x_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        samples_std = sample_with_surgery(
+            model=model,
+            surgery_idx=dataset.surgery_idx[batch_idx].astype(np.int64),
+            patient_features=patient_features,
+            initial_noise=initial_noise,
+            n_steps=n_steps,
+            device=device,
+        )
+        samples_original = fm.unstandardize(samples_std, preprocessing).astype(np.float32)
+        point_predictions[start:end] = np.median(samples_original, axis=1)
+
+    return point_predictions
+
+
+def timepoint_metric_table(
+    dataset: fm.FlowDataset,
+    patient_idx: np.ndarray,
+    point_predictions: np.ndarray,
+) -> pd.DataFrame:
+    rows = []
+    labels = {"bmi": "BMI", "hba1c": "HbA1c"}
+    for group in ("bmi", "hba1c"):
+        dims, months = target_dims(dataset, group)
+        for dim, month in zip(dims, months):
+            observed = dataset.mask[patient_idx, dim] == 1
+            n_observed = int(observed.sum())
+            if n_observed == 0:
+                mad = np.nan
+                rmse = np.nan
+            else:
+                truth = dataset.x[patient_idx[observed], dim]
+                pred = point_predictions[observed, dim]
+                diff = pred - truth
+                mad = float(np.median(np.abs(diff)))
+                rmse = float(np.sqrt(np.mean(diff**2)))
+            rows.append(
+                {
+                    "outcome": labels[group],
+                    "timepoint": f"{_format_month(float(month))}m",
+                    "n_observed": n_observed,
+                    "MAD": mad,
+                    "RMSE": rmse,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def format_metric_table(table: pd.DataFrame) -> str:
+    display = table.copy()
+    for column in ("MAD", "RMSE"):
+        display[column] = display[column].map(lambda value: "NA" if pd.isna(value) else f"{value:.3f}")
+    return display.to_string(index=False)
+
+
 def _format_month(month: float) -> str:
     return str(int(month)) if float(month).is_integer() else f"{month:g}"
 
@@ -431,6 +518,7 @@ def evaluate_run(
     seed: int,
     n_show_per_procedure: int,
     max_sample_lines: int,
+    metric_batch_size: int,
     device_name: str,
 ) -> dict[str, Any]:
     run_dir = Path(run_dir)
@@ -477,11 +565,26 @@ def evaluate_run(
     )
 
     selected_path = output_dir / "eval_selected_test_patients.csv"
+    metrics_path = output_dir / "eval_timepoint_metrics_test.csv"
     bmi_path = output_dir / "eval_bmi_factual_counterfactual_examples_test.png"
     hba1c_path = output_dir / "eval_hba1c_factual_counterfactual_examples_test.png"
     mace_path = output_dir / "eval_mace_factual_counterfactual_histograms_test.png"
 
     selected_patient_frame(dataset, selected_idx).to_csv(selected_path, index=False)
+    test_point_predictions = sample_factual_point_predictions(
+        model=model,
+        dataset=dataset,
+        patient_idx=test_idx,
+        preprocessing=preprocessing,
+        n_samples=n_samples,
+        n_steps=n_steps,
+        x_dim=x_dim,
+        seed=seed + 1,
+        device=device,
+        batch_size=metric_batch_size,
+    )
+    timepoint_metrics = timepoint_metric_table(dataset, test_idx, test_point_predictions)
+    timepoint_metrics.to_csv(metrics_path, index=False)
     plot_timecourse_factual_counterfactual(
         dataset=dataset,
         patient_idx=selected_idx,
@@ -510,6 +613,7 @@ def evaluate_run(
             f"({n_show_per_procedure} sleeve, {n_show_per_procedure} RNYGB)"
         ),
         max_sample_lines=max_sample_lines,
+        y_limits=(3.0, 15.0),
     )
     plot_mace_histograms(
         dataset=dataset,
@@ -531,12 +635,15 @@ def evaluate_run(
         "n_samples": int(n_samples),
         "n_steps": int(n_steps),
         "seed": int(seed),
+        "metric_batch_size": int(metric_batch_size),
         "split_sizes": {key: int(len(value)) for key, value in splits.items()},
         "target_names": target_names,
         "selected_subject_ids": dataset.subject_ids[selected_idx].tolist(),
         "selected_procedures": dataset.surgery_type[selected_idx].tolist(),
+        "timepoint_metrics": timepoint_metrics.to_dict(orient="records"),
         "outputs": {
             "selected_patients": str(selected_path),
+            "timepoint_metrics": str(metrics_path),
             "bmi": str(bmi_path),
             "hba1c": str(hba1c_path),
             "mace": str(mace_path),
@@ -558,12 +665,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--n-show-per-procedure", type=int, default=N_SHOW_PER_PROCEDURE)
     parser.add_argument("--max-sample-lines", type=int, default=MAX_SAMPLE_LINES)
+    parser.add_argument("--metric-batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto", help="auto, cpu, cuda, or cuda:<index>.")
     args = parser.parse_args()
     if args.n_samples < 1:
         raise SystemExit("--n-samples must be at least 1.")
     if args.n_steps < 1:
         raise SystemExit("--n-steps must be at least 1.")
+    if args.metric_batch_size < 1:
+        raise SystemExit("--metric-batch-size must be at least 1.")
 
     run_dir = resolve_run_dir(args.run, args.log_dir)
     summary = evaluate_run(
@@ -575,6 +685,7 @@ def main() -> None:
         seed=args.seed,
         n_show_per_procedure=args.n_show_per_procedure,
         max_sample_lines=args.max_sample_lines,
+        metric_batch_size=args.metric_batch_size,
         device_name=args.device,
     )
 
@@ -583,6 +694,8 @@ def main() -> None:
     print("Selected test patients:")
     for subject_id, procedure in zip(summary["selected_subject_ids"], summary["selected_procedures"]):
         print(f"  {subject_id}: {procedure}")
+    print("Test timepoint metrics (median factual prediction vs observed):")
+    print(format_metric_table(pd.DataFrame(summary["timepoint_metrics"])))
     print("Saved outputs:")
     for name, path in summary["outputs"].items():
         print(f"  {name}: {path}")
