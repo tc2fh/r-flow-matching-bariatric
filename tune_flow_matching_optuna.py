@@ -36,11 +36,11 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "runs" / "python_flow_matching_optuna"
 DEFAULT_CSV_PATH = REPO_ROOT / "fake_data" / "fake_mbs_cohort.csv"
 
-N_TRIALS = 30
+N_TRIALS = 3000
 TIMEOUT_SECONDS = None
 N_JOBS = 1
 FINAL_TRAIN_BEST = True
-MIN_TRIAL_STOP_STEP = 1500
+MIN_TRIAL_STOP_STEP = 2000
 
 BASE_CONFIG = fm.TrainConfig(
     output_dir=str(DEFAULT_OUTPUT_DIR),
@@ -95,7 +95,7 @@ def suggest_config(trial, base_cfg: fm.TrainConfig) -> fm.TrainConfig:
         surgery_emb_dim=trial.suggest_categorical("surgery_emb_dim", [2, 4, 8, 16]),
         learning_rate=trial.suggest_float("learning_rate", 1e-5, 3e-3, log=True),
         weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
-        batch_size=trial.suggest_categorical("batch_size", [32, 64, 128, 256]),
+        batch_size=trial.suggest_categorical("batch_size", [256]),
     )
 
 
