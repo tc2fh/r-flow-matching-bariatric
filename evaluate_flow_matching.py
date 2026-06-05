@@ -753,10 +753,9 @@ def plot_timecourse_factual_counterfactual(
     n_rows = len(patient_idx)
     fig, axes = plt.subplots(
         n_rows,
-        2,
-        figsize=(11, max(2.65 * n_rows, 4)),
+        3,
+        figsize=(15, max(2.65 * n_rows, 4)),
         sharex=True,
-        sharey="row",
         squeeze=False,
         constrained_layout=True,
     )
@@ -783,6 +782,17 @@ def plot_timecourse_factual_counterfactual(
             ax.set_ylim(*y_limits)
         ax.grid(alpha=0.25)
 
+    def difference_panel(ax, factual, counterfactual, panel_title):
+        factual_median = np.median(factual[:, dims], axis=0)
+        counterfactual_median = np.median(counterfactual[:, dims], axis=0)
+        diff = factual_median - counterfactual_median
+        ax.axhline(0.0, color="black", lw=1.0, alpha=0.45)
+        ax.plot(months, diff, color="tab:green", marker="o", lw=2.0)
+        ax.set_title(panel_title)
+        ax.set_xlabel("Months post-op")
+        ax.set_ylabel(f"Delta median {y_label}\nfactual - counterfactual")
+        ax.grid(alpha=0.25)
+
     for row, global_idx in enumerate(patient_idx):
         actual = INDEX_TO_SURGERY[int(dataset.surgery_idx[global_idx])]
         cf = INDEX_TO_SURGERY[int(1 - dataset.surgery_idx[global_idx])]
@@ -803,6 +813,12 @@ def plot_timecourse_factual_counterfactual(
             counterfactual_samples[row],
             "tab:orange",
             f"{subject_id}: counterfactual {cf}",
+        )
+        difference_panel(
+            axes[row, 2],
+            factual_samples[row],
+            counterfactual_samples[row],
+            f"{subject_id}: median factual - counterfactual",
         )
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
