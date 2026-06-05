@@ -1,11 +1,12 @@
-"""Optuna hyperparameter tuner for the MBSCohort flow-matching model.
+"""AdaLN-only Optuna tuner for the MBSCohort flow-matching model.
 
 Default standalone behavior:
     python tune_flow_matching_optuna.py
 
 This loads Cosmos MBSCohort through train_flow_matching.py, tunes model and
-optimizer hyperparameters on validation flow loss, then retrains one final model
-with the best hyperparameters and evaluates it on the held-out test split.
+optimizer hyperparameters on validation flow loss with conditioning fixed to
+AdaLN, then retrains one final model with the best hyperparameters and evaluates
+it on the held-out test split.
 
 For local smoke tests without Cosmos access, import this file and call
 tune_from_csv(...).
@@ -47,6 +48,7 @@ BASE_CONFIG = fm.TrainConfig(
     device="cuda" if torch.cuda.is_available() else "cpu",
     seed=0,
     split_seed=0,
+    conditioning="adaln",
     num_steps=3000,
     batch_size=64,
     val_every=150,
@@ -88,6 +90,7 @@ def suggest_config(trial, base_cfg: fm.TrainConfig) -> fm.TrainConfig:
     return replace(
         base_cfg,
         seed=base_cfg.seed + trial.number,
+        conditioning="adaln",
         hidden_dim=trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512, 1024]),
         num_hidden_layers=trial.suggest_int("num_hidden_layers", 1, 8),
         time_emb_dim=trial.suggest_categorical("time_emb_dim", [16, 32, 64, 128]),
@@ -185,11 +188,17 @@ def train_validation_trial(
 
 
 def best_config_from_trial(best_trial, base_cfg: fm.TrainConfig, study_dir: Path) -> fm.TrainConfig:
-    cfg = replace(base_cfg, output_dir=str(study_dir / "best_model"), seed=base_cfg.seed)
+    cfg = replace(
+        base_cfg,
+        output_dir=str(study_dir / "best_model"),
+        seed=base_cfg.seed,
+        conditioning="adaln",
+    )
     for name, value in best_trial.params.items():
         cfg = replace(cfg, **{name: value})
     for name, value in FINAL_CONFIG_OVERRIDES.items():
         cfg = replace(cfg, **{name: value})
+    cfg = replace(cfg, conditioning="adaln")
     return cfg
 
 
@@ -216,11 +225,13 @@ def tune_dataset(
     final_train_best: bool = FINAL_TRAIN_BEST,
 ) -> dict:
     optuna_module = require_optuna()
+    base_cfg = replace(base_cfg, conditioning="adaln")
     study_dir = make_study_dir(output_dir)
     write_json(
         study_dir / "tuning_config.json",
         {
             "base_config": asdict(base_cfg),
+            "forced_conditioning": "adaln",
             "final_config_overrides": FINAL_CONFIG_OVERRIDES,
             "n_trials": n_trials,
             "timeout_seconds": timeout_seconds,
@@ -245,6 +256,7 @@ def tune_dataset(
 
     def objective(trial) -> float:
         cfg = suggest_config(trial, base_cfg)
+        trial.set_user_attr("conditioning", cfg.conditioning)
         print(f"Trial {trial.number}: {trial.params}")
         return train_validation_trial(dataset, cfg, trial, study_dir)
 

@@ -49,9 +49,10 @@ WHERE Sex NOT IN (N'#Masked', N'*Unspecified', N'Unknown', N'other')
   AND (eGFRatEvent IS NULL OR eGFRatEvent >= 20)
   AND PMH_dialysis_transplant = 0
   AND (NephropathyInterval IS NULL OR NephropathyInterval >= 0)
+  AND (RetinopathyInterval IS NULL OR RetinopathyInterval >= 0)
+  AND (MACEinterval IS NULL OR MACEinterval >= 0)
   AND PMH_PriorMBS = 0
   AND PriorGLP1 = 0
-  AND PMH_DM2 = 1
   AND PMH_retinopathy = 0
   AND ActiveEndInterval >= 700
   AND ProcDateValue <= '2023-05-01'
@@ -83,8 +84,8 @@ HBA1C_TARGETS = [
 ]
 
 MACE_TARGETS = [
-    ("mace_ever", "mace", math.nan, "MACE"),
-    ("mace_interval_months", "mace", math.nan, "MACEinterval"),
+    ("mace_ever", "mace", math.nan, "MACE/Nephropathy/Retinopathy composite"),
+    ("mace_interval_months", "mace", math.nan, "Earliest MACE/Nephropathy/Retinopathy interval"),
 ]
 
 TARGET_SPECS = BMI_TARGETS + HBA1C_TARGETS + MACE_TARGETS
@@ -106,6 +107,15 @@ CONTINUOUS_PATIENT_FEATURES = [
     "hba1c_at_surgery",
     "bmi_at_surgery",
 ]
+REQUIRED_PATIENT_FEATURES = [
+    "age_at_surgery",
+    "sex_male",
+    "creatinine_at_surgery",
+    "bmi_at_surgery",
+]
+
+COMPOSITE_EVENT_COLUMNS = ["MACE", "Nephropathy", "Retinopathy"]
+COMPOSITE_INTERVAL_COLUMNS = ["MACEinterval", "NephropathyInterval", "RetinopathyInterval"]
 
 
 @dataclass
@@ -122,6 +132,7 @@ class TrainConfig:
     surgery_emb_dim: int = 8
     hidden_dim: int = 64
     num_hidden_layers: int = 2
+    conditioning: str = "concat"
     learning_rate: float = 3e-4
     weight_decay: float = 1e-2
     num_steps: int = 6000
@@ -235,6 +246,10 @@ def required_columns() -> list[str]:
         "ProcDateValue",
         "MACE",
         "MACEinterval",
+        "Nephropathy",
+        "NephropathyInterval",
+        "Retinopathy",
+        "RetinopathyInterval",
     ]
     cols.extend(item[3] for item in BMI_TARGETS + HBA1C_TARGETS)
     return sorted(set(cols))
@@ -272,6 +287,21 @@ def binary_event(series: pd.Series) -> pd.Series:
     return ((values == 1) & values.notna()).astype("float32")
 
 
+def composite_event(df: pd.DataFrame) -> pd.Series:
+    events = [binary_event(df[column]).astype(bool) for column in COMPOSITE_EVENT_COLUMNS]
+    return pd.concat(events, axis=1).any(axis=1).astype("float32")
+
+
+def composite_interval_months(df: pd.DataFrame) -> pd.Series:
+    event_matrix = pd.concat([binary_event(df[column]).astype(bool) for column in COMPOSITE_EVENT_COLUMNS], axis=1)
+    interval_matrix = pd.concat([numeric(df[column]) for column in COMPOSITE_INTERVAL_COLUMNS], axis=1)
+    interval_matrix.columns = COMPOSITE_INTERVAL_COLUMNS
+    interval_matrix = interval_matrix.mask(~event_matrix.to_numpy())
+    interval_matrix = interval_matrix.mask(interval_matrix < 0)
+    earliest_days = interval_matrix.min(axis=1, skipna=True)
+    return (earliest_days / DAYS_PER_MONTH).astype("float32")
+
+
 def compute_glp1_start_month(df: pd.DataFrame) -> pd.Series:
     post_op = numeric(df["PostOpGLP1"]).fillna(0).eq(1)
     glp1_days = numeric(df["GLP1Interval"])
@@ -300,12 +330,12 @@ def build_target_matrix(df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, list[
         source_col = item["source_column"]
 
         if name == "mace_ever":
-            values = binary_event(df[source_col]).to_numpy(dtype=np.float32)
+            values = composite_event(df).to_numpy(dtype=np.float32)
             observed = np.ones(len(df), dtype=bool)
         elif name == "mace_interval_months":
-            mace = binary_event(df["MACE"]).to_numpy(dtype=np.float32)
-            interval_days = numeric(df["MACEinterval"]).to_numpy(dtype=np.float32)
-            values = np.where(mace == 1.0, interval_days / DAYS_PER_MONTH, 0.0).astype(np.float32)
+            event = composite_event(df).to_numpy(dtype=np.float32)
+            interval_months = composite_interval_months(df).to_numpy(dtype=np.float32)
+            values = np.where(event == 1.0, interval_months, 0.0).astype(np.float32)
             observed = np.ones(len(df), dtype=bool)
         else:
             values = numeric(df[source_col]).to_numpy(dtype=np.float32)
@@ -330,7 +360,7 @@ def make_patient_features(df: pd.DataFrame) -> pd.DataFrame:
             "creatinine_at_surgery": numeric(df["CreatinineAtEvent"]),
             "hba1c_at_surgery": numeric(df["HbA1cAtEvent"]),
             "bmi_at_surgery": numeric(df["BMIatEvent"]),
-            "insulin_status": numeric(df["InsulinStatus"]),
+            "insulin_status": numeric(df["InsulinStatus"]).fillna(0.0),
         },
         index=df.index,
     )
@@ -353,15 +383,17 @@ def prepare_flow_dataset(df: pd.DataFrame, source_label: str) -> FlowDataset:
         examples = df.loc[df["PatKey"].duplicated(), "PatKey"].head(10).tolist()
         raise ValueError(f"Duplicate PatKey rows found in wide patient input: {examples}")
 
-    mace = binary_event(df["MACE"])
-    mace_interval_days = numeric(df["MACEinterval"])
-    bad_mace_interval = mace.eq(1) & (mace_interval_days.isna() | (mace_interval_days < 0))
-    if bad_mace_interval.any():
+    event = composite_event(df)
+    event_interval_months = composite_interval_months(df)
+    bad_event_interval = event.eq(1) & event_interval_months.isna()
+    if bad_event_interval.any():
         warnings.warn(
-            f"Dropping {int(bad_mace_interval.sum())} rows with MACE == 1 and missing/negative MACEinterval.",
+            "Dropping "
+            f"{int(bad_event_interval.sum())} rows with a composite MACE/nephropathy/retinopathy "
+            "event and no valid nonnegative event interval.",
             stacklevel=2,
         )
-        df = df.loc[~bad_mace_interval].copy()
+        df = df.loc[~bad_event_interval].copy()
 
     post_op_glp1 = numeric(df["PostOpGLP1"]).fillna(0).eq(1)
     glp1_months = compute_glp1_start_month(df)
@@ -374,10 +406,10 @@ def prepare_flow_dataset(df: pd.DataFrame, source_label: str) -> FlowDataset:
         df = df.loc[~bad_glp1].copy()
 
     patient_features = make_patient_features(df)
-    complete_conditioning = patient_features.notna().all(axis=1)
+    complete_conditioning = patient_features[REQUIRED_PATIENT_FEATURES].notna().all(axis=1)
     if (~complete_conditioning).any():
         warnings.warn(
-            f"Dropping {int((~complete_conditioning).sum())} rows with missing required conditioning fields.",
+            f"Dropping {int((~complete_conditioning).sum())} rows with missing required core conditioning fields.",
             stacklevel=2,
         )
         df = df.loc[complete_conditioning].copy()
@@ -472,8 +504,9 @@ def fit_preprocessing(dataset: FlowDataset, train_idx: np.ndarray) -> Preprocess
         [PATIENT_FEATURES.index(name) for name in CONTINUOUS_PATIENT_FEATURES],
         dtype=np.int64,
     )
-    static_mean[continuous_idx] = raw[:, continuous_idx].mean(axis=0)
-    std = raw[:, continuous_idx].std(axis=0)
+    static_mean[continuous_idx] = np.nanmean(raw[:, continuous_idx], axis=0)
+    static_mean[continuous_idx] = np.where(np.isnan(static_mean[continuous_idx]), 0.0, static_mean[continuous_idx])
+    std = np.nanstd(raw[:, continuous_idx], axis=0)
     static_std[continuous_idx] = np.where((std < 1e-8) | np.isnan(std), 1.0, std)
     return Preprocessing(
         target_mean=target_mean.astype(np.float32),
@@ -493,6 +526,12 @@ def transform_targets(x: np.ndarray, mask: np.ndarray, preprocessing: Preprocess
 def transform_patient_features(x: np.ndarray, preprocessing: Preprocessing) -> np.ndarray:
     out = x.copy().astype(np.float32)
     idx = preprocessing.static_continuous_idx
+    missing_continuous = np.isnan(out[:, idx])
+    if missing_continuous.any():
+        out[:, idx] = np.where(missing_continuous, preprocessing.static_mean[idx], out[:, idx])
+    missing_other = np.isnan(out)
+    if missing_other.any():
+        out = np.where(missing_other, 0.0, out)
     out[:, idx] = (out[:, idx] - preprocessing.static_mean[idx]) / preprocessing.static_std[idx]
     return out
 
@@ -524,17 +563,39 @@ def sinusoidal_time_embedding(t: torch.Tensor, dim: int, time_scale: float) -> t
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
 
 
+def modulate_layer_norm(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    return x * (1.0 + scale) + shift
+
+
+def zero_init_linear(layer: nn.Linear) -> nn.Linear:
+    nn.init.zeros_(layer.weight)
+    if layer.bias is not None:
+        nn.init.zeros_(layer.bias)
+    return layer
+
+
 class VectorFieldNet(nn.Module):
     def __init__(self, cfg: TrainConfig, x_dim: int, patient_feature_dim: int, num_surgery_types: int = 2):
         super().__init__()
         if cfg.time_emb_dim % 2 != 0:
             raise ValueError("time_emb_dim must be even")
+        conditioning = cfg.conditioning.lower()
+        if conditioning not in {"concat", "adaln"}:
+            raise ValueError(f"Unknown conditioning style: {cfg.conditioning!r}")
         self.x_dim = x_dim
         self.time_emb_dim = cfg.time_emb_dim
         self.time_scale = cfg.time_scale
+        self.conditioning = conditioning
         self.surgery_emb = nn.Embedding(num_surgery_types, cfg.surgery_emb_dim)
 
         cond_dim = cfg.time_emb_dim + cfg.surgery_emb_dim + patient_feature_dim
+        self.cond_dim = cond_dim
+        if conditioning == "concat":
+            self._init_concat_layers(cfg, x_dim, cond_dim)
+        else:
+            self._init_adaln_layers(cfg, x_dim, cond_dim)
+
+    def _init_concat_layers(self, cfg: TrainConfig, x_dim: int, cond_dim: int) -> None:
         in_dim = x_dim + cond_dim
         layers = []
         for _ in range(cfg.num_hidden_layers):
@@ -543,14 +604,52 @@ class VectorFieldNet(nn.Module):
         self.hidden_layers = nn.ModuleList(layers)
         self.out = nn.Linear(in_dim, x_dim)
 
+    def _init_adaln_layers(self, cfg: TrainConfig, x_dim: int, cond_dim: int) -> None:
+        self.cond_in = nn.Linear(cond_dim, cfg.hidden_dim)
+        self.cond_out = nn.Linear(cfg.hidden_dim, cfg.hidden_dim)
+        self.x_in = nn.Linear(x_dim, cfg.hidden_dim)
+        self.layer_norms = nn.ModuleList(
+            [nn.LayerNorm(cfg.hidden_dim, elementwise_affine=False) for _ in range(cfg.num_hidden_layers)]
+        )
+        self.adaln_modulators = nn.ModuleList(
+            [zero_init_linear(nn.Linear(cfg.hidden_dim, 3 * cfg.hidden_dim)) for _ in range(cfg.num_hidden_layers)]
+        )
+        self.block_layers = nn.ModuleList(
+            [nn.Linear(cfg.hidden_dim, cfg.hidden_dim) for _ in range(cfg.num_hidden_layers)]
+        )
+        self.out_adaln = zero_init_linear(nn.Linear(cfg.hidden_dim, 2 * cfg.hidden_dim))
+        self.out_ln = nn.LayerNorm(cfg.hidden_dim, elementwise_affine=False)
+        self.out = zero_init_linear(nn.Linear(cfg.hidden_dim, x_dim))
+
     def forward(self, x_t: torch.Tensor, t: torch.Tensor, surgery_idx: torch.Tensor, patient_features: torch.Tensor) -> torch.Tensor:
         t_emb = sinusoidal_time_embedding(t, self.time_emb_dim, self.time_scale)
         surgery_emb = self.surgery_emb(surgery_idx.long())
         cond = torch.cat([t_emb, surgery_emb, patient_features], dim=-1)
+        if self.conditioning == "adaln":
+            return self.forward_adaln(x_t, cond)
+        return self.forward_concat(x_t, cond)
+
+    def forward_concat(self, x_t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
         h = torch.cat([x_t, cond], dim=-1)
         for layer in self.hidden_layers:
             h = F.silu(layer(h))
             h = torch.cat([h, cond], dim=-1)
+        return self.out(h)
+
+    def forward_adaln(self, x_t: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        cond_h = F.silu(self.cond_in(cond))
+        cond_h = self.cond_out(cond_h)
+
+        h = F.silu(self.x_in(x_t))
+        for layer_norm, modulator, block_layer in zip(self.layer_norms, self.adaln_modulators, self.block_layers):
+            shift, scale, gate = modulator(cond_h).chunk(3, dim=-1)
+            y = layer_norm(h)
+            y = modulate_layer_norm(y, shift, scale)
+            y = F.silu(block_layer(y))
+            h = h + gate * y
+
+        shift, scale = self.out_adaln(cond_h).chunk(2, dim=-1)
+        h = modulate_layer_norm(self.out_ln(h), shift, scale)
         return self.out(h)
 
 
