@@ -37,7 +37,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "runs" / "python_flow_matching_optuna"
 DEFAULT_CSV_PATH = REPO_ROOT / "fake_data" / "fake_mbs_cohort.csv"
 
-N_TRIALS = 3000
+N_TRIALS = 500
 TIMEOUT_SECONDS = None
 N_JOBS = 1
 FINAL_TRAIN_BEST = True
@@ -91,14 +91,14 @@ def suggest_config(trial, base_cfg: fm.TrainConfig) -> fm.TrainConfig:
         base_cfg,
         seed=base_cfg.seed + trial.number,
         conditioning="adaln",
-        hidden_dim=trial.suggest_categorical("hidden_dim", [32, 64, 128, 256, 512, 1024]),
-        num_hidden_layers=trial.suggest_int("num_hidden_layers", 1, 8),
-        time_emb_dim=trial.suggest_categorical("time_emb_dim", [16, 32, 64, 128]),
+        hidden_dim=trial.suggest_categorical("hidden_dim", [32, 64, 128, 256]),
+        num_hidden_layers=trial.suggest_int("num_hidden_layers", 2, 5),
+        time_emb_dim=trial.suggest_categorical("time_emb_dim", [64, 128]),
         time_scale=trial.suggest_categorical("time_scale", [1.0, 3.0, 10.0, 30.0]),
-        surgery_emb_dim=trial.suggest_categorical("surgery_emb_dim", [2, 4, 8, 16]),
+        surgery_emb_dim=trial.suggest_categorical("surgery_emb_dim", [8, 16]),
         learning_rate=trial.suggest_float("learning_rate", 1e-5, 3e-3, log=True),
         weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
-        batch_size=trial.suggest_categorical("batch_size", [256]),
+        batch_size=trial.suggest_categorical("batch_size", [2048]),
     )
 
 

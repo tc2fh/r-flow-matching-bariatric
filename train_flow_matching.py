@@ -784,6 +784,14 @@ def make_run_dir(output_dir: str | Path) -> Path:
     return run_dir
 
 
+def save_model_state(run_dir: Path, state: dict[str, torch.Tensor], step: int, best_score: float) -> None:
+    tmp_path = run_dir / "model.pt.tmp"
+    torch.save(state, tmp_path)
+    tmp_path.replace(run_dir / "model.pt")
+    with (run_dir / "checkpoint.json").open("w", encoding="utf-8") as f:
+        json.dump({"model_path": "model.pt", "step": step, "best_score": best_score}, f, indent=2)
+
+
 def train_model(dataset: FlowDataset, cfg: TrainConfig) -> dict:
     np.random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)
@@ -839,6 +847,7 @@ def train_model(dataset: FlowDataset, cfg: TrainConfig) -> dict:
                 best_score = score
                 best_step = step
                 best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
+                save_model_state(run_dir, best_state, best_step, best_score)
                 evals_since_improve = 0
             else:
                 evals_since_improve += 1
@@ -857,7 +866,9 @@ def train_model(dataset: FlowDataset, cfg: TrainConfig) -> dict:
 
     if best_state is not None:
         model.load_state_dict(best_state)
-    torch.save(model.state_dict(), run_dir / "model.pt")
+        save_model_state(run_dir, best_state, best_step, best_score)
+    else:
+        save_model_state(run_dir, {key: value.detach().cpu() for key, value in model.state_dict().items()}, -1, float("nan"))
 
     test_arrays = arrays["test"]
     samples_std = sample_trajectories(model, test_arrays, cfg, device, X_DIM)
