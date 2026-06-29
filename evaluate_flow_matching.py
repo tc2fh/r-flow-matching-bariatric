@@ -17,6 +17,11 @@ Outputs in the run directory by default:
     eval_bmi_factual_counterfactual_examples_test.png
     eval_hba1c_factual_counterfactual_examples_test.png
     eval_mace_factual_counterfactual_histograms_test.png
+    eval_mace_metrics_test.csv          (AUROC / AUPRC / Brier for composite MACE)
+    eval_mace_metrics_test.png          (rendered MACE metrics table)
+    eval_mace_curves_test.png           (ROC / PR / reliability)
+    eval_mace_predictions_test.csv      (per-patient predicted P(event) vs observed)
+    eval_timepoint_metrics_test.png     (rendered BMI/HbA1c timepoint metrics table)
     eval_summary.json
 """
 
@@ -54,6 +59,60 @@ except ImportError:  # pragma: no cover - keeps Cosmos execution portable if tqd
 N_SHOW_PER_PROCEDURE = 3
 MAX_SAMPLE_LINES = 50
 INDEX_TO_SURGERY = {idx: name for name, idx in fm.SURGERY_TO_INDEX.items()}
+
+
+def report_saved(path: Path, description: str = "") -> Path:
+    """Announce each saved artifact (with full path) so it is easy to locate in
+    the terminal when running on the Cosmos VM. flush=True keeps the line visible
+    immediately during long jobs."""
+    tag = f" {description}" if description else ""
+    print(f"  [saved]{tag} -> {path}", flush=True)
+    return path
+
+
+def render_table(df: pd.DataFrame, output_path: Path, title: str = "") -> Path:
+    """Render a metrics DataFrame as a styled table image (PNG) next to its CSV.
+
+    Floats are formatted to 3 decimals (NaN -> "NA"); other columns are stringified.
+    """
+    display = df.copy()
+    for column in display.columns:
+        if pd.api.types.is_float_dtype(display[column]):
+            display[column] = display[column].map(lambda value: "NA" if pd.isna(value) else f"{value:.3f}")
+        else:
+            display[column] = display[column].astype(str)
+    n_rows, n_cols = display.shape
+    fig_width = max(6.0, 1.7 * n_cols)
+    fig_height = max(1.4, 0.5 * (n_rows + 1)) + (0.5 if title else 0.0)
+    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    ax.axis("off")
+    table = ax.table(
+        cellText=display.to_numpy(),
+        colLabels=list(display.columns),
+        loc="center",
+        cellLoc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    table.scale(1.0, 1.5)
+    for (row, _col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight="bold", color="white")
+            cell.set_facecolor("#40466e")
+        elif row % 2 == 0:
+            cell.set_facecolor("#f2f2f2")
+    try:
+        table.auto_set_column_width(col=list(range(n_cols)))
+    except Exception:
+        pass
+    if title:
+        ax.set_title(title, fontweight="bold", pad=14)
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    report_saved(output_path, "rendered metrics table")
+    return output_path
 
 
 class NullProgress:
@@ -526,14 +585,20 @@ def sample_test_factual_counterfactual_analysis(
     batch_size: int,
     alpha: float,
     show_progress: bool,
-) -> tuple[np.ndarray, dict[str, tuple[pd.DataFrame, dict[str, Any]]]]:
-    """Sample full test factual/counterfactual distributions for metrics and t-tests."""
+) -> tuple[np.ndarray, np.ndarray, dict[str, tuple[pd.DataFrame, dict[str, Any]]]]:
+    """Sample full test factual/counterfactual distributions for metrics and t-tests.
+
+    Returns (point_predictions, mace_prob, ttest_results) where mace_prob is the
+    per-patient predicted composite-event probability (mean of clipped samples).
+    """
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
     if scipy_stats is None:
         raise RuntimeError("scipy is required for Welch t-tests. Install scipy or rerun without this analysis.")
 
     point_predictions = np.zeros((len(patient_idx), x_dim), dtype=np.float32)
+    mace_dim = target_dim_by_name(dataset, "mace_ever")
+    mace_prob = np.zeros(len(patient_idx), dtype=np.float32)
     states = {
         "bmi": init_ttest_state(dataset, len(patient_idx), "bmi", "BMI"),
         "hba1c": init_ttest_state(dataset, len(patient_idx), "hba1c", "HbA1c"),
@@ -584,6 +649,7 @@ def sample_test_factual_counterfactual_analysis(
             factual_samples = fm.unstandardize(factual_std, preprocessing).astype(np.float32)
             counterfactual_samples = fm.unstandardize(counterfactual_std, preprocessing).astype(np.float32)
             point_predictions[start:end] = np.median(factual_samples, axis=1)
+            mace_prob[start:end] = np.clip(factual_samples[:, :, mace_dim], 0.0, 1.0).mean(axis=1)
             batch_positions = np.arange(start, end, dtype=np.int64)
             for state in states.values():
                 update_ttest_state(
@@ -595,7 +661,7 @@ def sample_test_factual_counterfactual_analysis(
                     counterfactual_samples=counterfactual_samples,
                 )
 
-    return point_predictions, {
+    return point_predictions, mace_prob, {
         group: finalize_ttest_state(state, alpha=alpha)
         for group, state in states.items()
     }
@@ -698,6 +764,7 @@ def plot_outcome_ttest_summary(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    report_saved(output_path)
 
 
 def ttest_json_summary(ttest_summary: dict[str, Any]) -> dict[str, Any]:
@@ -834,6 +901,132 @@ def plot_timecourse_factual_counterfactual(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    report_saved(output_path)
+
+
+# --------------------------------------------------------------------------- #
+# MACE discrimination metrics + curves.
+# Implemented in pure numpy (no sklearn) so this stays runnable in the Cosmos
+# environment. The metric schema matches the new GBM/multi-task evaluators, so
+# eval_mace_metrics_test.csv is directly comparable across all three models.
+# --------------------------------------------------------------------------- #
+def _rankdata_average(values: np.ndarray) -> np.ndarray:
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.size, dtype=float)
+    ranks[order] = np.arange(1, values.size + 1, dtype=float)
+    sorted_values = values[order]
+    i = 0
+    n = values.size
+    while i < n:
+        j = i
+        while j + 1 < n and sorted_values[j + 1] == sorted_values[i]:
+            j += 1
+        if j > i:
+            ranks[order[i : j + 1]] = (i + 1 + j + 1) / 2.0
+        i = j + 1
+    return ranks
+
+
+def _precision_recall_curve(y: np.ndarray, p: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Precision/recall at distinct score thresholds (matches sklearn).
+
+    Tied scores are collapsed to the end of each tied run -- the only achievable
+    operating points -- so step-wise AP equals sklearn.average_precision_score.
+    """
+    n_pos = max(int(np.sum(y == 1)), 1)
+    order = np.argsort(p, kind="mergesort")[::-1]
+    y_sorted = y[order]
+    p_sorted = p[order]
+    tp = np.cumsum(y_sorted == 1)
+    fp = np.cumsum(y_sorted == 0)
+    distinct = np.r_[np.where(np.diff(p_sorted) != 0)[0], y_sorted.size - 1]
+    tp_d = tp[distinct]
+    fp_d = fp[distinct]
+    precision = tp_d / np.maximum(tp_d + fp_d, 1)
+    recall = tp_d / n_pos
+    return precision, recall
+
+
+def mace_discrimination_metrics(y_true: np.ndarray, prob: np.ndarray) -> dict[str, Any]:
+    """AUROC (tie-aware Mann-Whitney), AUPRC (step-wise AP), Brier -- numpy only.
+
+    Verified to match sklearn's roc_auc_score / average_precision_score /
+    brier_score_loss to floating-point tolerance, including tied scores.
+    """
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(prob, dtype=float)
+    n = int(y.size)
+    n_pos = int(np.sum(y == 1))
+    n_neg = int(np.sum(y == 0))
+    prevalence = float(y.mean()) if n else float("nan")
+    if n_pos and n_neg:
+        ranks = _rankdata_average(p)
+        auroc = float((ranks[y == 1].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
+    else:
+        auroc = float("nan")
+    if n_pos:
+        precision, recall = _precision_recall_curve(y, p)
+        recall_prev = np.concatenate([[0.0], recall[:-1]])
+        auprc = float(np.sum((recall - recall_prev) * precision))
+    else:
+        auprc = float("nan")
+    brier = float(np.mean((p - y) ** 2)) if n else float("nan")
+    return {
+        "n": n,
+        "n_pos": n_pos,
+        "prevalence": prevalence,
+        "auroc": auroc,
+        "auprc": auprc,
+        "auprc_baseline": prevalence,
+        "brier": brier,
+    }
+
+
+def plot_mace_curves(y_true: np.ndarray, prob: np.ndarray, output_path: Path) -> None:
+    y = np.asarray(y_true, dtype=float)
+    p = np.asarray(prob, dtype=float)
+    metrics = mace_discrimination_metrics(y, p)
+    prevalence = metrics["prevalence"]
+    n_pos = max(int(np.sum(y == 1)), 1)
+    n_neg = max(int(np.sum(y == 0)), 1)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    if metrics["n_pos"] and np.any(y == 0):
+        order = np.argsort(p, kind="mergesort")[::-1]
+        y_sorted = y[order]
+        tpr = np.concatenate([[0.0], np.cumsum(y_sorted == 1) / n_pos])
+        fpr = np.concatenate([[0.0], np.cumsum(y_sorted == 0) / n_neg])
+        axes[0].plot(fpr, tpr)
+    axes[0].plot([0, 1], [0, 1], "k--", alpha=0.4)
+    axes[0].set_title(f"ROC (test, AUROC={metrics['auroc']:.3f})")
+    axes[0].set_xlabel("FPR")
+    axes[0].set_ylabel("TPR")
+    if metrics["n_pos"]:
+        precision_curve, recall_curve = _precision_recall_curve(y, p)
+        axes[1].plot(recall_curve, precision_curve)
+    axes[1].axhline(prevalence, color="k", ls="--", alpha=0.4)
+    axes[1].set_title(f"Precision-Recall (test, AUPRC={metrics['auprc']:.3f})")
+    axes[1].set_xlabel("Recall")
+    axes[1].set_ylabel("Precision")
+    edges = np.linspace(0.0, 1.0, 11)
+    bins = np.clip(np.digitize(p, edges[1:-1]), 0, 9)
+    mean_pred, frac_pos = [], []
+    for b in range(10):
+        sel = bins == b
+        if np.any(sel):
+            mean_pred.append(float(p[sel].mean()))
+            frac_pos.append(float(y[sel].mean()))
+    if mean_pred:
+        axes[2].plot(mean_pred, frac_pos, marker="o")
+    axes[2].plot([0, 1], [0, 1], "k--", alpha=0.4)
+    axes[2].set_title("Reliability (test)")
+    axes[2].set_xlabel("Mean predicted")
+    axes[2].set_ylabel("Observed frequency")
+    fig.tight_layout()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    report_saved(output_path)
 
 
 def plot_mace_histograms(
@@ -888,6 +1081,7 @@ def plot_mace_histograms(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
+    report_saved(output_path)
 
 
 def selected_patient_frame(dataset: fm.FlowDataset, patient_idx: np.ndarray) -> pd.DataFrame:
@@ -972,9 +1166,15 @@ def evaluate_run(
     bmi_path = output_dir / "eval_bmi_factual_counterfactual_examples_test.png"
     hba1c_path = output_dir / "eval_hba1c_factual_counterfactual_examples_test.png"
     mace_path = output_dir / "eval_mace_factual_counterfactual_histograms_test.png"
+    mace_metrics_csv_path = output_dir / "eval_mace_metrics_test.csv"
+    mace_curves_path = output_dir / "eval_mace_curves_test.png"
+    mace_pred_csv_path = output_dir / "eval_mace_predictions_test.csv"
+    timepoint_table_path = output_dir / "eval_timepoint_metrics_test.png"
+    mace_metrics_table_path = output_dir / "eval_mace_metrics_test.png"
 
     selected_patient_frame(dataset, selected_idx).to_csv(selected_path, index=False)
-    test_point_predictions, ttest_results = sample_test_factual_counterfactual_analysis(
+    report_saved(selected_path, "selected test patients")
+    test_point_predictions, test_mace_prob, ttest_results = sample_test_factual_counterfactual_analysis(
         model=model,
         dataset=dataset,
         patient_idx=test_idx,
@@ -990,6 +1190,30 @@ def evaluate_run(
     )
     timepoint_metrics = timepoint_metric_table(dataset, test_idx, test_point_predictions)
     timepoint_metrics.to_csv(metrics_path, index=False)
+    report_saved(metrics_path, "timepoint metrics")
+    render_table(timepoint_metrics, timepoint_table_path, "Timepoint metrics: median factual prediction vs observed (test)")
+
+    # Composite MACE discrimination/calibration from the flow model's predicted
+    # P(event) = mean of clipped mace_ever samples. Comparable to the GBM and
+    # multi-task evaluators (same schema).
+    mace_dim = target_dim_by_name(dataset, "mace_ever")
+    mace_obs_mask = dataset.mask[test_idx, mace_dim] == 1
+    mace_observed = dataset.x[test_idx, mace_dim][mace_obs_mask].astype(np.int64)
+    mace_predicted = test_mace_prob[mace_obs_mask]
+    mace_metrics = mace_discrimination_metrics(mace_observed, mace_predicted)
+    mace_metrics_table = pd.DataFrame([{"split": "test", **mace_metrics}])
+    mace_metrics_table.to_csv(mace_metrics_csv_path, index=False)
+    report_saved(mace_metrics_csv_path, "MACE discrimination metrics")
+    render_table(mace_metrics_table, mace_metrics_table_path, "Composite MACE discrimination (test)")
+    pd.DataFrame(
+        {
+            "subject_id": dataset.subject_ids[test_idx][mace_obs_mask],
+            "y_true": mace_observed,
+            "prob": mace_predicted,
+        }
+    ).to_csv(mace_pred_csv_path, index=False)
+    report_saved(mace_pred_csv_path, "MACE per-patient predictions")
+    plot_mace_curves(mace_observed, mace_predicted, mace_curves_path)
 
     ttest_paths = {
         "bmi": {"csv": bmi_ttest_csv_path, "figure": bmi_ttest_path},
@@ -998,6 +1222,7 @@ def evaluate_run(
     ttest_json = {}
     for group, (ttest_df, ttest_summary) in ttest_results.items():
         ttest_df.to_csv(ttest_paths[group]["csv"], index=False)
+        report_saved(ttest_paths[group]["csv"], f"{group} counterfactual Welch t-tests")
         plot_outcome_ttest_summary(
             ttest_summary=ttest_summary,
             output_path=ttest_paths[group]["figure"],
@@ -1065,6 +1290,7 @@ def evaluate_run(
         "selected_subject_ids": dataset.subject_ids[selected_idx].tolist(),
         "selected_procedures": dataset.surgery_type[selected_idx].tolist(),
         "timepoint_metrics": timepoint_metrics.to_dict(orient="records"),
+        "mace_classification_test": mace_metrics,
         "counterfactual_welch_ttests_test": ttest_json,
         "outputs": {
             "selected_patients": str(selected_path),
@@ -1076,10 +1302,16 @@ def evaluate_run(
             "bmi": str(bmi_path),
             "hba1c": str(hba1c_path),
             "mace": str(mace_path),
+            "mace_metrics": str(mace_metrics_csv_path),
+            "mace_metrics_table": str(mace_metrics_table_path),
+            "mace_curves": str(mace_curves_path),
+            "mace_predictions": str(mace_pred_csv_path),
+            "timepoint_metrics_table": str(timepoint_table_path),
             "summary": str(summary_path),
         },
     }
     summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    report_saved(summary_path, "evaluation summary")
     return summary
 
 
@@ -1139,6 +1371,13 @@ def main() -> None:
     for group, ttest_summary in summary["counterfactual_welch_ttests_test"].items():
         print(f"{ttest_summary['outcome']} counterfactual Welch t-test month summary:")
         print(format_ttest_month_summary(ttest_summary))
+    mace = summary["mace_classification_test"]
+    print(
+        "Composite MACE discrimination (test): "
+        f"AUROC={mace['auroc']:.3f} AUPRC={mace['auprc']:.3f} "
+        f"(baseline={mace['auprc_baseline']:.3f}) Brier={mace['brier']:.3f} "
+        f"n={mace['n']} n_pos={mace['n_pos']}"
+    )
     print("Saved outputs:")
     for name, path in summary["outputs"].items():
         print(f"  {name}: {path}")

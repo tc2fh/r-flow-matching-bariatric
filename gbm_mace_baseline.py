@@ -64,6 +64,14 @@ DEFAULT_OUTPUT_DIR = fm.REPO_ROOT / "runs" / "gbm_mace_baseline"
 MACE_LABEL_NAME = "mace_ever"
 
 
+def report_saved(path: Path, description: str = "") -> Path:
+    """Announce each saved artifact (with full path) so it is easy to locate in
+    the terminal when running on the Cosmos VM."""
+    tag = f" {description}" if description else ""
+    print(f"  [saved]{tag} -> {path}", flush=True)
+    return path
+
+
 @dataclass
 class GBMConfig:
     output_dir: str = str(DEFAULT_OUTPUT_DIR)
@@ -72,6 +80,9 @@ class GBMConfig:
     train_frac: float = 0.70
     val_frac: float = 0.15
     test_frac: float = 0.15
+    # "surgery" reproduces the Cosmos flow split (fm.make_stratified_splits) so test
+    # patients line up one-for-one; "outcome" stratifies jointly by surgery and MACE.
+    split_strategy: str = "surgery"
     # HistGradientBoosting hyperparameters (used when XGBoost is unavailable).
     learning_rate: float = 0.05
     max_iter: int = 400
@@ -109,6 +120,30 @@ def assemble_features(dataset: fm.FlowDataset) -> tuple[np.ndarray, list[str], n
     mace_dim = fm.TARGET_NAMES.index(MACE_LABEL_NAME)
     y = dataset.x[:, mace_dim].astype(np.int64)
     return x, feature_names, y
+
+
+def make_splits(dataset: fm.FlowDataset, cfg: GBMConfig) -> dict[str, np.ndarray]:
+    """Dispatch on cfg.split_strategy.
+
+    "surgery" delegates to fm.make_stratified_splits -- the exact split used by
+    train_flow_matching.py / tune_flow_matching_optuna.py -- so with the same
+    split_seed and fractions the baseline shares its test patients with the
+    Cosmos flow model. "outcome" stratifies jointly by surgery and the MACE label.
+    """
+    if cfg.split_strategy == "surgery":
+        return fm.make_stratified_splits(
+            dataset,
+            fm.TrainConfig(
+                split_seed=cfg.split_seed,
+                train_frac=cfg.train_frac,
+                val_frac=cfg.val_frac,
+                test_frac=cfg.test_frac,
+            ),
+        )
+    if cfg.split_strategy != "outcome":
+        raise ValueError(f"Unknown split_strategy: {cfg.split_strategy!r} (expected 'surgery' or 'outcome')")
+    y = dataset.x[:, fm.TARGET_NAMES.index(MACE_LABEL_NAME)].astype(np.int64)
+    return stratified_splits_by_outcome(dataset.surgery_type, y, cfg)
 
 
 def stratified_splits_by_outcome(
@@ -327,6 +362,7 @@ def save_plots(run_dir: Path, variant_probs: dict[str, np.ndarray], y_true: np.n
         fig.tight_layout()
         fig.savefig(run_dir / "evaluation_curves.png", dpi=120)
         plt.close(fig)
+        report_saved(run_dir / "evaluation_curves.png", "ROC/PR/reliability curves")
     except Exception as exc:  # pragma: no cover - plotting is optional
         warnings.warn(f"Skipped plotting: {exc}", stacklevel=2)
 
@@ -404,7 +440,7 @@ def fit_predict_variant(
 
 def run(dataset: fm.FlowDataset, cfg: GBMConfig) -> dict:
     x, feature_names, y = assemble_features(dataset)
-    splits = stratified_splits_by_outcome(dataset.surgery_type, y, cfg)
+    splits = make_splits(dataset, cfg)
     run_dir = make_run_dir(cfg.output_dir)
 
     overall_prevalence = float(y.mean())
@@ -460,9 +496,12 @@ def run(dataset: fm.FlowDataset, cfg: GBMConfig) -> dict:
     metrics_df = pd.DataFrame(all_metric_rows)
     operating_df = pd.DataFrame(all_operating_points)
     metrics_df.to_csv(run_dir / "metrics.csv", index=False)
+    report_saved(run_dir / "metrics.csv", "discrimination/calibration metrics")
     operating_df.to_csv(run_dir / "operating_points.csv", index=False)
+    report_saved(run_dir / "operating_points.csv", "operating points")
     if importances_frames:
         pd.concat(importances_frames, ignore_index=True).to_csv(run_dir / "feature_importances.csv", index=False)
+        report_saved(run_dir / "feature_importances.csv", "permutation importances")
 
     # Test-set predictions for both variants.
     test_idx = splits["test"]
@@ -470,6 +509,7 @@ def run(dataset: fm.FlowDataset, cfg: GBMConfig) -> dict:
     for variant_name, prob in variant_test_probs.items():
         predictions[f"prob_{variant_name}"] = prob
     predictions.to_csv(run_dir / "test_predictions.csv", index=False)
+    report_saved(run_dir / "test_predictions.csv", "test predictions")
 
     save_plots(run_dir, variant_test_probs, y[test_idx])
 
@@ -485,6 +525,7 @@ def run(dataset: fm.FlowDataset, cfg: GBMConfig) -> dict:
             f,
             indent=2,
         )
+    report_saved(run_dir / "config.json", "run config")
 
     print(f"\nDiscrimination/calibration (lower Brier better; AUPRC vs baseline={overall_prevalence:.3f}):")
     with pd.option_context("display.max_columns", None, "display.width", 200):
@@ -521,6 +562,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--split-seed", type=int, default=0)
     parser.add_argument("--target-specificity", type=float, default=0.90)
+    parser.add_argument("--split-strategy", type=str, default="surgery", choices=["surgery", "outcome"])
     parser.add_argument("--no-recalibrate", action="store_true")
     args = parser.parse_args()
 
@@ -529,6 +571,7 @@ def main() -> None:
         seed=args.seed,
         split_seed=args.split_seed,
         target_specificity=args.target_specificity,
+        split_strategy=args.split_strategy,
         recalibrate=not args.no_recalibrate,
     )
     try:
