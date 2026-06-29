@@ -1,0 +1,345 @@
+"""Optuna tuner for the joint multi-task flow-matching + MACE model.
+
+Mirrors ``tune_flow_matching_optuna.py`` but tunes
+``train_flow_matching_multitask.py`` (shared encoder -> flow head for continuous
+BMI/HbA1c outcomes + a classification head for the composite MACE label).
+
+Objective
+---------
+A single-objective minimization of a *fixed-weight* validation score::
+
+    objective = val_flow_loss + TUNE_CLS_WEIGHT * val_BCE
+
+The fixed weight is deliberately independent of the per-trial, *tuned*
+``cls_loss_weight``. If the objective used the trained weight, Optuna could
+trivially shrink it toward zero to lower the objective while ignoring MACE.
+Using a fixed weight keeps trials comparable and forces both heads to be good:
+the flow loss cannot be gamed by the weight, and the (unweighted) BCE reflects
+MACE quality regardless of how the trial weighted the two losses during
+training.
+
+Output goes to ``runs/python_flow_matching_multitask_optuna/`` by default so it
+never collides with the Cosmos flow study under
+``runs/python_flow_matching_optuna/``.
+
+Local smoke test without Cosmos::
+
+    python tune_flow_matching_multitask_optuna.py  # falls through to DB error
+    # or, from Python: tune_from_csv("fake_data/fake_mbs_cohort.csv", n_trials=3)
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, replace
+from pathlib import Path
+import json
+import sys
+import time
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+
+try:
+    import optuna
+except ImportError:  # pragma: no cover - exercised only without Optuna.
+    optuna = None
+
+import train_flow_matching as fm
+import train_flow_matching_multitask as mt
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "runs" / "python_flow_matching_multitask_optuna"
+DEFAULT_CSV_PATH = REPO_ROOT / "fake_data" / "fake_mbs_cohort.csv"
+
+N_TRIALS = 500
+TIMEOUT_SECONDS = None
+N_JOBS = 1
+FINAL_TRAIN_BEST = True
+MIN_TRIAL_STOP_STEP = 1500
+TUNE_CLS_WEIGHT = 1.0  # fixed objective weight (NOT the tuned cls_loss_weight)
+
+BASE_CONFIG = mt.MultiTaskConfig(
+    output_dir=str(DEFAULT_OUTPUT_DIR),
+    device="cuda" if torch.cuda.is_available() else "cpu",
+    seed=0,
+    split_seed=0,
+    num_steps=3000,
+    batch_size=2048,
+    val_every=150,
+    val_repeats=8,
+    early_stop_patience=6,
+    early_stop_min_delta=0.002,
+    sample_steps=50,
+    n_samples_per_patient=250,
+    select_metric="combined",
+)
+
+FINAL_CONFIG_OVERRIDES = {
+    "num_steps": 6000,
+    "val_every": 250,
+    "val_repeats": 8,
+    "early_stop_patience": 6,
+    "n_samples_per_patient": 250,
+}
+
+
+def require_optuna():
+    if optuna is None:
+        raise RuntimeError(
+            "Optuna is required for hyperparameter tuning, but it is not installed "
+            "in this Python environment."
+        )
+    return optuna
+
+
+def make_study_dir(output_dir: str | Path = DEFAULT_OUTPUT_DIR) -> Path:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    study_dir = output_dir / f"study_{time.strftime('%Y%m%d_%H%M%S')}"
+    study_dir.mkdir(parents=True, exist_ok=True)
+    (study_dir / "trial_logs").mkdir(parents=True, exist_ok=True)
+    return study_dir
+
+
+def suggest_config(trial, base_cfg: mt.MultiTaskConfig) -> mt.MultiTaskConfig:
+    return replace(
+        base_cfg,
+        seed=base_cfg.seed + trial.number,
+        hidden_dim=trial.suggest_categorical("hidden_dim", [32, 64, 128, 256]),
+        num_hidden_layers=trial.suggest_int("num_hidden_layers", 2, 5),
+        cond_hidden_dim=trial.suggest_categorical("cond_hidden_dim", [32, 64, 128]),
+        cond_num_layers=trial.suggest_int("cond_num_layers", 1, 3),
+        cls_hidden_dim=trial.suggest_categorical("cls_hidden_dim", [32, 64, 128]),
+        cls_num_layers=trial.suggest_int("cls_num_layers", 1, 3),
+        time_emb_dim=trial.suggest_categorical("time_emb_dim", [64, 128]),
+        time_scale=trial.suggest_categorical("time_scale", [1.0, 3.0, 10.0, 30.0]),
+        surgery_emb_dim=trial.suggest_categorical("surgery_emb_dim", [8, 16]),
+        learning_rate=trial.suggest_float("learning_rate", 1e-5, 3e-3, log=True),
+        weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
+        cls_loss_weight=trial.suggest_float("cls_loss_weight", 0.1, 10.0, log=True),
+        focal_gamma=trial.suggest_categorical("focal_gamma", [0.0, 1.0, 2.0]),
+        batch_size=trial.suggest_categorical("batch_size", [2048]),
+    )
+
+
+def write_json(path: Path, payload: dict) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+    mt.report_saved(path)
+
+
+def _bce(y_true: np.ndarray, prob: np.ndarray) -> float:
+    if prob.size == 0:
+        return float("nan")
+    p = np.clip(prob.astype(np.float64), 1e-6, 1.0 - 1e-6)
+    y = y_true.astype(np.float64)
+    return float(-np.mean(y * np.log(p) + (1.0 - y) * np.log(1.0 - p)))
+
+
+def train_validation_trial(dataset: fm.FlowDataset, cfg: mt.MultiTaskConfig, trial, study_dir: Path) -> float:
+    np.random.seed(cfg.seed)
+    torch.manual_seed(cfg.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(cfg.seed)
+
+    device = torch.device(cfg.device)
+    splits = mt.make_splits(dataset, cfg)
+    pre = mt.fit_preprocessing(dataset, splits["train"])
+    arrays = mt.split_arrays(dataset, splits, pre)
+    pos_weight = mt.resolve_pos_weight(cfg, arrays["train"]["y_mace"])
+
+    model = mt.MultiTaskNet(cfg, mt.X_CONT_DIM, len(fm.PATIENT_FEATURES)).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
+    rng = np.random.default_rng(cfg.seed)
+    batch_size = min(cfg.batch_size, max(1, arrays["train"]["x"].shape[0]))
+
+    best_score = float("inf")
+    best_step = -1
+    best_auprc = float("nan")
+    evals_since_improve = 0
+    logs = []
+
+    for step in range(1, cfg.num_steps + 1):
+        model.train()
+        batch = mt.batch_sample(arrays["train"], batch_size, rng)
+        x1 = fm.as_tensor(batch["x"], device)
+        mask = fm.as_tensor(batch["mask"], device)
+        surgery_idx = fm.as_tensor(batch["surgery_idx"], device, torch.long)
+        patient_features = fm.as_tensor(batch["patient_features"], device)
+        y_mace = fm.as_tensor(batch["y_mace"], device)
+
+        cond = model.encode(surgery_idx, patient_features)
+        x_t, t, u_t = fm.sample_conditional_path(x1)
+        pred = model.velocity(x_t, t, cond)
+        flow_loss = mt.flow_matching_loss(pred, u_t, mask)
+        cls_loss = mt.classification_loss(model.classify(cond), y_mace, pos_weight, cfg.focal_gamma)
+        total_loss = flow_loss + cfg.cls_loss_weight * cls_loss
+
+        optimizer.zero_grad()
+        total_loss.backward()
+        optimizer.step()
+        train_flow = float(flow_loss.detach().cpu())
+
+        should_eval = step == 1 or step % cfg.val_every == 0 or step == cfg.num_steps
+        if not should_eval:
+            continue
+
+        val_flow = mt.evaluate_flow_loss(model, arrays["val"], cfg, device)
+        val_prob = mt.predict_mace_proba(model, arrays["val"], device)
+        y_val = arrays["val"]["y_mace"].astype(np.int64)
+        val_bce = _bce(y_val, val_prob)
+        val_auprc = mt.discrimination_metrics(y_val, val_prob)["auprc"] if val_prob.size else float("nan")
+
+        flow_component = train_flow if np.isnan(val_flow) else val_flow
+        bce_component = 0.0 if np.isnan(val_bce) else val_bce
+        score = flow_component + TUNE_CLS_WEIGHT * bce_component
+
+        improved = score < best_score - cfg.early_stop_min_delta
+        if improved:
+            best_score = score
+            best_step = step
+            best_auprc = val_auprc
+            evals_since_improve = 0
+        else:
+            evals_since_improve += 1
+
+        logs.append(
+            {
+                "trial": trial.number,
+                "step": step,
+                "val_flow": val_flow,
+                "val_bce": val_bce,
+                "val_auprc": val_auprc,
+                "score": score,
+                "best_score": best_score,
+                "best_step": best_step,
+            }
+        )
+        trial.report(score, step)
+
+        if step >= MIN_TRIAL_STOP_STEP and trial.should_prune():
+            pd.DataFrame(logs).to_csv(study_dir / "trial_logs" / f"trial_{trial.number:04d}.csv", index=False)
+            raise optuna.TrialPruned()
+
+        if step >= MIN_TRIAL_STOP_STEP and evals_since_improve >= cfg.early_stop_patience:
+            break
+
+    pd.DataFrame(logs).to_csv(study_dir / "trial_logs" / f"trial_{trial.number:04d}.csv", index=False)
+    trial.set_user_attr("best_step", best_step)
+    trial.set_user_attr("best_val_auprc", float(best_auprc) if np.isfinite(best_auprc) else None)
+    trial.set_user_attr("device", cfg.device)
+    return float(best_score)
+
+
+def best_config_from_trial(best_trial, base_cfg: mt.MultiTaskConfig, study_dir: Path) -> mt.MultiTaskConfig:
+    cfg = replace(base_cfg, output_dir=str(study_dir / "best_model"), seed=base_cfg.seed)
+    for name, value in best_trial.params.items():
+        cfg = replace(cfg, **{name: value})
+    for name, value in FINAL_CONFIG_OVERRIDES.items():
+        cfg = replace(cfg, **{name: value})
+    return cfg
+
+
+def save_study_tables(study, study_dir: Path) -> None:
+    trials = study.trials_dataframe(attrs=("number", "value", "state", "params", "user_attrs"))
+    trials.to_csv(study_dir / "optuna_trials.csv", index=False)
+    mt.report_saved(study_dir / "optuna_trials.csv", "Optuna trials table")
+    write_json(
+        study_dir / "best_trial.json",
+        {
+            "number": study.best_trial.number,
+            "value": study.best_trial.value,
+            "params": study.best_trial.params,
+            "user_attrs": study.best_trial.user_attrs,
+        },
+    )
+
+
+def tune_dataset(
+    dataset: fm.FlowDataset,
+    base_cfg: mt.MultiTaskConfig = BASE_CONFIG,
+    n_trials: int = N_TRIALS,
+    timeout_seconds: int | None = TIMEOUT_SECONDS,
+    output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    final_train_best: bool = FINAL_TRAIN_BEST,
+) -> dict:
+    optuna_module = require_optuna()
+    study_dir = make_study_dir(output_dir)
+    write_json(
+        study_dir / "tuning_config.json",
+        {
+            "base_config": asdict(base_cfg),
+            "objective": "minimize val_flow + TUNE_CLS_WEIGHT * val_BCE",
+            "tune_cls_weight": TUNE_CLS_WEIGHT,
+            "final_config_overrides": FINAL_CONFIG_OVERRIDES,
+            "n_trials": n_trials,
+            "timeout_seconds": timeout_seconds,
+            "min_trial_stop_step": MIN_TRIAL_STOP_STEP,
+            "cont_names": mt.CONT_NAMES,
+            "x_cont_dim": mt.X_CONT_DIM,
+            "mace_label": mt.MACE_LABEL_NAME,
+            "source_label": dataset.source_label,
+            "n_patients": int(len(dataset.subject_ids)),
+        },
+    )
+
+    sampler = optuna_module.samplers.TPESampler(seed=base_cfg.seed)
+    pruner = optuna_module.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=MIN_TRIAL_STOP_STEP)
+    storage_url = f"sqlite:///{study_dir / 'optuna_study.sqlite3'}"
+    study = optuna_module.create_study(
+        direction="minimize",
+        sampler=sampler,
+        pruner=pruner,
+        study_name=f"flow_matching_multitask_{study_dir.name}",
+        storage=storage_url,
+    )
+
+    def objective(trial) -> float:
+        cfg = suggest_config(trial, base_cfg)
+        print(f"Trial {trial.number}: {trial.params}")
+        return train_validation_trial(dataset, cfg, trial, study_dir)
+
+    study.optimize(objective, n_trials=n_trials, timeout=timeout_seconds, n_jobs=N_JOBS, gc_after_trial=True)
+    save_study_tables(study, study_dir)
+
+    final_result = None
+    if final_train_best:
+        best_cfg = best_config_from_trial(study.best_trial, base_cfg, study_dir)
+        write_json(study_dir / "best_final_config.json", asdict(best_cfg))
+        final_result = mt.train_model(dataset, best_cfg)
+        write_json(
+            study_dir / "final_model.json",
+            {"run_dir": str(final_result["run_dir"]), "best_trial_number": study.best_trial.number},
+        )
+
+    print(f"Best trial {study.best_trial.number}: value={study.best_trial.value:.6f}")
+    print(f"Study artifacts saved to {study_dir}")
+    if final_result is not None:
+        print(f"Final best-model run saved to {final_result['run_dir']}")
+    return {"study": study, "study_dir": study_dir, "final_result": final_result}
+
+
+def tune_from_csv(csv_path: str | Path = DEFAULT_CSV_PATH, **kwargs) -> dict:
+    return tune_dataset(fm.load_dataset_from_csv(csv_path), **kwargs)
+
+
+def tune_from_database(**kwargs) -> dict:
+    try:
+        dataset = fm.load_dataset_from_database()
+    except RuntimeError as exc:
+        raise RuntimeError(str(exc).replace("call train_from_csv(...)", "call tune_from_csv(...)")) from exc
+    return tune_dataset(dataset, **kwargs)
+
+
+if __name__ == "__main__":
+    try:
+        tune_from_database()
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        warnings.warn("Interrupted by user; completed trials remain saved in the study directory.", stacklevel=1)
+        sys.exit(130)

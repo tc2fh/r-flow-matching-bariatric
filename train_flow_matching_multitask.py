@@ -74,6 +74,14 @@ X_CONT_DIM = int(CONT_DIMS.size)
 MACE_DIM = fm.TARGET_NAMES.index(MACE_LABEL_NAME)
 
 
+def report_saved(path, description: str = ""):
+    """Announce each saved artifact (with full path) so it is easy to locate in
+    the terminal when running on the Cosmos VM."""
+    tag = f" {description}" if description else ""
+    print(f"  [saved]{tag} -> {path}", flush=True)
+    return path
+
+
 @dataclass
 class MultiTaskConfig:
     output_dir: str = str(DEFAULT_OUTPUT_DIR)
@@ -83,6 +91,9 @@ class MultiTaskConfig:
     train_frac: float = 0.70
     val_frac: float = 0.15
     test_frac: float = 0.15
+    # "surgery" reproduces the Cosmos flow split (fm.make_stratified_splits) so test
+    # patients line up one-for-one; "outcome" stratifies jointly by surgery and MACE.
+    split_strategy: str = "surgery"
     # Shared encoder.
     surgery_emb_dim: int = 8
     cond_hidden_dim: int = 64
@@ -174,6 +185,31 @@ def stratified_splits_by_outcome(
     for key in splits:
         rng.shuffle(splits[key])
     return splits
+
+
+def make_splits(dataset: fm.FlowDataset, cfg: MultiTaskConfig) -> dict[str, np.ndarray]:
+    """Dispatch on cfg.split_strategy.
+
+    "surgery" delegates to fm.make_stratified_splits -- the exact split used by
+    train_flow_matching.py / tune_flow_matching_optuna.py -- so with the same
+    split_seed and fractions the multi-task model shares its test patients with
+    the Cosmos flow model (patient-for-patient comparison). "outcome" stratifies
+    jointly by surgery and the binary MACE label.
+    """
+    if cfg.split_strategy == "surgery":
+        return fm.make_stratified_splits(
+            dataset,
+            fm.TrainConfig(
+                split_seed=cfg.split_seed,
+                train_frac=cfg.train_frac,
+                val_frac=cfg.val_frac,
+                test_frac=cfg.test_frac,
+            ),
+        )
+    if cfg.split_strategy != "outcome":
+        raise ValueError(f"Unknown split_strategy: {cfg.split_strategy!r} (expected 'surgery' or 'outcome')")
+    y = dataset.x[:, MACE_DIM].astype(np.int64)
+    return stratified_splits_by_outcome(dataset.surgery_type, y, cfg)
 
 
 def fit_preprocessing(dataset: fm.FlowDataset, train_idx: np.ndarray) -> Preprocessing:
@@ -525,8 +561,7 @@ def train_model(dataset: fm.FlowDataset, cfg: MultiTaskConfig) -> dict:
     torch.manual_seed(cfg.seed)
     device = torch.device(cfg.device)
 
-    y_all = dataset.x[:, MACE_DIM].astype(np.int64)
-    splits = stratified_splits_by_outcome(dataset.surgery_type, y_all, cfg)
+    splits = make_splits(dataset, cfg)
     pre = fit_preprocessing(dataset, splits["train"])
     arrays = split_arrays(dataset, splits, pre)
     run_dir = make_run_dir(cfg.output_dir)
@@ -539,8 +574,10 @@ def train_model(dataset: fm.FlowDataset, cfg: MultiTaskConfig) -> dict:
             f,
             indent=2,
         )
+    report_saved(run_dir / "config.json", "run config")
     with (run_dir / "preprocessing.json").open("w", encoding="utf-8") as f:
         json.dump(pre.to_jsonable(), f, indent=2)
+    report_saved(run_dir / "preprocessing.json", "preprocessing stats")
 
     model = MultiTaskNet(cfg, X_CONT_DIM, len(fm.PATIENT_FEATURES)).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
@@ -649,9 +686,11 @@ def train_model(dataset: fm.FlowDataset, cfg: MultiTaskConfig) -> dict:
                 f"total={total_scalar:.4f}"
             )
 
+    report_saved(run_dir / "training_log.csv", "training log")
     if best_state is not None:
         model.load_state_dict(best_state)
     torch.save(model.state_dict(), run_dir / "model.pt")
+    report_saved(run_dir / "model.pt", "model checkpoint")
 
     return finalize_and_evaluate(model, arrays, pre, cfg, run_dir, best_step, early_stopped, device)
 
@@ -677,6 +716,7 @@ def finalize_and_evaluate(
     flow_table["best_step"] = best_step
     flow_table["early_stopped"] = early_stopped
     flow_table.to_csv(run_dir / "test_flow_metrics.csv", index=False)
+    report_saved(run_dir / "test_flow_metrics.csv", "continuous (BMI/HbA1c) test metrics")
 
     # --- MACE classification head ---
     val_prob = predict_mace_proba(model, arrays["val"], device)
@@ -700,6 +740,7 @@ def finalize_and_evaluate(
         mace_rows.append({"split": "test_calibrated", **discrimination_metrics(y_test, test_prob_cal)})
     mace_metrics = pd.DataFrame(mace_rows)
     mace_metrics.to_csv(run_dir / "test_mace_metrics.csv", index=False)
+    report_saved(run_dir / "test_mace_metrics.csv", "MACE discrimination metrics")
 
     thr_youden = youden_threshold(y_val, val_prob) if y_val.size else 0.5
     thr_spec = threshold_at_specificity(y_val, val_prob, cfg.target_specificity) if y_val.size else 0.5
@@ -711,6 +752,7 @@ def finalize_and_evaluate(
         ]
     )
     operating_points.to_csv(run_dir / "test_operating_points.csv", index=False)
+    report_saved(run_dir / "test_operating_points.csv", "MACE operating points")
 
     # --- Per-patient predictions (continuous + MACE) ---
     predictions = pd.DataFrame({"subject_id": test_arrays["subject_ids"]})
@@ -727,6 +769,7 @@ def finalize_and_evaluate(
     if calibrated:
         predictions["mace_prob_calibrated"] = test_prob_cal
     predictions.to_csv(run_dir / "test_predictions.csv", index=False)
+    report_saved(run_dir / "test_predictions.csv", "per-patient predictions (continuous + MACE)")
 
     print("\nContinuous-outcome (flow) test metrics:")
     print(flow_table.to_string(index=False))
@@ -772,10 +815,13 @@ def main() -> None:
     parser.add_argument("--cls-loss-weight", type=float, default=None)
     parser.add_argument("--focal-gamma", type=float, default=None)
     parser.add_argument("--select-metric", type=str, default=None, choices=["combined", "flow", "auprc"])
+    parser.add_argument("--split-strategy", type=str, default=None, choices=["surgery", "outcome"])
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
     cfg = MultiTaskConfig(output_dir=args.output_dir, device=args.device, seed=args.seed)
+    if args.split_strategy is not None:
+        cfg.split_strategy = args.split_strategy
     if args.num_steps is not None:
         cfg.num_steps = args.num_steps
     if args.cls_loss_weight is not None:
