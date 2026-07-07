@@ -63,6 +63,13 @@ import train_flow_matching as fm
 DEFAULT_OUTPUT_DIR = fm.REPO_ROOT / "runs" / "gbm_mace_baseline"
 MACE_LABEL_NAME = "mace_ever"
 
+# Extra comorbidity features pulled straight from ``dataset.frame`` and handed to
+# the GBM ONLY. They are deliberately NOT added to ``fm.PATIENT_FEATURES`` -- that
+# shared list feeds the flow + multi-task models too, and these belong to the risk
+# model. Trees route missing values natively, so they are passed through un-imputed
+# (NaNs preserved). See MACE_MODELING_DECISIONS.md (2026-07 session 2).
+GBM_EXTRA_FRAME_FEATURES = ["PMH_DM2", "PMH_hypertension"]
+
 
 def report_saved(path: Path, description: str = "") -> Path:
     """Announce each saved artifact (with full path) so it is easy to locate in
@@ -106,17 +113,50 @@ class GBMConfig:
 # --------------------------------------------------------------------------- #
 # Feature assembly + splitting
 # --------------------------------------------------------------------------- #
-def assemble_features(dataset: fm.FlowDataset) -> tuple[np.ndarray, list[str], np.ndarray]:
-    """Build the model matrix from the same conditioning the flow model sees.
+def frame_feature(dataset: fm.FlowDataset, canonical: str) -> np.ndarray | None:
+    """Pull a numeric column from ``dataset.frame`` by its canonical name.
 
-    Features: the 6 patient features + surgery type (sleeve/rnygb). Continuous
-    columns keep their NaNs -- the tree learners route missing values natively.
-    Label: the composite ``mace_ever`` indicator (MACE/Nephropathy/Retinopathy).
+    Tolerant of Cosmos casing / join suffixes (``.y``, ``_mbs`` ...): reuses the
+    same normalized-name matching ``fm.canonicalize_columns`` uses, so a column
+    that survives the SQL export under a slightly different spelling is still
+    found. ``dataset.frame`` is row-aligned with ``dataset.x`` /
+    ``patient_features_raw`` (all built from the same post-filter DataFrame), so
+    the returned vector lines up with the label and the rest of the matrix.
+    Returns a float64 array with NaNs preserved (trees handle them), or ``None``
+    when the column is absent.
+    """
+    matched = fm.find_compatible_column(list(dataset.frame.columns), canonical)
+    if matched is None:
+        return None
+    return fm.numeric(dataset.frame[matched]).to_numpy(dtype=np.float64)
+
+
+def assemble_features(dataset: fm.FlowDataset) -> tuple[np.ndarray, list[str], np.ndarray]:
+    """Build the model matrix for the composite-MACE risk GBM.
+
+    Features: the 6 shared patient features + surgery type (sleeve/rnygb) + the
+    extra comorbidity flags in ``GBM_EXTRA_FRAME_FEATURES`` (``PMH_DM2``,
+    ``PMH_hypertension``) pulled from ``dataset.frame``. These extras are GBM-only
+    -- they are pointedly NOT in ``fm.PATIENT_FEATURES`` (which also feeds the
+    flow/multi-task models). Continuous/binary columns keep their NaNs; the tree
+    learners route missing values natively. Label: the composite ``mace_ever``
+    indicator (MACE OR Nephropathy OR Retinopathy).
     """
     patient = dataset.patient_features_raw.astype(np.float64)
     surgery = dataset.surgery_idx.astype(np.float64).reshape(-1, 1)
-    x = np.hstack([patient, surgery])
+    columns = [patient, surgery]
     feature_names = list(dataset.patient_feature_names) + ["surgery_idx"]
+    for canonical in GBM_EXTRA_FRAME_FEATURES:
+        values = frame_feature(dataset, canonical)
+        if values is None:
+            warnings.warn(
+                f"GBM extra feature {canonical!r} not found in dataset.frame; skipping it.",
+                stacklevel=2,
+            )
+            continue
+        columns.append(values.reshape(-1, 1))
+        feature_names.append(canonical)
+    x = np.hstack(columns)
     mace_dim = fm.TARGET_NAMES.index(MACE_LABEL_NAME)
     y = dataset.x[:, mace_dim].astype(np.int64)
     return x, feature_names, y

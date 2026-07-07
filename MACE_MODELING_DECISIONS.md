@@ -28,6 +28,61 @@ MBSAQIP / Cosmos `MBSCohort` (bariatric surgery outcomes). **Newest entries on t
 
 ---
 
+## 2026-07-06 (session 3) — Digital-twin build EXECUTED (all six items shipped + smoke-tested)
+
+All six items from `NEXT_SESSION_BUILD_PROMPT.md` are implemented and smoke-tested on
+`fake_data/fake_mbs_cohort.csv` with the `mbsaqip_flow/.venv` (py3.13, HistGB fallback — no local
+xgboost). **Net UX = three commands:** `debug_attrition.py` → `train_twin_pipeline.py` →
+`evaluate_twin.py`. The pristine Cosmos core (`train_flow_matching.py`, `tune_flow_matching_optuna.py`)
+is byte-for-byte unmodified (verified via `git status`); the only edit to an existing file is
+`gbm_mace_baseline.py` (Item 2, +46/−6).
+
+**Files:**
+- `gbm_mace_baseline.py` (edited) — `assemble_features` now hstacks `PMH_DM2` + `PMH_hypertension`
+  pulled from `dataset.frame` via a new `frame_feature()` helper (uses `fm.find_compatible_column`,
+  tolerant of Cosmos casing/join suffixes; NaNs preserved). GBM-only — `fm.PATIENT_FEATURES` untouched.
+  Feature matrix is now 9 cols; both appear in `feature_importances.csv` (confirmed).
+- `debug_attrition.py` (new, read-only) — `--csv` / `--db`. Emits a terse `.txt` + 1-line stdout
+  headline. Sections: (a) per-feature missingness for conditioning + candidate features, (b) LOO on
+  `REQUIRED_PATIENT_FEATURES`, (c) CPT 43645 + other unrecognized codes, (d) stage decomposition.
+  Replays fm's filter predicates by import to *count* each drop (loader returns no counts); stages
+  reconcile exactly (raw − Σdrops = final N). `creatinine` NOT demoted — reported only.
+- `train_flow_matching_twin.py` (new) — fork of the multi-task trainer: cls head + 2 MACE dims
+  DROPPED; generates only the 15 continuous dims (`CONT_DIMS`); binary event added as a conditioning
+  input via `nn.Embedding(2, event_emb_dim)` into the shared encoder (mirrors surgery), teacher-forced
+  with the TRUE label. Reuses mt's preprocessing/split/loss by import. Module docstring documents the
+  chain-rule factorization, event-not-score, leak-free teacher-forcing, and GBM→Bernoulli→flow.
+- `tune_flow_matching_twin_optuna.py` (new) — twin sweep; objective = val flow loss only (no
+  cls/fixed-weight juggling). Separate dir `runs/python_flow_matching_twin_optuna/`. Save-as-you-go
+  per-trial logs + resumable SQLite (`load_if_exists=True` + `--study-dir` to resume).
+- `train_twin_pipeline.py` (new, command 2) — fits the GBM on the shared train split (saves a
+  config-deterministic run dir + a best-effort joblib pickle) → asserts the shared-split invariant →
+  launches the twin sweep on the SAME split. Manifest written before AND after the sweep.
+- `evaluate_twin.py` (new, command 3, monolithic) — GBM (histogram/calibration/discrimination +
+  bootstrap CIs + per-component + DeLong), Flow (factual + surgery-counterfactual BMI/HbA1c plots via
+  ev's model-agnostic machinery), Simulator (Modes A/B/C). 23 tagged artifacts (`gbm_`/`flow_`/`sim_`).
+
+**Design decisions made during the build (things the prompt left open):**
+- **Event conditioning = embedding, not raw scalar** (mirrors surgery exactly; verified live —
+  clamping event 0→1 shifts trajectories ~1.7 BMI/HbA1c units).
+- **Attrition stages include the two intermediate fm drops** (bad-event-interval, bad-glp1) between
+  the prompt's [CPT] and [missing-required] stages so counts reconcile to final N exactly.
+- **GBM persistence keeps the repo's retrain-from-config convention** (leak-free, portable) as the
+  source of truth; the joblib pickle is an added convenience. The evaluator refits the GBM
+  deterministically on the train split and calibrates on val (calibration is a *simulation*
+  requirement — the event marginal is only correct if calibrated).
+- **Flow plots reuse ev machinery model-agnostically**: the twin's own event-aware sampler produces
+  15-dim samples scattered into a full 17-dim array (MACE dims = 0), then handed to
+  `ev.plot_timecourse_factual_counterfactual` / `ev.timepoint_metric_table` (which take sample
+  arrays, not a model) — "keeps existing machinery" without an event-blind adapter.
+- **DeLong** validated to match sklearn AUC exactly; primary comparison is GBM-raw vs GBM-calibrated
+  (both free), with `--compare-predictions` for GBM-vs-other (aligned on subject_id).
+- On the 52-row fake cohort, val=7 (<10) ⇒ isotonic calibration and DeLong (n_pos=1) gracefully
+  degrade to skip/NaN; every stat is guarded. Real numbers appear on the real cohort (val ~4.3k,
+  test 571 events). **This build did NOT act on any attrition finding** (creatinine stays REQUIRED).
+
+---
+
 ## 2026-07 (session 2) — Reorientation to a modular digital twin: build plan, feature & validation decisions
 
 Committing the modular hybrid (calibrated GBM risk + event-conditioned flow) from an idea to the **active build plan**. Target UX: the research group runs **three commands** — (1) an attrition/missingness debug script, (2) a train script that fits the GBM then launches the flow Optuna sweep, (3) one monolithic evaluate script that emits every plot/table/output. The pristine Cosmos core (`train_flow_matching.py`, `tune_flow_matching_optuna.py`) stays untouched; all new work is new scripts or edits to the already-forked multi-task scripts. **All six items are implemented in one iteration — the build does NOT pause on the debug findings.** The debug output is informational: it decides whether we later *act* on optional data changes (e.g. demoting `creatinine`, adding more features), not whether the scripts get built.
