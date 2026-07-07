@@ -64,11 +64,23 @@ DEFAULT_OUTPUT_DIR = fm.REPO_ROOT / "runs" / "gbm_mace_baseline"
 MACE_LABEL_NAME = "mace_ever"
 
 # Extra comorbidity features pulled straight from ``dataset.frame`` and handed to
-# the GBM ONLY. They are deliberately NOT added to ``fm.PATIENT_FEATURES`` -- that
-# shared list feeds the flow + multi-task models too, and these belong to the risk
-# model. Trees route missing values natively, so they are passed through un-imputed
-# (NaNs preserved). See MACE_MODELING_DECISIONS.md (2026-07 session 2).
-GBM_EXTRA_FRAME_FEATURES = ["PMH_DM2", "PMH_hypertension"]
+# the GBM ONLY. They are deliberately NOT in ``fm.PATIENT_FEATURES`` -- that shared
+# list feeds the flow + multi-task models too, and these belong to the risk model.
+# Trees route missing values natively, so they are passed through un-imputed (NaNs
+# preserved). See MACE_MODELING_DECISIONS.md.
+#
+# NOTE: ``PMH_dyslipidemia`` is a requested risk feature but is intentionally absent
+# here -- it lives in ``fm.PATIENT_FEATURES`` (shared with the flow), so it already
+# reaches the GBM via ``patient_features_raw``; listing it here too would duplicate
+# the column. ``osa`` likewise arrives through the shared vector.
+GBM_EXTRA_FRAME_FEATURES = [
+    "PMH_DM2",
+    "PMH_hypertension",
+    "PMH_MI",
+    "PMH_stroke",
+    "PMH_AFib",
+    "PMH_VTE",
+]
 
 
 def report_saved(path: Path, description: str = "") -> Path:
@@ -134,13 +146,16 @@ def frame_feature(dataset: fm.FlowDataset, canonical: str) -> np.ndarray | None:
 def assemble_features(dataset: fm.FlowDataset) -> tuple[np.ndarray, list[str], np.ndarray]:
     """Build the model matrix for the composite-MACE risk GBM.
 
-    Features: the 6 shared patient features + surgery type (sleeve/rnygb) + the
-    extra comorbidity flags in ``GBM_EXTRA_FRAME_FEATURES`` (``PMH_DM2``,
-    ``PMH_hypertension``) pulled from ``dataset.frame``. These extras are GBM-only
-    -- they are pointedly NOT in ``fm.PATIENT_FEATURES`` (which also feeds the
-    flow/multi-task models). Continuous/binary columns keep their NaNs; the tree
-    learners route missing values natively. Label: the composite ``mace_ever``
-    indicator (MACE OR Nephropathy OR Retinopathy).
+    Features: the shared ``fm.PATIENT_FEATURES`` (which now include ``osa`` and
+    ``dyslipidemia`` alongside the original demographics/labs) + surgery type
+    (sleeve/rnygb) + the extra comorbidity flags in ``GBM_EXTRA_FRAME_FEATURES``
+    (``PMH_DM2``, ``PMH_hypertension``, ``PMH_MI``, ``PMH_stroke``, ``PMH_AFib``,
+    ``PMH_VTE``) pulled from ``dataset.frame``. The extras are GBM-only -- they are
+    pointedly NOT in ``fm.PATIENT_FEATURES`` (which also feeds the flow/multi-task
+    models); ``dyslipidemia`` reaches the GBM through the shared vector instead.
+    Continuous/binary columns keep their NaNs; the tree learners route missing
+    values natively. Label: the composite ``mace_ever`` indicator (MACE OR
+    Nephropathy OR Retinopathy).
     """
     patient = dataset.patient_features_raw.astype(np.float64)
     surgery = dataset.surgery_idx.astype(np.float64).reshape(-1, 1)

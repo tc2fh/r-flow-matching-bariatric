@@ -59,9 +59,11 @@ GASTRIC_BYPASS_VARIANT_CPT = "43645"  # a bypass variant currently dropped as un
 # PMH_* columns are discovered dynamically from the frame; these are the rest.
 EXPLICIT_CANDIDATE_FEATURES = ["eGFRatEvent", "InsulinStatus", "BiguanideStatus", "SGLT2Status"]
 
-# The six conditioning features, mapped to their raw source columns + coercion so
-# missingness reflects the RAW availability (mirrors fm.make_patient_features, but
-# without insulin_status' fillna(0), which would otherwise hide its missingness).
+# The conditioning features (fm.PATIENT_FEATURES), mapped to their raw source
+# columns + coercion so missingness reflects the RAW availability (mirrors
+# fm.make_patient_features, but without insulin_status' fillna(0), which would
+# otherwise hide its missingness). osa/dyslipidemia are binary comorbidity flags
+# promoted into the shared conditioning vector (2026-07 feature expansion).
 CONDITIONING_SOURCES: list[tuple[str, str, str]] = [
     ("age_at_surgery", "AgeAtEvent", "numeric"),
     ("sex_male", "Sex", "sex"),
@@ -69,6 +71,8 @@ CONDITIONING_SOURCES: list[tuple[str, str, str]] = [
     ("hba1c_at_surgery", "HbA1cAtEvent", "numeric"),
     ("bmi_at_surgery", "BMIatEvent", "numeric"),
     ("insulin_status", "InsulinStatus", "numeric"),
+    ("osa", "PMH_OSA", "numeric"),
+    ("dyslipidemia", "PMH_dyslipidemia", "numeric"),
 ]
 
 
@@ -206,12 +210,17 @@ def missingness_report(raw_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
         miss = int(values.isna().sum())
         cond_rows.append({"feature": name, "source": matched, "n": n, "missing": miss, "missing_pct": 100.0 * miss / n if n else np.nan})
 
-    # Candidate features: all PMH_* columns present + the explicitly named extras.
+    # Candidate features: all PMH_* columns present + the explicitly named extras,
+    # MINUS any source column already profiled as a conditioning feature (osa,
+    # dyslipidemia, and insulin_status all map to columns in this set) so nothing is
+    # double-listed across the conditioning and candidate sections.
+    conditioning_sources = {source_col for _, source_col, _ in CONDITIONING_SOURCES}
     pmh_cols = sorted(c for c in raw_df.columns if str(c).lower().startswith("pmh_"))
     candidate_names: list[str] = []
     for name in pmh_cols + EXPLICIT_CANDIDATE_FEATURES:
-        if name not in candidate_names:
-            candidate_names.append(name)
+        if name in conditioning_sources or name in candidate_names:
+            continue
+        candidate_names.append(name)
 
     cand_rows = []
     for name in candidate_names:

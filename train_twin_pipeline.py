@@ -228,7 +228,8 @@ def main() -> None:
     parser.add_argument("--train-frac", type=float, default=0.70)
     parser.add_argument("--val-frac", type=float, default=0.15)
     parser.add_argument("--test-frac", type=float, default=0.15)
-    parser.add_argument("--n-trials", type=int, default=500)
+    parser.add_argument("--n-trials", type=int, default=tune_twin.N_TRIALS,
+                        help="Twin-flow Optuna trials (defaults to the tuner's trimmed N_TRIALS).")
     parser.add_argument("--twin-num-steps", type=int, default=None, help="Override base sweep num_steps (smoke tests).")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--no-final-train", action="store_true")

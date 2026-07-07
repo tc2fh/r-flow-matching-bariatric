@@ -28,6 +28,51 @@ MBSAQIP / Cosmos `MBSCohort` (bariatric surgery outcomes). **Newest entries on t
 
 ---
 
+## 2026-07-07 (session 4) - Feature expansion EXECUTED: risk features to the GBM, comorbidity conditioning to the flow
+
+Acted on the session-2 feature-expansion decision ("features are the ceiling, not the model"). This is
+the FIRST change to the shared conditioning vector: a hard constraint in sessions 2-3 was to leave
+`fm.PATIENT_FEATURES` untouched, and that constraint is now **deliberately lifted** - we are
+intentionally enriching the flow's *trajectory* conditioning, not only the GBM's risk features.
+
+**Placement (clinically motivated split):**
+- **GBM risk model** (`GBM_EXTRA_FRAME_FEATURES`): added `PMH_MI`, `PMH_stroke`, `PMH_AFib`, `PMH_VTE`
+  (strong macrovascular / thrombotic MACE predictors). Extras list is now DM2, hypertension, MI, stroke,
+  AFib, VTE. These are the Tier-A features; DM2 + hypertension (session 3) were the pre-registered *weak*
+  ones, so this is the first real test of the ceiling thesis.
+- **Flow / twin / multi-task conditioning** (`fm.PATIENT_FEATURES`, 6 -> 8): added `osa` (`PMH_OSA`) and
+  `dyslipidemia` (`PMH_dyslipidemia`) - metabolic-syndrome-adjacent, plausibly shaping the BMI/HbA1c
+  trajectory. `dyslipidemia` is in BOTH models: it reaches the GBM through the shared vector, so it is
+  intentionally NOT duplicated in `GBM_EXTRA_FRAME_FEATURES`.
+
+**Decisions made:**
+- **OSA reaches the GBM too** (user call): the GBM is built on top of `patient_features_raw`, so anything
+  in the shared vector is visible to it. Rather than a strict flow-only exclusion, we let OSA ride into
+  the GBM - trees are robust, it is a real comorbidity, and the risk model wants more signal.
+- **Binary flags, NaN preserved in `make_patient_features`** (no `fillna`, unlike `insulin_status`): the
+  GBM routes native NaN; the dense flow/MT nets 0-fill them in `transform_patient_features` (they are NOT
+  in `CONTINUOUS_PATIENT_FEATURES`, so never standardized). Added `PMH_OSA` / `PMH_dyslipidemia` to
+  `required_columns()` so they canonicalize + assert (a fixed-width conditioning vector cannot gracefully
+  drop a column, unlike the GBM's optional frame features).
+
+**Consequence - full retrain required.** Conditioning width 6 -> 8 invalidates every existing
+flow/twin/multi-task checkpoint and the 6-feature GBM. Re-run `train_twin_pipeline.py` ->
+`evaluate_twin.py` (plus the multi-task / base sweeps if the head-to-head is being refreshed).
+
+**Verified (fake cohort, HistGB fallback):** 8-dim conditioning propagates to all three model
+constructors (no hardcoded width); binary flags are un-standardized and finite after transform; the GBM
+trains end-to-end with the 15-feature matrix captured in `config.json`; forward passes pass for base
+flow / twin / multi-task.
+
+**Also:** `debug_attrition.py` now groups `osa`/`dyslipidemia` under *conditioning* features (and
+de-dups `InsulinStatus`, which was previously double-listed as a candidate).
+
+**NOT acted on this session** (still pending): creatinine demotion, CPT `43645` -> `rnygb` mapping, and
+adding `eGFRatEvent` to the GBM (awaiting the real-cohort eGFR missingness - it sits below the fold in
+the 09:28:44 attrition report).
+
+---
+
 ## 2026-07-06 (session 3) — Digital-twin build EXECUTED (all six items shipped + smoke-tested)
 
 All six items from `NEXT_SESSION_BUILD_PROMPT.md` are implemented and smoke-tested on

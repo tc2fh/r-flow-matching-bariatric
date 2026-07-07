@@ -50,18 +50,24 @@ REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "runs" / "python_flow_matching_twin_optuna"
 DEFAULT_CSV_PATH = REPO_ROOT / "fake_data" / "fake_mbs_cohort.csv"
 
-N_TRIALS = 500
+# Sweep budget trimmed for time-boxed VM runs (was N_TRIALS=500, num_steps=3000,
+# MIN_TRIAL_STOP_STEP=1500). TPE finds a near-optimal config well inside ~150 trials
+# for the reduced 5-HP space below, the median pruner now bites at step 800 instead
+# of 1500, and the sweep trains at 2400 steps while the winner is still retrained at
+# 6000 (FINAL_CONFIG_OVERRIDES) -- so lower sweep fidelity costs ranking accuracy, not
+# the shipped model. Restore the originals for an exhaustive sweep when not time-boxed.
+N_TRIALS = 150
 TIMEOUT_SECONDS = None
 N_JOBS = 1
 FINAL_TRAIN_BEST = True
-MIN_TRIAL_STOP_STEP = 1500
+MIN_TRIAL_STOP_STEP = 800
 
 BASE_CONFIG = tw.TwinConfig(
     output_dir=str(DEFAULT_OUTPUT_DIR),
     device="cuda" if torch.cuda.is_available() else "cpu",
     seed=0,
     split_seed=0,
-    num_steps=3000,
+    num_steps=2400,
     batch_size=2048,
     val_every=150,
     val_repeats=8,
@@ -69,6 +75,19 @@ BASE_CONFIG = tw.TwinConfig(
     early_stop_min_delta=0.002,
     sample_steps=50,
     n_samples_per_patient=250,
+    # Low-impact architecture HPs pinned OUT of the Optuna search so the trimmed trial
+    # budget concentrates on the high-impact ones (learning_rate, weight_decay,
+    # hidden_dim, num_hidden_layers, time_scale). They are pinned HERE, not just inside
+    # suggest_config, because best_config_from_trial rebuilds the final model from
+    # BASE_CONFIG + the searched params -- anything absent from both would silently
+    # revert to a TwinConfig default. Values: modest embeddings for the 2-category
+    # surgery/event inputs, a slightly richer time embedding (cheap, helps the velocity
+    # field), and the mid-range conditioning MLP.
+    surgery_emb_dim=16,
+    event_emb_dim=8,
+    time_emb_dim=128,
+    cond_hidden_dim=64,
+    cond_num_layers=2,
 )
 
 FINAL_CONFIG_OVERRIDES = {
@@ -99,20 +118,17 @@ def make_study_dir(output_dir: str | Path = DEFAULT_OUTPUT_DIR) -> Path:
 
 
 def suggest_config(trial, base_cfg: tw.TwinConfig) -> tw.TwinConfig:
+    # Search only the high-impact HPs; the low-impact architecture dims and batch_size
+    # are pinned in BASE_CONFIG (see the note there) so the trimmed budget is spent
+    # where it moves the val flow loss.
     return replace(
         base_cfg,
         seed=base_cfg.seed + trial.number,
         hidden_dim=trial.suggest_categorical("hidden_dim", [32, 64, 128, 256]),
         num_hidden_layers=trial.suggest_int("num_hidden_layers", 2, 5),
-        cond_hidden_dim=trial.suggest_categorical("cond_hidden_dim", [32, 64, 128]),
-        cond_num_layers=trial.suggest_int("cond_num_layers", 1, 3),
-        time_emb_dim=trial.suggest_categorical("time_emb_dim", [64, 128]),
         time_scale=trial.suggest_categorical("time_scale", [1.0, 3.0, 10.0, 30.0]),
-        surgery_emb_dim=trial.suggest_categorical("surgery_emb_dim", [8, 16]),
-        event_emb_dim=trial.suggest_categorical("event_emb_dim", [4, 8, 16]),
         learning_rate=trial.suggest_float("learning_rate", 1e-5, 3e-3, log=True),
         weight_decay=trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
-        batch_size=trial.suggest_categorical("batch_size", [2048]),
     )
 
 

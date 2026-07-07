@@ -100,6 +100,8 @@ PATIENT_FEATURES = [
     "hba1c_at_surgery",
     "bmi_at_surgery",
     "insulin_status",
+    "osa",
+    "dyslipidemia",
 ]
 CONTINUOUS_PATIENT_FEATURES = [
     "age_at_surgery",
@@ -250,6 +252,12 @@ def required_columns() -> list[str]:
         "NephropathyInterval",
         "Retinopathy",
         "RetinopathyInterval",
+        # Comorbidity flags now used as flow conditioning features (make_patient_features):
+        # required so canonicalize_columns normalizes their names and a clean error is
+        # raised if a source export omits them (a fixed-width conditioning vector cannot
+        # gracefully drop a column, unlike the GBM's optional frame features).
+        "PMH_OSA",
+        "PMH_dyslipidemia",
     ]
     cols.extend(item[3] for item in BMI_TARGETS + HBA1C_TARGETS)
     return sorted(set(cols))
@@ -361,6 +369,13 @@ def make_patient_features(df: pd.DataFrame) -> pd.DataFrame:
             "hba1c_at_surgery": numeric(df["HbA1cAtEvent"]),
             "bmi_at_surgery": numeric(df["BMIatEvent"]),
             "insulin_status": numeric(df["InsulinStatus"]).fillna(0.0),
+            # Binary comorbidity flags (0/1). NaN is deliberately preserved (no
+            # fillna): the GBM reads patient_features_raw and routes missing values
+            # natively, while the dense flow/multi-task nets 0-fill them in
+            # transform_patient_features (they are not in CONTINUOUS_PATIENT_FEATURES,
+            # so they are never standardized).
+            "osa": numeric(df["PMH_OSA"]),
+            "dyslipidemia": numeric(df["PMH_dyslipidemia"]),
         },
         index=df.index,
     )
