@@ -13,3 +13,6 @@ data/
 # R and test caches
 .pytest_cache/
 __pycache__/
+
+# temporary folder
+temp/
