@@ -127,6 +127,12 @@ class FreezeConfig:
     device: str = "cpu"
     # Table 1.
     table_continuous: str = "median"
+    # Additive causal (target-trial emulation) + distributional + equity-fairness passes.
+    # Default ON: a bare `python freeze_run.py` runs the FULL study (tte_*, dist_*, fairness_*
+    # artifacts land in evaluation/, summarized into RUN_MANIFEST.json). --no-causal / --no-fairness
+    # opt out. They inherit the freeze's split_strategy, so --split-strategy temporal carries through.
+    with_causal: bool = True
+    with_fairness: bool = True
 
 
 # --------------------------------------------------------------------------- #
@@ -467,6 +473,13 @@ def build_manifest(cfg: FreezeConfig, frozen_dir: Path, dataset: fm.FlowDataset,
                 "error": figures_result.get("error"),
             },
         },
+        # --- Additive target-trial-emulation + distributional + equity-fairness summaries.
+        #     Full CSV/PNG artifacts live in evaluation/ (dist_*, tte_*, fairness_*); these are the
+        #     manifest-level headline blocks (PS-model AUC + trim, weight ESS, marginal-effect
+        #     headlines, absent confounders, per-subgroup calibration gaps). None when the pass was
+        #     skipped (--no-causal / --no-fairness) or if it failed (status field records which).
+        "causal_distributional": eval_summary.get("causal_distributional"),
+        "fairness": eval_summary.get("fairness"),
         "environment": {
             "platform": platform.platform(),
             "python_executable": sys.executable,
@@ -635,6 +648,7 @@ def freeze(cfg: FreezeConfig) -> Path:
         n_samples=cfg.n_samples, n_steps=cfg.n_steps, seed=cfg.eval_seed,
         n_show=ev.N_SHOW_PER_PROCEDURE, max_lines=ev.MAX_SAMPLE_LINES,
         n_boot=cfg.n_boot, device_name=cfg.device, compare_predictions=None,
+        with_causal=cfg.with_causal, with_fairness=cfg.with_fairness,
     )
 
     # --- 4. W4 four-arm event-conditioning trajectory ablation (guarded) ------ #
@@ -681,6 +695,18 @@ def freeze(cfg: FreezeConfig) -> Path:
     print(f"[freeze] trajectory ablation: {traj_result.get('status')} "
           f"(arms={traj_result.get('arms')}) | figures: {fig_art['status']} "
           f"(main={len(fig_art['main'])} supplement={len(fig_art['supplement'])})")
+
+    def _pass_status(block: dict | None) -> str:
+        if block is None:
+            return "skipped"
+        if isinstance(block, dict) and block.get("status"):
+            return str(block["status"])
+        return "ok"
+
+    cd_block = eval_summary.get("causal_distributional")
+    fr_block = eval_summary.get("fairness")
+    print(f"[freeze] causal+distributional (tte_*/dist_*): {_pass_status(cd_block)} | "
+          f"equity-fairness (fairness_*): {_pass_status(fr_block)}")
     print(f"[freeze] DONE. All artifacts under {frozen_dir}")
     return frozen_dir
 
@@ -716,6 +742,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n-boot", type=int, default=1000)
     p.add_argument("--device", default="cpu")
     p.add_argument("--continuous", dest="table_continuous", choices=["median", "mean"], default="median")
+    p.add_argument("--causal", dest="with_causal", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run the target-trial-emulation + distributional pass (tte_*/dist_* artifacts). "
+                        "Default ON; --no-causal skips it.")
+    p.add_argument("--fairness", dest="with_fairness", action=argparse.BooleanOptionalAction, default=True,
+                   help="Run the SVI/RUCA/race equity-fairness subgroup audit (fairness_* artifacts). "
+                        "Default ON; --no-fairness skips it.")
     p.add_argument("--smoke", action="store_true",
                    help="Minimal-but-real settings for a fast fake-cohort smoke test.")
     return p.parse_args()
@@ -754,6 +786,8 @@ def main() -> None:
         n_boot=args.n_boot,
         device=args.device,
         table_continuous=args.table_continuous,
+        with_causal=args.with_causal,
+        with_fairness=args.with_fairness,
     )
     if args.smoke:
         cfg = replace(

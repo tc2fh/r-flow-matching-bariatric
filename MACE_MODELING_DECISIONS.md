@@ -28,6 +28,136 @@ MBSAQIP / Cosmos `MBSCohort` (bariatric surgery outcomes). **Newest entries on t
 
 ---
 
+## 2026-07-10 (session 6) - Target-trial-emulation causal layer, expanded distributional metrics, equity-fairness audit (all wired into freeze_run)
+
+Build session. Implemented the TTE causal layer + expanded distributional evaluation (spec:
+`TTE_DISTRIBUTIONAL_RUN_PLAN.md`; manuscript methods: `METHODS_causal_distributional.md`) and a
+new SVI/RUCA/race equity-fairness subgroup audit, all reusing the frozen twin and wired into
+`freeze_run.py` so `python freeze_run.py` (and `--split-strategy temporal`) run the full study.
+
+**New modules (all new files; the pristine Cosmos core and W5 `calibration_twin.py` were NOT
+touched).**
+- `distributional_metrics.py` - pure proper scores + calibration: log-score, energy/variogram
+  (joint cross-horizon), interval/Winkler, pinball, sharpness, threshold-probability reliability
+  (ECE/MCE/Brier + Murphy decomposition), calibration slope/CITL, IPCW weights + attrition
+  stratification, Wasserstein/KS marginal distance. Reuses `baselines_trajectory.crps_ensemble`
+  (the one CRPS) and `calibration_twin` PIT/coverage; never reimplements them.
+- `causal_tte.py` - pure estimators + nuisance fitters: `build_L_A`, propensity (XGBoost, NaN
+  native), stabilized IPTW + trim + SMD/Love, IPCW censoring model, doubly-robust IPCW-AIPW,
+  E-value, RCT benchmark, c-for-benefit. No twin sampling, no file writes (unit-testable).
+- `run_tte.py` - orchestrator: samples the twin 5x total (4 arm x event blocks + 1 factual),
+  emits `tte_*` (causal) and `dist_*` (distributional) artifacts, returns manifest blocks.
+- `fairness_audit.py` - per-subgroup twin calibration/error + GBM discrimination + gaps, `fairness_*`.
+- `test_{distributional_metrics,causal_tte,fairness_audit}.py` (47 tests). Integration hook added
+  to `evaluate_twin.evaluate` (guarded; `--with-causal`/`--with-fairness`) and to `freeze_run.py`
+  (`FreezeConfig.with_causal`/`with_fairness`, default ON; `--no-causal`/`--no-fairness` opt out).
+
+**Decisions encoded (plan Part D, as actually implemented).**
+1. CPT -> arm: 43775 = SG; 43644 / 43846 / **43645 = RYGB**. Documented constants only
+   (`causal_tte.RYGB_CPTS`); the actual `CptCode -> dataset.surgery_idx` mapping is UPSTREAM in the
+   loader. TODO: verify 43645 is mapped (not dropped) in the loader - this also fixes the
+   "unrecognized CPT" drop noted earlier.
+2. Confounder set L = the GBM design matrix minus `surgery_idx` (the 5 SVI percentiles + comorbidity
+   flags + eGFR + baseline drug flags are ALREADY in it) plus RUCA + CoverageClass integer codes.
+   ABSENT confounders - GERD/reflux, surgeon/center, smoking - are named in code + manifest as the
+   exchangeability caveat and the E-value target.
+3. Race: `INCLUDE_RACE_IN_PS = False` - race enters the fairness audit ONLY, never the flow, GBM, or
+   PS model.
+4. Death (`DeathInterval`) censors the metabolic trajectory (cannot measure BMI/HbA1c post-mortem);
+   the censoring model targets observation-at-horizon directly. Competing-risk framing for the
+   complication endpoint is future work.
+5. Nuisance models fit on TRAIN, applied to TEST (no test-set cross-fit). The PS/censoring models
+   read the SAME split as the twin/GBM via the frozen `gbm_cfg`, so `--split-strategy temporal`
+   carries through with no extra flag.
+6. RCT backbone (`causal_tte.RCT_ANCHORS`) covers weight + glycemia ONLY; the composite-complication
+   contrast has no randomized anchor and is reported as exploratory with the widest E-value caveat.
+   **The anchor numbers are VERIFY-BEFORE-QUOTE** (illustrative pending a source check against
+   SLEEVEPASS / SM-BOSS / Oseberg / STAMPEDE).
+7. Unit reconciliation before any RCT benchmark: BMI-point ATE -> %TWL proxy (baseline BMI);
+   P(HbA1c < 5.7) stated against each trial's remission definition (a definition mismatch is flagged
+   in `tte_rct_benchmark.csv`, not silently compared).
+8. Estimand: marginal ATE (doubly-robust AIPW) primary; individual CATE (the twin) secondary,
+   validated by c-for-benefit. Point intervention -> ITT == per-protocol.
+
+**Corrections to the plan's reference code (verified against the live signatures first).** The
+twin's per-EVENT `mu1`/`mu0` in `evaluate_simulator` are NOT per-surgery-arm; the RYGB-vs-SG outcome
+model is built from the surgery clamp (the `bmi_threshold_probability.cohort_probability` pattern),
+risk-weighted over the event. `frame_feature("*_num")` does not exist (returns None); SVI is already
+in `assemble_features`, and RUCA/CoverageClass come via `frame_categorical` + factorize.
+
+**Distributional drift is a CROSS-RUN delta.** A single freeze emits calibration slope/CITL on its
+own fold (tagged `split_strategy`); the SOPHIA-style drift is the delta between a `surgery` run and a
+`--split-strategy temporal` run, computed from the two `RUN_MANIFEST.json`s. Run both.
+
+**How to run (collaborator, Cosmos VM).** `python freeze_run.py` = full study incl. tte_*/dist_*/
+fairness_* (causal + fairness default ON); add `--split-strategy temporal` for the out-of-time fold.
+Artifacts land in `runs/frozen/<ts>/evaluation/`; headline blocks (`causal_distributional`,
+`fairness`) go into `RUN_MANIFEST.json`. Local smoke: `python freeze_run.py --smoke` (fake cohort;
+tiny test n so most stats are NaN by design, but every artifact is written and the wiring runs).
+
+---
+
+## 2026-07-09 (session 5) - Lancet targeting, cohort-funnel understanding, clinical threshold readouts, reproducibility
+
+Strategy + tooling session (no model retrain). Full roadmap lives in a shared artifact;
+the engineering plan is `NEXT_RUN_PLAN.md` (W1-W7).
+
+**Journal strategy (benchmarked against SOPHIA).** Saux et al., *Lancet Digital Health*
+2023 (CART/LASSO, 7 pre-op features, 5-yr weight-trajectory calculator): external MAD
+2.8 / RMSE 4.7 kg/m^2 for BMI. Our trajectory MAD is competitive at matched timepoints;
+RMSE runs ~1 kg/m^2 worse with a 12m tail spike. We cannot win as a weight-trajectory
+calculator (SOPHIA owns it). **Decision: reframe around the gap SOPHIA concedes** -
+cardiometabolic-renal complications + a coupled risk+trajectory twin with
+counterfactuals. Primary target **Lancet Diabetes & Endocrinology** (clinical: risk tool
++ RYGB-vs-sleeve comparative effectiveness + diabetes remission); secondary **Lancet
+Digital Health** (methods: the twin, gated on fixing the Mode-C marginals). Same body of
+work converts to either.
+
+**Keep the GLP-1 filter** (user decision). `PriorGLP1 = 0` is a deliberate inclusion
+criterion (a clean GLP-1-naive surgical baseline, analogous to SOPHIA excluding prior
+bariatric). Report it in the attrition / CONSORT flow; do not remove. GLP-1-exposed
+patients live in the companion `GLP1Cohort`.
+
+**Temporal validation is the pre-submission minimum** (user). Feasible now: `ProcDateValue`
+is retained in `dataset.frame` and row-aligned, so a `split_strategy="temporal"` is a
+small change (NEXT_RUN_PLAN W3). Later-era test folds are more GLP-1-selected and less
+follow-up-mature - reportable, not disqualifying.
+
+**Cohort funnel understood (answers "why only ~28.7k?").** SlicerDicer ~500k bariatric
+patients -> `MBSCohort` table 91,357 (no WHERE) -> ~32k exported -> ~28.7k final. The
+~5.5x table-build cut is UPSTREAM of the visible query: narrow CPT set
+({43775 sleeve, 43644/43846 rnygb}), T2D-only (Table 1 is 100% DM2), and a structured-data
++ longitudinal-presence requirement. WHERE cuts are dominated by `PriorGLP1 = 0`
+(-47,832) and `ProcDateValue <= '2023-05-01'` (-28,712). ACTIONS: pull the `MBSCohort`
+build DDL; reconcile the query discrepancy (the R loader in `importing in r.txt` has
+`AND PMH_DM2 = 1`, but the Python `MBS_SQL` does not, yet Table 1 is 100% DM2 -> the T2D
+restriction lives in the table build, and `debug_attrition` replays the Python query so
+its per-clause list never shows the diabetes cut); render the funnel as a CONSORT figure.
+
+**New capability - clinical threshold probabilities** (`bmi_threshold_probability.py`,
+new). The flow's predictive sample distribution yields threshold probabilities a
+point predictor cannot: `P(BMI_t < 35)`, `P(HbA1c_t < 5.7)` = the fraction of a patient's
+samples past the cutoff. The script computes this as a per-surgery counterfactual clamp
+(the whole test cohort forced to each arm), with e=0 / e=1 / risk-weighted event
+handling; smoke-tested on the fake cohort (plumbing only - values meaningless, and the
+event columns coincide, consistent with the ~0 Mode A->B coupling). On the real VM twin
+this gives the per-surgery percent likelihoods (RYGB vs sleeve) the user asked for. Only
+trustworthy once the flow tail is calibrated (NEXT_RUN_PLAN W5). **Two new figures
+planned** (NEXT_RUN_PLAN W6): threshold-probability columns added to the per-patient
+trajectory figures (factual + counterfactual surgery, every timepoint), and a
+cohort-level median difference (rnygb - sleeve) curve for BMI and HbA1c in absolute
+units (BMI kg/m^2, HbA1c %-points; user decision 2026-07-09, not relative percent).
+
+**Reproducibility finding.** The committed fake twin checkpoint is stale: input dim 30 vs
+current 32 (the 6->8 patient-feature expansion, osa + dyslipidemia, commit `d721388`) -
+it load-fails with a size mismatch. Motivates the freeze harness (NEXT_RUN_PLAN W1): pin
+the code SHA + patient-feature width in the run manifest.
+
+**Docs added this session:** `NEXT_RUN_PLAN.md` (W1-W7 build plan),
+`bmi_threshold_probability.py`. All uncommitted.
+
+---
+
 ## 2026-07-07 (session 4) - Feature expansion EXECUTED: risk features to the GBM, comorbidity conditioning to the flow
 
 Acted on the session-2 feature-expansion decision ("features are the ceiling, not the model"). This is

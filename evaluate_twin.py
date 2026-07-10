@@ -1104,7 +1104,8 @@ def compare_trajectory_models(
 # --------------------------------------------------------------------------- #
 def evaluate(pipeline: Path | None, gbm_run: Path | None, twin_run: Path | None, csv_path: Path | None,
              output_dir: Path | None, n_samples: int, n_steps: int, seed: int, n_show: int, max_lines: int,
-             n_boot: int, device_name: str, compare_predictions: Path | None) -> dict:
+             n_boot: int, device_name: str, compare_predictions: Path | None,
+             with_causal: bool = False, with_fairness: bool = False) -> dict:
     # No explicit run pointers -> auto-discover the newest pipeline (so a bare run
     # works on the cluster right after train_twin_pipeline.py).
     if pipeline is None and gbm_run is None and twin_run is None:
@@ -1158,6 +1159,43 @@ def evaluate(pipeline: Path | None, gbm_run: Path | None, twin_run: Path | None,
     threshold_summary = evaluate_threshold_probabilities(model, dataset, splits, pre, twin_cfg, gbm, output_dir,
                                                          n_samples, n_steps, seed, device, pit_regimes)
 
+    # --- Additive causal (target-trial emulation) + distributional + equity-fairness passes.
+    #     Guarded so a failure here NEVER loses the core GBM/flow/simulator/threshold artifacts
+    #     already written. run_tte / fairness_audit are imported lazily (they import evaluate_twin
+    #     at module top, which is already loaded here) to avoid an import cycle. Both reuse the
+    #     objects already built above, so nothing is reloaded and the split is identical. run_tte
+    #     reads split_strategy from gbm_cfg, so a temporal freeze carries through automatically.
+    causal_distributional_summary = None
+    if with_causal:
+        try:
+            import run_tte
+            causal_distributional_summary = run_tte.run(
+                dataset=dataset, splits=splits, model=model, twin_cfg=twin_cfg, pre=pre,
+                gbm=gbm, gbm_cfg=gbm_cfg, output_dir=output_dir, device=device,
+                n_samples=n_samples, n_steps=n_steps, seed=seed, with_causal=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - the causal layer must never lose the eval
+            import traceback
+            traceback.print_exc()
+            warnings.warn(f"causal/distributional evaluation FAILED ({type(exc).__name__}: {exc}); "
+                          "core twin evaluation is intact.", stacklevel=2)
+            causal_distributional_summary = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+    fairness_summary = None
+    if with_fairness:
+        try:
+            import fairness_audit
+            fairness_summary = fairness_audit.run(
+                dataset=dataset, splits=splits, model=model, twin_cfg=twin_cfg, pre=pre,
+                gbm=gbm, gbm_cfg=gbm_cfg, output_dir=output_dir, device=device,
+                n_samples=n_samples, n_steps=n_steps, seed=seed, n_boot=n_boot,
+            )
+        except Exception as exc:  # noqa: BLE001 - the fairness audit must never lose the eval
+            import traceback
+            traceback.print_exc()
+            warnings.warn(f"fairness audit FAILED ({type(exc).__name__}: {exc}); "
+                          "core twin evaluation is intact.", stacklevel=2)
+            fairness_summary = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"}
+
     summary = {
         "pipeline_dir": None if pipeline is None else str(pipeline),
         "gbm_run_dir": str(gbm_run),
@@ -1172,6 +1210,8 @@ def evaluate(pipeline: Path | None, gbm_run: Path | None, twin_run: Path | None,
         "flow": flow_summary,
         "simulator": sim_summary,
         "threshold_probabilities": threshold_summary,
+        "causal_distributional": causal_distributional_summary,
+        "fairness": fairness_summary,
     }
     summary_path = output_dir / "eval_twin_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
@@ -1205,6 +1245,12 @@ def main() -> None:
                         help="num_steps for the inline no-event arm (defaults to the event arm's).")
     parser.add_argument("--no-baselines", dest="no_baselines", action="store_true",
                         help="Trajectory comparison: flow arms only (skip XGB/Ridge).")
+    parser.add_argument("--with-causal", action="store_true",
+                        help="Also run the target-trial-emulation + distributional pass (run_tte.run): "
+                             "writes tte_* and dist_* artifacts. Off by default here (freeze_run turns it on).")
+    parser.add_argument("--with-fairness", action="store_true",
+                        help="Also run the SVI/RUCA/race equity-fairness subgroup audit (fairness_audit.run): "
+                             "writes fairness_* artifacts. Off by default here (freeze_run turns it on).")
     args = parser.parse_args()
 
     if args.trajectory_comparison:
@@ -1221,6 +1267,7 @@ def main() -> None:
         output_dir=args.output_dir, n_samples=args.n_samples, n_steps=args.n_steps, seed=args.seed,
         n_show=args.n_show, max_lines=args.max_lines, n_boot=args.n_boot, device_name=args.device,
         compare_predictions=args.compare_predictions,
+        with_causal=args.with_causal, with_fairness=args.with_fairness,
     )
 
 
