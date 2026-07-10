@@ -114,12 +114,20 @@ class TwinConfig:
     val_frac: float = 0.15
     test_frac: float = 0.15
     # "surgery" reproduces the Cosmos flow split so test patients line up
-    # one-for-one with the GBM and the pristine flow; "outcome" stratifies jointly
-    # by surgery and the binary event.
+    # one-for-one with the GBM and the pristine flow; "temporal" is the out-of-time
+    # fold (fm.make_temporal_splits: earliest surgeries -> train, latest -> test),
+    # shared patient-for-patient with the GBM and Table 1; "outcome" stratifies
+    # jointly by surgery and the binary event.
     split_strategy: str = "surgery"
     # Shared encoder (surgery embedding + EVENT embedding + patient features).
     surgery_emb_dim: int = 8
     event_emb_dim: int = 8  # binary composite-event conditioning, handled like surgery
+    # W4 ablation toggle. True = event-CONDITIONED trajectory (the coupled twin);
+    # False = drop the event embedding entirely so the flow is UNCONDITIONED on the
+    # event (baseline that quantifies how much the coupling actually buys). One flag
+    # flips the whole model between the two arms; the encoder width shrinks by
+    # ``event_emb_dim`` when this is False (see TwinNet.__init__).
+    use_event: bool = True
     cond_hidden_dim: int = 64
     cond_num_layers: int = 2
     # Flow head.
@@ -151,8 +159,13 @@ def make_splits(dataset: fm.FlowDataset, cfg: TwinConfig) -> dict[str, np.ndarra
     "surgery" delegates to ``fm.make_stratified_splits`` (the exact split used by
     the pristine flow, the GBM, and the multi-task fork), so with a matching
     split_seed + fractions every model in the twin shares its test patients
-    patient-for-patient. "outcome" stratifies jointly by surgery and the binary
-    event via the multi-task fork's stratifier.
+    patient-for-patient. "temporal" delegates to ``fm.make_temporal_splits`` (the
+    out-of-time fold: earliest surgeries -> train, latest -> test); it shares the same
+    delegate, split_seed, and fractions as the GBM and Table 1, so under
+    ``split_strategy=="temporal"`` all three still see the identical patient-for-patient
+    partition (asserted in train_twin_pipeline via SHARED_SPLIT_KEYS). "outcome"
+    stratifies jointly by surgery and the binary event via the multi-task fork's
+    stratifier.
     """
     if cfg.split_strategy == "surgery":
         return fm.make_stratified_splits(
@@ -164,8 +177,18 @@ def make_splits(dataset: fm.FlowDataset, cfg: TwinConfig) -> dict[str, np.ndarra
                 test_frac=cfg.test_frac,
             ),
         )
+    if cfg.split_strategy == "temporal":
+        return fm.make_temporal_splits(
+            dataset,
+            fm.TrainConfig(
+                split_seed=cfg.split_seed,
+                train_frac=cfg.train_frac,
+                val_frac=cfg.val_frac,
+                test_frac=cfg.test_frac,
+            ),
+        )
     if cfg.split_strategy != "outcome":
-        raise ValueError(f"Unknown split_strategy: {cfg.split_strategy!r} (expected 'surgery' or 'outcome')")
+        raise ValueError(f"Unknown split_strategy: {cfg.split_strategy!r} (expected 'surgery', 'temporal', or 'outcome')")
     y = dataset.x[:, MACE_DIM].astype(np.int64)
     proxy = mt.MultiTaskConfig(
         split_seed=cfg.split_seed, train_frac=cfg.train_frac, val_frac=cfg.val_frac, test_frac=cfg.test_frac
@@ -182,6 +205,15 @@ class TwinNet(nn.Module):
     Mirrors ``MultiTaskNet`` but (a) drops the classification head and (b) adds a
     binary-event embedding into the shared encoder, so the flow is conditioned on
     (surgery, event, patient features).
+
+    W4 ablation -- ``cfg.use_event`` selects the arm:
+      * True  (default): encoder input = surgery_emb (8) + event_emb (8) + patient
+        features (8) = 24; this is the coupled, event-conditioned twin.
+      * False: the event embedding is not created and not concatenated, so the
+        encoder input = surgery_emb (8) + patient features (8) = 16, i.e. the event
+        arm width minus ``event_emb_dim``. A no-event checkpoint therefore carries
+        no ``event_emb.*`` tensors and a narrower ``encoder.0`` layer, so save/load
+        round-trips at exactly the right width in each mode.
     """
 
     def __init__(self, cfg: TwinConfig, x_cont_dim: int, patient_feature_dim: int, num_surgery_types: int = 2):
@@ -191,10 +223,18 @@ class TwinNet(nn.Module):
         self.x_cont_dim = x_cont_dim
         self.time_emb_dim = cfg.time_emb_dim
         self.time_scale = cfg.time_scale
+        self.use_event = cfg.use_event
         self.surgery_emb = nn.Embedding(num_surgery_types, cfg.surgery_emb_dim)
-        self.event_emb = nn.Embedding(2, cfg.event_emb_dim)
+        # The event embedding exists ONLY in the conditioned arm. Creating it
+        # conditionally (rather than building it and skipping it) keeps the checkpoint
+        # width honest: a no-event model has no event_emb weights and a narrower
+        # encoder, so it cannot silently load into an event-conditioned model.
+        event_dim = 0
+        if self.use_event:
+            self.event_emb = nn.Embedding(2, cfg.event_emb_dim)
+            event_dim = cfg.event_emb_dim
 
-        static_dim = cfg.surgery_emb_dim + cfg.event_emb_dim + patient_feature_dim
+        static_dim = cfg.surgery_emb_dim + event_dim + patient_feature_dim
         encoder_layers: list[nn.Module] = []
         in_dim = static_dim
         for _ in range(cfg.cond_num_layers):
@@ -215,8 +255,13 @@ class TwinNet(nn.Module):
 
     def encode(self, surgery_idx: torch.Tensor, patient_features: torch.Tensor, event_idx: torch.Tensor) -> torch.Tensor:
         surgery = self.surgery_emb(surgery_idx.long())
-        event = self.event_emb(event_idx.long())
-        static = torch.cat([surgery, event, patient_features], dim=-1)
+        if self.use_event:
+            event = self.event_emb(event_idx.long())
+            static = torch.cat([surgery, event, patient_features], dim=-1)
+        else:
+            # No-event arm: ``event_idx`` is still accepted so every trainer/sampler
+            # keeps one call signature, but it is deliberately dropped here.
+            static = torch.cat([surgery, patient_features], dim=-1)
         return self.encoder(static)
 
     def velocity(self, x_t: torch.Tensor, t: torch.Tensor, cond_repr: torch.Tensor) -> torch.Tensor:
@@ -470,8 +515,10 @@ def main() -> None:
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--num-steps", type=int, default=None)
-    parser.add_argument("--split-strategy", type=str, default=None, choices=["surgery", "outcome"])
+    parser.add_argument("--split-strategy", type=str, default=None, choices=["surgery", "temporal", "outcome"])
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--no-event", dest="no_event", action="store_true",
+                        help="W4 ablation: train the UNCONDITIONED arm (drop the event embedding).")
     args = parser.parse_args()
 
     cfg = TwinConfig(output_dir=args.output_dir, device=args.device, seed=args.seed)
@@ -479,6 +526,8 @@ def main() -> None:
         cfg.split_strategy = args.split_strategy
     if args.num_steps is not None:
         cfg.num_steps = args.num_steps
+    if args.no_event:
+        cfg.use_event = False
 
     try:
         if args.csv_path:

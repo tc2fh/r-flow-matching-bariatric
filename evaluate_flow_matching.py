@@ -815,17 +815,40 @@ def plot_timecourse_factual_counterfactual(
     title: str,
     max_sample_lines: int,
     y_limits: tuple[float, float] | None = None,
+    *,
+    threshold: float | None = None,
+    threshold_label: str | None = None,
+    trustworthy_months: set[float] | None = None,
+    vector_stem: Path | None = None,
 ) -> None:
+    """Per-patient factual vs surgery-counterfactual trajectories.
+
+    Legacy 3-column layout (band | counterfactual band | delta-median) when
+    ``threshold is None``. When a ``threshold`` is passed (W6 Figure spec A) TWO more
+    columns are added: column 4 = P(value < threshold) at every timepoint under the
+    FACTUAL surgery, column 5 = the same under the COUNTERFACTUAL (flipped) surgery.
+    The threshold probability is the fraction of that patient's samples past the cut -
+    the SAME definition as the W5 threshold machinery, read off the samples already
+    drawn for the bands. Horizons whose flow PIT regime is not 'calibrated' (not in
+    ``trustworthy_months``) are drawn with OPEN markers so an un-earned probability is
+    never shown as trustworthy. With ``vector_stem`` the figure is written as .pdf +
+    .svg + .png (journal deliverable) instead of a single .png.
+    """
     dims, months = target_dims(dataset, group)
+    n_cols = 5 if threshold is not None else 3
     n_rows = len(patient_idx)
     fig, axes = plt.subplots(
         n_rows,
-        3,
-        figsize=(15, max(2.65 * n_rows, 4)),
+        n_cols,
+        figsize=(3.0 * n_cols, max(2.65 * n_rows, 4)),
         sharex=True,
         squeeze=False,
         constrained_layout=True,
     )
+    if trustworthy_months is None:
+        trust_mask = np.ones(len(months), dtype=bool)
+    else:
+        trust_mask = np.array([float(m) in trustworthy_months for m in months], dtype=bool)
 
     def panel(ax, samples, color, panel_title, truth=None, obs=None):
         values = samples[:, dims]
@@ -860,6 +883,24 @@ def plot_timecourse_factual_counterfactual(
         ax.set_ylabel(f"Delta median {y_label}\nfactual - counterfactual")
         ax.grid(alpha=0.25)
 
+    def threshold_panel(ax, samples, color, panel_title):
+        # Per-patient P(value < threshold) at each timepoint = fraction of samples past
+        # the cut (identical to the W5 _hit_fraction on the display samples).
+        prob = (samples[:, dims] < threshold).mean(axis=0)
+        ax.plot(months, prob, color=color, lw=1.8, zorder=3)
+        # calibrated horizons: filled markers; calibration-dependent: open markers.
+        if trust_mask.any():
+            ax.plot(months[trust_mask], prob[trust_mask], linestyle="none", marker="o",
+                    ms=5, mfc=color, mec="white", mew=1.1, zorder=5)
+        if (~trust_mask).any():
+            ax.plot(months[~trust_mask], prob[~trust_mask], linestyle="none", marker="o",
+                    ms=5, mfc="white", mec=color, mew=1.4, zorder=5)
+        ax.set_ylim(-0.03, 1.03)
+        ax.set_title(panel_title)
+        ax.set_xlabel("Months post-op")
+        ax.set_ylabel(f"P({threshold_label or f'{y_label} < {threshold:g}'})")
+        ax.grid(alpha=0.25)
+
     for row, global_idx in enumerate(patient_idx):
         actual = INDEX_TO_SURGERY[int(dataset.surgery_idx[global_idx])]
         cf = INDEX_TO_SURGERY[int(1 - dataset.surgery_idx[global_idx])]
@@ -887,20 +928,38 @@ def plot_timecourse_factual_counterfactual(
             counterfactual_samples[row],
             f"{subject_id}: median factual - counterfactual",
         )
+        if threshold is not None:
+            threshold_panel(axes[row, 3], factual_samples[row], "tab:blue",
+                            f"{subject_id}: P(threshold) factual {actual}")
+            threshold_panel(axes[row, 4], counterfactual_samples[row], "tab:orange",
+                            f"{subject_id}: P(threshold) counterfactual {cf}")
 
     handles, labels = axes[0, 0].get_legend_handles_labels()
+    if threshold is not None:
+        from matplotlib.lines import Line2D
+        handles = handles + [
+            Line2D([0], [0], marker="o", linestyle="none", mfc="gray", mec="white",
+                   ms=6, label="calibrated horizon (trustworthy)"),
+            Line2D([0], [0], marker="o", linestyle="none", mfc="white", mec="gray",
+                   mew=1.4, ms=6, label="calibration-dependent (not trustworthy)"),
+        ]
+        labels = [h.get_label() for h in handles]
     fig.legend(
         handles,
         labels,
         loc="lower center",
         bbox_to_anchor=(0.5, -0.01),
-        ncol=4,
+        ncol=6 if threshold is not None else 4,
         frameon=False,
     )
     fig.suptitle(title, y=1.01)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=160, bbox_inches="tight")
-    plt.close(fig)
+    if vector_stem is not None:
+        from figures import style as _fstyle
+        _fstyle.save_figure(fig, vector_stem)  # writes .pdf + .svg + .png, closes fig
+    else:
+        fig.savefig(output_path, dpi=160, bbox_inches="tight")
+        plt.close(fig)
     report_saved(output_path)
 
 

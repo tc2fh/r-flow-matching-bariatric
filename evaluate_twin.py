@@ -67,6 +67,8 @@ import train_flow_matching_multitask as mt
 import train_flow_matching_twin as tw
 import gbm_mace_baseline as gb
 import evaluate_flow_matching as ev
+import baselines_trajectory as bt  # W4: per-horizon XGB/Ridge arms + scoring primitives
+import calibration_twin as cal  # W5: PIT/coverage/CRPS + split-conformal for trajectory intervals
 
 try:
     from scipy import stats as scipy_stats
@@ -127,6 +129,7 @@ def load_twin_preprocessing(twin_run_dir: Path) -> mt.Preprocessing:
         static_continuous_idx=np.asarray(raw["static_continuous_idx"], dtype=np.int64),
         patient_feature_names=list(raw["patient_feature_names"]),
         cont_names=list(raw["cont_names"]),
+        conformal=raw.get("conformal"),  # W5: None for pre-W5 runs (backward compatible)
     )
 
 
@@ -487,8 +490,35 @@ def _plot_gbm_curves(y: np.ndarray, prob: np.ndarray, path: Path) -> None:
 # --------------------------------------------------------------------------- #
 # Flow section: factual + counterfactual trajectory plots (reuse ev machinery)
 # --------------------------------------------------------------------------- #
+def _persist_conformal(twin_run: Path | None, pre: mt.Preprocessing) -> bool:
+    """Re-save the run's preprocessing.json with the fitted conformal calibrator attached
+    (additive: only adds the ``conformal`` key), then reload and verify the per-horizon Q
+    round-trips through Preprocessing save/load. Returns the round-trip PASS/FAIL bool.
+
+    Writing back into the twin RUN dir is what makes the calibrator "saved with the run":
+    the twin persists ``mt.Preprocessing`` (aliased ``tw.Preprocessing``) to
+    preprocessing.json, so that file -- not ``fm.Preprocessing`` -- is the container the
+    run loads. Any future load_twin_preprocessing() therefore reconstructs the calibrator.
+    """
+    if twin_run is None:
+        return False
+    pp_path = Path(twin_run) / "preprocessing.json"
+    try:
+        pp_path.write_text(json.dumps(pre.to_jsonable(), indent=2), encoding="utf-8")
+        reloaded = load_twin_preprocessing(Path(twin_run))
+        q_before = cal.conformal_q_array(pre.conformal, pre.cont_names)
+        q_after = cal.conformal_q_array(reloaded.conformal, reloaded.cont_names)
+        ok = reloaded.conformal is not None and np.allclose(q_before, q_after, equal_nan=True)
+        ev.report_saved(pp_path, "preprocessing.json (+conformal calibrator, saved with the run)")
+        print(f"  conformal round-trip through Preprocessing save/load: {'PASS' if ok else 'FAIL'}")
+        return bool(ok)
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(f"Could not persist conformal calibrator into {pp_path}: {exc}", stacklevel=2)
+        return False
+
+
 def evaluate_flow(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preprocessing, twin_cfg: tw.TwinConfig,
-                  output_dir: Path, n_samples: int, n_steps: int, seed: int, n_show: int,
+                  twin_run: Path | None, output_dir: Path, n_samples: int, n_steps: int, seed: int, n_show: int,
                   max_lines: int, device: torch.device) -> dict:
     test_idx = splits["test"]
     sample_cfg = replace(twin_cfg, n_samples_per_patient=n_samples, sample_steps=n_steps)
@@ -504,22 +534,59 @@ def evaluate_flow(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preproce
     ev.selected_patient_frame(dataset, selected).to_csv(output_dir / "eval_flow_selected_test_patients.csv", index=False)
     ev.report_saved(output_dir / "eval_flow_selected_test_patients.csv", "selected display patients")
 
+    # Mode-A timepoint metrics over the full test set (true-event conditioning).
+    test_arrays = arrays_for(dataset, test_idx, pre)
+    full = scatter_to_full(twin_samples_15(model, test_arrays, test_arrays["y_mace"], sample_cfg, pre, device))
+
+    # --- W5: trajectory-distribution calibration, computed from the FULL predictive
+    # samples BEFORE the median collapse below. Keep the 15 continuous dims; score PIT /
+    # coverage / CRPS against the observed targets, diagnose each horizon's PIT regime,
+    # then fit split-conformal on val and apply to test. We sample val under the SAME
+    # Mode-A (true-event) conditioning so the conformal residuals match the test band.
+    cont_test = full[:, :, tw.CONT_DIMS]  # (n_test, n_samples, 15) original units
+    split_data = mt.split_arrays(dataset, splits, pre)
+    test_split, val_split = split_data["test"], split_data["val"]
+    val_idx = splits["val"]
+    val_arrays = arrays_for(dataset, val_idx, pre)
+    cont_val = twin_samples_15(model, val_arrays, val_arrays["y_mace"], sample_cfg, pre, device)
+    calibration = cal.calibrate_flow_predictions(
+        cont_test=cont_test, obs_test=test_split["original_x"], mask_test=test_split["original_mask"],
+        cont_val=cont_val, obs_val=val_split["original_x"], mask_val=val_split["original_mask"],
+        cont_names=list(tw.CONT_NAMES), cont_groups=list(tw.CONT_GROUPS),
+        subject_ids_test=test_split["subject_ids"], output_dir=output_dir, report_saved=ev.report_saved,
+    )
+    # Attach the fitted calibrator to Preprocessing and re-save it WITH the run so it is
+    # reloaded on every future load; prove it round-trips through save/load.
+    pre.conformal = calibration["conformal"]
+    roundtrip_ok = _persist_conformal(twin_run, pre)
+
+    # W6 Figure spec A: the per-patient trajectory figures, EXTENDED from 3 to 5 columns
+    # (columns 4-5 add per-timepoint P(threshold) under factual & counterfactual surgery)
+    # and written as .pdf + .svg + .png. Rendered HERE (after calibration) so non-calibrated
+    # horizons can be flagged from the PIT regime just diagnosed above.
+    _name_to_month = {item[0]: float(item[2]) for item in fm.TARGET_SPECS}
+
+    def _trust_months(grp: str) -> set[float]:
+        return {_name_to_month[n] for n, d in calibration["regime_by_horizon"].items()
+                if d.get("group") == grp and d.get("regime") == "calibrated" and n in _name_to_month}
+
     ev.plot_timecourse_factual_counterfactual(
         dataset, selected, factual, counterfactual, "bmi", "BMI",
         output_dir / "eval_flow_bmi_factual_counterfactual_examples_test.png",
-        f"Twin BMI factual vs surgery-counterfactual ({n_show}/arm, event conditioned)",
+        f"Twin BMI factual vs surgery-counterfactual ({n_show}/arm; +P(BMI<35) per timepoint)",
         max_lines, y_limits=(15.0, 90.0),
+        threshold=35.0, threshold_label="BMI < 35", trustworthy_months=_trust_months("bmi"),
+        vector_stem=output_dir / "eval_flow_bmi_factual_counterfactual_examples_test",
     )
     ev.plot_timecourse_factual_counterfactual(
         dataset, selected, factual, counterfactual, "hba1c", "HbA1c",
         output_dir / "eval_flow_hba1c_factual_counterfactual_examples_test.png",
-        f"Twin HbA1c factual vs surgery-counterfactual ({n_show}/arm, event conditioned)",
+        f"Twin HbA1c factual vs surgery-counterfactual ({n_show}/arm; +P(HbA1c<5.7) per timepoint)",
         max_lines, y_limits=(3.0, 15.0),
+        threshold=5.7, threshold_label="HbA1c < 5.7", trustworthy_months=_trust_months("hba1c"),
+        vector_stem=output_dir / "eval_flow_hba1c_factual_counterfactual_examples_test",
     )
 
-    # Mode-A timepoint metrics over the full test set (true-event conditioning).
-    test_arrays = arrays_for(dataset, test_idx, pre)
-    full = scatter_to_full(twin_samples_15(model, test_arrays, test_arrays["y_mace"], sample_cfg, pre, device))
     point_predictions = np.median(full, axis=1)
     timepoint = ev.timepoint_metric_table(dataset, test_idx, point_predictions)
     timepoint.to_csv(output_dir / "eval_flow_timepoint_metrics_test.csv", index=False)
@@ -527,7 +594,11 @@ def evaluate_flow(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preproce
     ev.render_table(timepoint.round(3), output_dir / "eval_flow_timepoint_metrics_test.png",
                     "Flow Mode-A (true-event) timepoint MAD/RMSE (test)")
     return {"selected_subject_ids": dataset.subject_ids[selected].tolist(),
-            "timepoint_metrics_modeA": timepoint.to_dict(orient="records")}
+            "timepoint_metrics_modeA": timepoint.to_dict(orient="records"),
+            "calibration": {"regime_by_horizon": calibration["regime_by_horizon"],
+                            "coverage": calibration["coverage"], "crps": calibration["crps"],
+                            "pit": calibration["pit"], "conformal": calibration["conformal"],
+                            "conformal_roundtrip_ok": roundtrip_ok, "artifacts": calibration["artifacts"]}}
 
 
 # --------------------------------------------------------------------------- #
@@ -540,7 +611,7 @@ def cont_observed(test_arrays_original_x: np.ndarray, mask: np.ndarray, dim: int
 
 def evaluate_simulator(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preprocessing, twin_cfg: tw.TwinConfig,
                        gbm: dict, output_dir: Path, n_samples: int, n_steps: int, seed: int,
-                       device: torch.device) -> dict:
+                       device: torch.device, pit_regimes: dict | None = None) -> dict:
     test_idx = splits["test"]
     sample_cfg = replace(twin_cfg, n_samples_per_patient=n_samples, sample_steps=n_steps)
     arrays = mt.split_arrays(dataset, splits, pre)["test"]
@@ -590,25 +661,49 @@ def evaluate_simulator(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Pre
     _plot_event_marginal(y_test, p, drawn, output_dir / "eval_sim_event_marginal.png")
     summary["event_marginal"] = marg.to_dict(orient="records")[0]
 
-    # (C2) trajectory marginals: per-timepoint sim vs observed (KS + quantiles)
+    # (C2) trajectory marginals: per-timepoint sim vs observed (KS + quantiles).
+    # W5 cross-reference: a Mode-C marginal mismatch (KS rejects, e.g. BMI biased high)
+    # and a LOCATION-SHIFTED PIT at the same horizon are the SAME sampler bias, not two
+    # findings. We surface the PIT regime here and flag the shared root cause so nobody
+    # "calibrates over" it -- conformal widening cannot fix a biased center; the sampler
+    # must be fixed. (The PIT is Mode-A/true-event; Mode-C draws the event, but both ride
+    # the same conditional flow, so a biased conditional shows up in both.)
+    pit_regimes = pit_regimes or {}
     marg_rows = []
+    shared_root_cause_dims = []
     for dim, name in enumerate(tw.CONT_NAMES):
         observed = cont_observed(original_x, mask, dim)
         simulated = sim[:, :, dim].reshape(-1)
         ks_stat, ks_p = _ks(simulated, observed)
+        reg = pit_regimes.get(name, {})
+        regime = reg.get("regime", "unknown")
+        ks_rejects = bool(np.isfinite(ks_p) and ks_p < 0.05)
+        same_root_cause = bool(ks_rejects and regime == "location-shift")
+        if same_root_cause:
+            shared_root_cause_dims.append(name)
         marg_rows.append({
             "outcome": name, "n_observed": int(observed.size),
             "obs_p10": _q(observed, 0.10), "sim_p10": _q(simulated, 0.10),
             "obs_p50": _q(observed, 0.50), "sim_p50": _q(simulated, 0.50),
             "obs_p90": _q(observed, 0.90), "sim_p90": _q(simulated, 0.90),
             "ks_stat": ks_stat, "ks_p": ks_p,
+            "pit_regime": regime, "pit_mean": reg.get("mean_pit", float("nan")),
+            "same_root_cause_as_pit": same_root_cause,
         })
     traj_marg = pd.DataFrame(marg_rows)
     traj_marg.to_csv(output_dir / "eval_sim_trajectory_marginals.csv", index=False)
-    ev.report_saved(output_dir / "eval_sim_trajectory_marginals.csv", "Mode C trajectory marginals (KS/quantiles)")
+    ev.report_saved(output_dir / "eval_sim_trajectory_marginals.csv", "Mode C trajectory marginals (KS/quantiles + PIT cross-ref)")
     ev.render_table(traj_marg.round(3), output_dir / "eval_sim_trajectory_marginals.png",
-                    "Simulated vs observed per-timepoint marginals (KS/quantiles)")
+                    "Simulated vs observed per-timepoint marginals (KS/quantiles + PIT regime)")
+    if shared_root_cause_dims:
+        print("  Mode-C <-> PIT cross-reference: KS mismatch AND location-shifted PIT (SAME sampler bias, "
+              f"do NOT calibrate over it) at: {shared_root_cause_dims}")
     summary["trajectory_marginals"] = traj_marg.to_dict(orient="records")
+    summary["mode_c_pit_crossref"] = {
+        "shared_root_cause_dims": shared_root_cause_dims,
+        "note": ("Horizons where the Mode-C marginal KS rejects (p<0.05) and the Mode-A PIT is location-shifted "
+                 "share one root cause: a biased flow sampler. Conformal will not fix it; retrain/debias the sampler."),
+    }
 
     # (C3) event-stratified contrast: sim (drawn event) vs data (true event)
     sim_mean_by_event = {e: sim[drawn == e].reshape(-1, 15).mean(axis=0) if (drawn == e).any() else np.full(15, np.nan)
@@ -719,6 +814,292 @@ def _plot_surgery_counterfactual(risk_delta: np.ndarray, bmi_delta: np.ndarray, 
 
 
 # --------------------------------------------------------------------------- #
+# W5: threshold-probability readout (frozen-run artifact feeding the W6 figures)
+# --------------------------------------------------------------------------- #
+def _plot_threshold_probabilities(summ: pd.DataFrame, path: Path) -> None:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5))
+    panels = [(axes[0], "bmi", "P(BMI < 35)"), (axes[1], "hba1c", "P(HbA1c < 5.7)")]
+    for ax, group, title in panels:
+        sub = summ[summ["group"] == group]
+        tps = list(dict.fromkeys(sub["timepoint"]))
+        xpos = {tp: i for i, tp in enumerate(tps)}
+        for arm, colour in [("factual", "tab:blue"), ("counterfactual", "tab:orange")]:
+            s = sub[sub["surgery_arm"] == arm]
+            if s.empty:
+                continue
+            ax.plot([xpos[tp] for tp in s["timepoint"]], s["cohort_p_risk_mean"], marker="o", label=arm, color=colour)
+        ax.set_xticks(range(len(tps))); ax.set_xticklabels(tps, rotation=45, ha="right", fontsize=8)
+        ax.set(title=f"{title} (cohort mean, risk-weighted)", ylabel="probability", ylim=(0, 1.02))
+        ax.legend(fontsize=8)
+    fig.tight_layout(); path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=150); plt.close(fig)
+    ev.report_saved(path, "threshold-probability curves (factual vs counterfactual)")
+
+
+def evaluate_threshold_probabilities(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preprocessing,
+                                     twin_cfg: tw.TwinConfig, gbm: dict, output_dir: Path, n_samples: int,
+                                     n_steps: int, seed: int, device: torch.device,
+                                     pit_regimes: dict | None = None) -> dict:
+    """Frozen-run artifact: per-patient x per-timepoint threshold probabilities.
+
+    P(BMI < 35) at BMI 3m..6y and P(HbA1c < 5.7) at HbA1c 12m..6y, for each patient's
+    FACTUAL surgery and its surgery COUNTERFACTUAL, risk-weighted over the composite
+    event (deployable marginal). Reuses the twin sampling machinery (twin_samples_15 with
+    surgery clamped factual / flipped) and the GBM's factual / flipped calibrated risk.
+    These feed the W6 figures.
+
+    CALIBRATION-DEPENDENCE (encoded on purpose): a threshold probability is the sample
+    tail mass past the cut, so it inherits the flow's tail calibration. It is trustworthy
+    only where the PIT/coverage pass calls the horizon calibrated; the summary carries each
+    timepoint's pit_regime + a calibration_trustworthy flag so W6 never plots an interval
+    the sampler has not earned.
+    """
+    import bmi_threshold_probability as thr  # lazy: thr imports evaluate_twin (avoid an import cycle)
+
+    test_idx = splits["test"]
+    sample_cfg = replace(twin_cfg, n_samples_per_patient=n_samples, sample_steps=n_steps)
+    torch.manual_seed(seed); np.random.seed(seed)
+    base_arrays = arrays_for(dataset, test_idx, pre)
+    subject_ids = dataset.subject_ids[test_idx]
+    targets = thr.default_threshold_targets()
+    p_fac = gbm["test_cal"] if gbm["calibrated"] else gbm["test_raw"]
+    p_cf = gbm["test_cf_cal"] if gbm["calibrated"] else gbm["test_cf_raw"]
+
+    table = thr.threshold_probability_table(model, base_arrays, subject_ids, targets,
+                                            p_fac, p_cf, sample_cfg, pre, device)
+    per_patient_path = output_dir / "eval_flow_threshold_probabilities.csv"
+    table.to_csv(per_patient_path, index=False)
+    ev.report_saved(per_patient_path, "per-patient x per-timepoint threshold probabilities (factual/counterfactual)")
+
+    # Cohort summary per timepoint x arm, annotated with the PIT regime + trust flag.
+    pit_regimes = pit_regimes or {}
+    summ = (table.groupby(["group", "timepoint", "threshold", "direction", "surgery_arm"], sort=False)["p_risk"]
+            .agg(["mean", "std", "count"]).reset_index()
+            .rename(columns={"mean": "cohort_p_risk_mean", "std": "cohort_p_risk_std", "count": "n_test"}))
+    summ["pit_regime"] = summ["timepoint"].map(lambda tp: pit_regimes.get(tp, {}).get("regime", "unknown"))
+    summ["calibration_trustworthy"] = summ["pit_regime"] == "calibrated"
+    summ["calibration_dependent"] = True
+    summary_path = output_dir / "eval_flow_threshold_probabilities_summary.csv"
+    summ.to_csv(summary_path, index=False)
+    ev.report_saved(summary_path, "threshold-probability cohort summary (+PIT regime / trust flag)")
+    ev.render_table(summ.round(3), output_dir / "eval_flow_threshold_probabilities_summary.png",
+                    "Threshold probabilities (cohort mean, factual vs counterfactual) + PIT regime")
+    _plot_threshold_probabilities(summ, output_dir / "eval_flow_threshold_probabilities.png")
+
+    n_trust = int(summ["calibration_trustworthy"].sum())
+    print(f"\nThreshold probabilities: {len(table)} patient-timepoint-arm rows, {len(targets)} timepoints x "
+          f"{{factual,counterfactual}} x {{BMI<35,HbA1c<5.7}}. Calibration-dependent: {n_trust}/{len(summ)} "
+          f"timepoint-arm rows sit on a 'calibrated' PIT (the rest are reported but flagged not-yet-trustworthy).")
+    return {
+        "per_patient_csv": str(per_patient_path),
+        "summary_csv": str(summary_path),
+        "thresholds": {"bmi": thr.BMI_THRESHOLD, "hba1c": thr.HBA1C_THRESHOLD},
+        "n_timepoints": len(targets),
+        "calibration_dependent": True,
+        "note": ("Threshold probabilities inherit the flow's tail calibration; trust only where "
+                 "pit_regime=='calibrated' (see eval_flow_calibration_pit.csv)."),
+        "summary": summ.to_dict(orient="records"),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# W4: four-arm trajectory ablation (does event conditioning actually help?)
+# --------------------------------------------------------------------------- #
+# The four arms scored on the held-out test set, all on the same patients/horizons:
+#   event_flow    -- the coupled twin (event-conditioned flow), Mode-A true event
+#   no_event_flow -- same architecture, event embedding dropped (use_event=False)
+#   xgb / ridge   -- one point regressor per horizon on the SAME conditioning
+# This table is what decides whether the coupling claim survives.
+TRAJECTORY_ARMS = ("event_flow", "no_event_flow", "xgb", "ridge")
+DENSITY_ARMS = {"event_flow", "no_event_flow"}  # only these have a predictive spread -> NLL
+# Paired comparisons written to the table. event_flow is the reference; the first row
+# is the decisive coupling test (event-conditioned vs unconditioned flow).
+TRAJECTORY_COMPARISONS = (
+    ("event_flow", "no_event_flow"),
+    ("event_flow", "xgb"),
+    ("event_flow", "ridge"),
+    ("no_event_flow", "xgb"),
+    ("no_event_flow", "ridge"),
+)
+
+
+def _sample_twin_arm(model, dataset: fm.FlowDataset, test_idx: np.ndarray, pre: mt.Preprocessing,
+                     cfg: tw.TwinConfig, n_samples: int, n_steps: int, device: torch.device) -> np.ndarray:
+    """[n_test, n_samples, 15] original-unit BMI/HbA1c draws (Mode-A, true event)."""
+    arrays = arrays_for(dataset, test_idx, pre)
+    sample_cfg = replace(cfg, n_samples_per_patient=n_samples, sample_steps=n_steps)
+    return twin_samples_15(model, arrays, arrays["y_mace"], sample_cfg, pre, device)
+
+
+def _resolve_noevent_arm(dataset: fm.FlowDataset, event_cfg: tw.TwinConfig, noevent_twin_run: Path | None,
+                         noevent_num_steps: int | None, output_dir: Path, device: torch.device):
+    """Load a no-event twin run, or train the controlled ablation inline.
+
+    Inline training clones the EVENT arm's config (identical architecture/optimiser/
+    split) and only flips ``use_event=False``, so the contrast isolates event
+    conditioning and nothing else. On the VM, pass a pre-trained (ideally
+    independently tuned) no-event run via ``noevent_twin_run`` to skip retraining.
+    """
+    if noevent_twin_run is not None:
+        run_dir = Path(noevent_twin_run)
+        cfg = load_twin_config(run_dir)
+        if cfg.use_event:
+            warnings.warn(f"--noevent-twin-run {run_dir} has use_event=True (expected the no-event arm).", stacklevel=2)
+        return restore_twin(run_dir, cfg, device), cfg, run_dir
+    steps = noevent_num_steps if noevent_num_steps is not None else event_cfg.num_steps
+    cfg = replace(event_cfg, use_event=False, num_steps=steps, output_dir=str(output_dir / "noevent_twin"))
+    print(f"Training the no-event ablation arm inline (use_event=False, num_steps={steps}) ...")
+    result = tw.train_model(dataset, cfg)
+    run_dir = Path(result["run_dir"])
+    cfg = load_twin_config(run_dir)  # reload persisted config (use_event=False baked in)
+    return restore_twin(run_dir, cfg, device), cfg, run_dir
+
+
+def _pool(per_patient: dict, arm: str, dims: list[int], key: str) -> np.ndarray:
+    if not dims:
+        return np.array([], dtype=np.float64)
+    return np.concatenate([per_patient[arm][h][key] for h in dims])
+
+
+def compare_trajectory_models(
+    event_twin_run: Path | None,
+    csv_path: Path | None,
+    output_dir: Path | None = None,
+    noevent_twin_run: Path | None = None,
+    pipeline: Path | None = None,
+    n_samples: int = 200,
+    n_steps: int = 50,
+    noevent_num_steps: int | None = None,
+    seed: int = 0,
+    device_name: str = "auto",
+    include_baselines: bool = True,
+    baseline_use_event: bool = True,
+) -> dict:
+    """Score the four trajectory arms on the shared test split and write the table.
+
+    Emits, per horizon (and pooled overall/bmi/hba1c rows), MAD / RMSE / CRPS and (for
+    the flow arms) Gaussian predictive NLL, plus a paired-test CSV (Wilcoxon signed-rank
+    + paired t) on per-patient CRPS for every arm pair. Everything is aligned
+    patient-for-patient off ``splits['test']``. ``evaluate()`` is untouched.
+    """
+    if event_twin_run is None:
+        if pipeline is None:
+            pipeline = find_latest_pipeline()
+        if pipeline is None:
+            raise SystemExit("Provide --twin-run (the event arm), or --pipeline.")
+        manifest = resolve_from_pipeline(Path(pipeline))
+        event_twin_run = Path(manifest["twin_final_run_dir"])
+        print(f"Event arm resolved from pipeline: {event_twin_run}")
+    event_twin_run = Path(event_twin_run)
+    output_dir = (event_twin_run / "trajectory_comparison") if output_dir is None else Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    device = choose_device(device_name)
+    dataset = load_dataset(csv_path)
+    event_cfg = load_twin_config(event_twin_run)
+    if not event_cfg.use_event:
+        warnings.warn(f"--twin-run {event_twin_run} has use_event=False; expected the event-conditioned arm.", stacklevel=2)
+
+    # One shared split + preprocessing drive every arm (deterministic from the split).
+    splits = tw.make_splits(dataset, event_cfg)
+    test_idx = splits["test"]
+    pre = mt.fit_preprocessing(dataset, splits["train"])
+    test_arrays = mt.split_arrays(dataset, splits, pre)["test"]
+    obs, mask = test_arrays["original_x"], test_arrays["original_mask"]  # [n, 15] original units
+
+    # Arm 1: event-conditioned flow (the coupled twin).
+    event_model = restore_twin(event_twin_run, event_cfg, device)
+    arm_samples: dict[str, np.ndarray] = {
+        "event_flow": _sample_twin_arm(event_model, dataset, test_idx, pre, event_cfg, n_samples, n_steps, device)
+    }
+    # Arm 2: no-event (unconditioned) flow.
+    noevent_model, noevent_cfg, noevent_run = _resolve_noevent_arm(
+        dataset, event_cfg, noevent_twin_run, noevent_num_steps, output_dir, device)
+    arm_samples["no_event_flow"] = _sample_twin_arm(
+        noevent_model, dataset, test_idx, pre, noevent_cfg, n_samples, n_steps, device)
+    # Arms 3 & 4: per-horizon XGB + Ridge (degenerate one-sample "ensembles").
+    baselines = None
+    if include_baselines:
+        baselines = bt.fit_trajectory_baselines(dataset, splits, use_event=baseline_use_event, seed=seed)
+        arm_samples["xgb"] = baselines["xgb_pred"][:, None, :]
+        arm_samples["ridge"] = baselines["ridge_pred"][:, None, :]
+    present = [a for a in TRAJECTORY_ARMS if a in arm_samples]
+
+    cont_names, cont_groups = tw.CONT_NAMES, tw.CONT_GROUPS
+    per_patient = {a: {} for a in present}
+    metric_rows: list[dict] = []
+    for h, name in enumerate(cont_names):
+        for arm in present:
+            score = bt.horizon_score(arm_samples[arm][:, :, h], obs[:, h], mask[:, h], has_density=arm in DENSITY_ARMS)
+            per_patient[arm][h] = score
+            metric_rows.append({"horizon": name, "group": cont_groups[h], "arm": arm, "n_obs": score["n_obs"],
+                                 "mad": score["mad"], "rmse": score["rmse"], "crps": score["crps"], "nll": score["nll"]})
+
+    group_dims = {"overall": list(range(len(cont_names))),
+                  "bmi": [i for i, g in enumerate(cont_groups) if g == "bmi"],
+                  "hba1c": [i for i, g in enumerate(cont_groups) if g == "hba1c"]}
+    for gname, dims in group_dims.items():
+        for arm in present:
+            abs_err, sq_err = _pool(per_patient, arm, dims, "abs_err"), _pool(per_patient, arm, dims, "sq_err")
+            crps_pp, nll_pp = _pool(per_patient, arm, dims, "crps_pp"), _pool(per_patient, arm, dims, "nll_pp")
+            metric_rows.append({"horizon": f"__{gname}__", "group": gname, "arm": arm, "n_obs": int(abs_err.size),
+                                "mad": float(np.mean(abs_err)) if abs_err.size else float("nan"),
+                                "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err.size else float("nan"),
+                                "crps": float(np.mean(crps_pp)) if crps_pp.size else float("nan"),
+                                "nll": float(np.nanmean(nll_pp)) if np.isfinite(nll_pp).any() else float("nan")})
+    metrics = pd.DataFrame(metric_rows)
+    metrics_path = output_dir / "trajectory_comparison_metrics.csv"
+    metrics.to_csv(metrics_path, index=False)
+    ev.report_saved(metrics_path, "four-arm per-horizon trajectory metrics")
+
+    # Paired tests on per-patient CRPS (the proper score defined for every arm).
+    paired_rows: list[dict] = []
+    for h, name in enumerate(cont_names):
+        for a, b in TRAJECTORY_COMPARISONS:
+            if a in present and b in present:
+                pt = bt.paired_test(per_patient[a][h]["crps_pp"], per_patient[b][h]["crps_pp"])
+                paired_rows.append({"horizon": name, "group": cont_groups[h], "comparison": f"{a}_vs_{b}", "metric": "crps", **pt})
+    for gname, dims in group_dims.items():
+        for a, b in TRAJECTORY_COMPARISONS:
+            if a in present and b in present:
+                pt = bt.paired_test(_pool(per_patient, a, dims, "crps_pp"), _pool(per_patient, b, dims, "crps_pp"))
+                paired_rows.append({"horizon": f"__{gname}__", "group": gname, "comparison": f"{a}_vs_{b}", "metric": "crps", **pt})
+    paired = pd.DataFrame(paired_rows)
+    paired_path = output_dir / "trajectory_comparison_paired_tests.csv"
+    paired.to_csv(paired_path, index=False)
+    ev.report_saved(paired_path, "four-arm paired CRPS tests (Wilcoxon + paired t)")
+
+    print("\nFour-arm trajectory comparison (pooled group rows, test split):")
+    with pd.option_context("display.max_columns", None, "display.width", 220):
+        print(metrics[metrics["horizon"].str.startswith("__")].round(4).to_string(index=False))
+        print("\nPaired CRPS tests (overall; mean_diff<0 => first arm better):")
+        print(paired[paired["group"] == "overall"].round(4).to_string(index=False))
+
+    summary = {
+        "output_dir": str(output_dir),
+        "event_twin_run": str(event_twin_run),
+        "noevent_twin_run": str(noevent_run),
+        "arms": present,
+        "n_test": int(test_idx.size),
+        "n_samples": n_samples,
+        "n_steps": n_steps,
+        "baseline_use_event": baseline_use_event,
+        "baseline_feature_names": baselines["feature_names"] if baselines else None,
+        "metrics_csv": str(metrics_path),
+        "paired_tests_csv": str(paired_path),
+        "paired_test": "Wilcoxon signed-rank + paired t on per-patient CRPS",
+        "note_mad": "MAD = mean absolute error of the ensemble mean; equals point-CRPS for the xgb/ridge arms",
+        "note_nll": "flow arms only: Gaussian predictive NLL moment-matched from samples (exact CNF NLL deferred to VM)",
+        "note_ridge": "Ridge per-horizon stands in for a linear mixed model (statsmodels not installed here)",
+    }
+    summary_path = output_dir / "trajectory_comparison_summary.json"
+    summary_path.write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
+    ev.report_saved(summary_path, "trajectory comparison summary")
+    print(f"\nSaved four-arm trajectory comparison to {output_dir}")
+    return summary
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 def evaluate(pipeline: Path | None, gbm_run: Path | None, twin_run: Path | None, csv_path: Path | None,
@@ -770,8 +1151,12 @@ def evaluate(pipeline: Path | None, gbm_run: Path | None, twin_run: Path | None,
           f"| GBM backend={gbm['backend']} calibrated={gbm['calibrated']}")
 
     gbm_summary = evaluate_gbm(gbm, y_test, dataset, test_idx, output_dir, n_boot, seed, compare_predictions)
-    flow_summary = evaluate_flow(model, dataset, splits, pre, twin_cfg, output_dir, n_samples, n_steps, seed, n_show, max_lines, device)
-    sim_summary = evaluate_simulator(model, dataset, splits, pre, twin_cfg, gbm, output_dir, n_samples, n_steps, seed, device)
+    flow_summary = evaluate_flow(model, dataset, splits, pre, twin_cfg, twin_run, output_dir, n_samples, n_steps, seed, n_show, max_lines, device)
+    pit_regimes = flow_summary.get("calibration", {}).get("regime_by_horizon")
+    sim_summary = evaluate_simulator(model, dataset, splits, pre, twin_cfg, gbm, output_dir, n_samples, n_steps, seed, device,
+                                     pit_regimes=pit_regimes)
+    threshold_summary = evaluate_threshold_probabilities(model, dataset, splits, pre, twin_cfg, gbm, output_dir,
+                                                         n_samples, n_steps, seed, device, pit_regimes)
 
     summary = {
         "pipeline_dir": None if pipeline is None else str(pipeline),
@@ -786,6 +1171,7 @@ def evaluate(pipeline: Path | None, gbm_run: Path | None, twin_run: Path | None,
         "gbm": gbm_summary,
         "flow": flow_summary,
         "simulator": sim_summary,
+        "threshold_probabilities": threshold_summary,
     }
     summary_path = output_dir / "eval_twin_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
@@ -810,7 +1196,25 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--compare-predictions", type=Path, default=None,
                         help="Optional CSV (subject_id, prob) for a DeLong AUROC delta vs the GBM.")
+    # W4 four-arm trajectory ablation (separate entrypoint; leaves evaluate() intact).
+    parser.add_argument("--trajectory-comparison", dest="trajectory_comparison", action="store_true",
+                        help="Run the four-arm {event-flow, no-event-flow, XGB, Ridge} comparison instead of evaluate().")
+    parser.add_argument("--noevent-twin-run", type=Path, default=None,
+                        help="Pre-trained no-event twin run dir; if omitted it is trained inline from the event arm's config.")
+    parser.add_argument("--noevent-num-steps", type=int, default=None,
+                        help="num_steps for the inline no-event arm (defaults to the event arm's).")
+    parser.add_argument("--no-baselines", dest="no_baselines", action="store_true",
+                        help="Trajectory comparison: flow arms only (skip XGB/Ridge).")
     args = parser.parse_args()
+
+    if args.trajectory_comparison:
+        compare_trajectory_models(
+            event_twin_run=args.twin_run, csv_path=args.csv_path, output_dir=args.output_dir,
+            noevent_twin_run=args.noevent_twin_run, pipeline=args.pipeline, n_samples=args.n_samples,
+            n_steps=args.n_steps, noevent_num_steps=args.noevent_num_steps, seed=args.seed,
+            device_name=args.device, include_baselines=not args.no_baselines,
+        )
+        return
 
     evaluate(
         pipeline=args.pipeline, gbm_run=args.gbm_run, twin_run=args.twin_run, csv_path=args.csv_path,

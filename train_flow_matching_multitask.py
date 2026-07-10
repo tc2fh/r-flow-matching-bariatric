@@ -138,6 +138,12 @@ class Preprocessing:
     static_continuous_idx: np.ndarray
     patient_feature_names: list[str]
     cont_names: list[str]
+    # W5: fitted per-horizon split-conformal calibrator (see calibration_twin.fit_conformal),
+    # attached AFTER training by the evaluator so the trajectory-interval calibration is saved
+    # and reloaded with the run. Additive + default None: existing constructors, older
+    # preprocessing.json files (no "conformal" key), and every current caller are unaffected;
+    # it is a JSON-native dict (lists of floats/ints) so it round-trips through to_jsonable().
+    conformal: dict | None = None
 
     def to_jsonable(self) -> dict:
         return {
@@ -148,6 +154,7 @@ class Preprocessing:
             "static_continuous_idx": self.static_continuous_idx.tolist(),
             "patient_feature_names": self.patient_feature_names,
             "cont_names": self.cont_names,
+            "conformal": self.conformal,
         }
 
 

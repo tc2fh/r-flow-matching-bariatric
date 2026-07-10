@@ -13,6 +13,7 @@ CSV without touching Cosmos.
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import asdict, dataclass
 from pathlib import Path
 import json
@@ -500,6 +501,77 @@ def make_stratified_splits(dataset: FlowDataset, cfg: TrainConfig) -> dict[str, 
     return {"train": train_idx, "val": val_idx, "test": test_idx}
 
 
+def make_temporal_splits(dataset: FlowDataset, cfg: TrainConfig) -> dict[str, np.ndarray]:
+    """Temporal (out-of-time) split: earliest surgeries -> train, latest -> test.
+
+    Same return contract as ``make_stratified_splits`` -- a dict of int64 POSITIONAL
+    index arrays ``{"train", "val", "test"}`` that index ``dataset.x`` / ``dataset.mask``
+    / ``dataset.surgery_type`` / ``dataset.subject_ids`` / ``dataset.frame`` (all built
+    from the same post-filter DataFrame, one row per patient, so row position == patient).
+    Unlike the stratified split it is NOT a random draw: patients are ordered by surgery
+    date (``ProcDateValue``) and sliced POSITIONALLY into the earliest ``train_frac``
+    (train), the next ``val_frac`` (val), and the latest remainder (test). This is the
+    prospective / temporal validation fold.
+
+    Row alignment (why we sort ``.to_numpy()`` and never the frame's pandas index):
+    ``dataset.frame`` is positionally row-aligned with ``dataset.x`` (same post-filter
+    frame), but its pandas index is NOT reset after the row filters in
+    ``prepare_flow_dataset``, so it may not be 0..n-1. We therefore build ``order`` from
+    ``ProcDateValue.to_numpy()`` (positional order) via ``np.argsort``; the resulting
+    positions index x/y correctly regardless of the frame's index labels.
+
+    Reportable structural properties of this fold (by construction, surfaced in the
+    freeze manifest's per-era stats -- NOT bugs, NOT to be worked around):
+      * the test block is strictly LATER surgeries than train/val (non-overlapping dates);
+      * later surgeries have shorter follow-up before the ``ProcDateValue <= 2023-05-01``
+        cohort cutoff, so the test fold's long-horizon (5-6yr) BMI/HbA1c cells shrink to
+        small/zero n -- long-horizon test metrics are underpowered on purpose;
+      * the test fold is more GLP-1-selected (later eras have more post-op incretin
+        exposure, which censors BMI/HbA1c cells) and less follow-up-mature.
+
+    Determinism: a stable argsort makes tie-breaking (identical dates) positional and
+    reproducible; the TRAIN block is then shuffled with ``split_seed`` so batch sampling
+    isn't date-ordered. Val/test KEEP ascending surgery-date order so the out-of-time
+    structure stays inspectable and their per-era maturity stats are monotone.
+    """
+    if not np.isclose(cfg.train_frac + cfg.val_frac + cfg.test_frac, 1.0):
+        raise ValueError("train_frac + val_frac + test_frac must equal 1.0")
+    if "ProcDateValue" not in dataset.frame.columns:
+        raise ValueError(
+            "make_temporal_splits requires 'ProcDateValue' in dataset.frame, but it is "
+            "absent. ProcDateValue is a required column, so this indicates an upstream "
+            "schema/canonicalization problem, not a temporal-split option."
+        )
+    proc_dates = pd.to_datetime(dataset.frame["ProcDateValue"], errors="coerce").to_numpy()
+    n = proc_dates.shape[0]
+    if n != dataset.x.shape[0]:
+        raise ValueError(
+            f"ProcDateValue length ({n}) != dataset.x rows ({dataset.x.shape[0]}); "
+            "dataset.frame is not row-aligned with dataset.x -- temporal indexing would "
+            "be silently wrong."
+        )
+    n_missing = int(pd.isna(proc_dates).sum())
+    if n_missing:
+        warnings.warn(
+            f"{n_missing} patient(s) have a missing/unparseable ProcDateValue; numpy sorts "
+            "NaT last, so they fall into the LATEST (test) block. The real cohort's SQL "
+            "filter (ProcDateValue <= '2023-05-01') guarantees a non-null date, so this only "
+            "fires on a partial CSV export.",
+            stacklevel=2,
+        )
+    # Positional order, earliest surgery first; stable so equal dates keep frame order and
+    # NaT (if any) sorts to the end -> latest (test) block.
+    order = np.argsort(proc_dates, kind="stable")
+    n_train = int(np.floor(n * cfg.train_frac))
+    n_val = int(np.floor(n * cfg.val_frac))
+    train_idx = order[:n_train].astype(np.int64)
+    val_idx = order[n_train : n_train + n_val].astype(np.int64)
+    test_idx = order[n_train + n_val :].astype(np.int64)
+    rng = np.random.default_rng(cfg.split_seed)
+    rng.shuffle(train_idx)  # train block only; val/test stay in ascending date order
+    return {"train": train_idx, "val": val_idx, "test": test_idx}
+
+
 def fit_preprocessing(dataset: FlowDataset, train_idx: np.ndarray) -> Preprocessing:
     x_train = dataset.x[train_idx]
     mask_train = dataset.mask[train_idx]
@@ -916,7 +988,43 @@ def train_from_database(cfg: TrainConfig | None = None) -> dict:
     return train_model(load_dataset_from_database(), cfg)
 
 
+def enable_determinism(seed: int = 0) -> None:
+    """Opt-in deterministic training (OFF by default).
+
+    Seeds numpy + torch and turns on torch's deterministic-algorithm enforcement so
+    a run is reproducible bit-for-bit. This is only invoked when the training entry
+    is called with ``--deterministic`` (see ``__main__`` below); the default path
+    never calls it, so normal training behavior is unchanged. ``train_model`` already
+    re-seeds numpy + torch from ``cfg.seed`` -- this pins the same seed up front and
+    layers the global ``use_deterministic_algorithms`` toggle on top.
+
+    NOTE: on CUDA, deterministic cuBLAS GEMMs additionally require the environment
+    variable ``CUBLAS_WORKSPACE_CONFIG=:4096:8`` (export it before importing torch).
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.use_deterministic_algorithms(True)
+
+
 if __name__ == "__main__":
+    # Additive CLI: the default (no-flag) path is unchanged -- it still trains from
+    # the Cosmos database with the default split. The only new option is an opt-in
+    # determinism switch used by the freeze harness / reproducible runs.
+    parser = argparse.ArgumentParser(
+        description="Train the Cosmos BMI/HbA1c flow-matching model (queries MBSCohort).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help=(
+            "Enable deterministic training: seed numpy + torch and turn on "
+            "torch.use_deterministic_algorithms(True). Off by default (the no-flag "
+            "path is unchanged). On CUDA also export CUBLAS_WORKSPACE_CONFIG=:4096:8."
+        ),
+    )
+    args = parser.parse_args()
+    if args.deterministic:
+        enable_determinism(TrainConfig().seed)
     try:
         train_from_database()
     except RuntimeError as exc:

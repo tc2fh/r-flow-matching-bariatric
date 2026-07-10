@@ -328,7 +328,7 @@ def main() -> None:
     parser.add_argument("--study-dir", type=str, default=None, help="Resume an existing study dir (reopens its SQLite DB).")
     parser.add_argument("--n-trials", type=int, default=N_TRIALS)
     parser.add_argument("--num-steps", type=int, default=None)
-    parser.add_argument("--split-strategy", type=str, default=None, choices=["surgery", "outcome"])
+    parser.add_argument("--split-strategy", type=str, default=None, choices=["surgery", "temporal", "outcome"])
     parser.add_argument("--no-final-train", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()

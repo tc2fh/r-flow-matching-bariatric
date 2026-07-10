@@ -92,6 +92,12 @@ class TableConfig:
     val_frac: float = 0.15
     test_frac: float = 0.15
     continuous: str = "median"  # "median" -> median [Q1, Q3]; "mean" -> mean (SD)
+    # Which model split the table's Train/Validation/Test columns describe. "surgery"
+    # (default, unchanged behavior) -> fm.make_stratified_splits; "temporal" ->
+    # fm.make_temporal_splits, so the columns match the models' out-of-time folds
+    # patient-for-patient. Threaded from freeze_run so Table 1 never misaligns with the
+    # temporal model.
+    split_strategy: str = "surgery"
 
 
 def report_saved(path: Path, description: str = "") -> Path:
@@ -401,13 +407,29 @@ def build_table(dataset: fm.FlowDataset, splits: dict[str, np.ndarray], cfg: Tab
 def footnotes(cfg: TableConfig) -> list[str]:
     summary = "median [Q1, Q3]" if cfg.continuous == "median" else "mean (SD)"
     test = "Kruskal-Wallis" if cfg.continuous == "median" else "one-way ANOVA"
+    if cfg.split_strategy == "temporal":
+        pvalue_note = (
+            f"P-values test the null of no difference across train / validation / test ({test} for "
+            "continuous variables, chi-square for categorical) and are not adjusted for multiplicity. "
+            "The columns are a TEMPORAL (out-of-time) split by surgery date -- earliest surgeries in "
+            "Train, latest in Test -- so differences across columns are EXPECTED (calendar drift in case "
+            "mix, follow-up maturity, and postoperative GLP-1 exposure) and are reported as such, not as a "
+            "randomization balance check. Later-era (Test) patients also have shorter follow-up before the "
+            "cohort's surgery-date cutoff, so long-horizon (5-6 yr) outcome cells are sparser in Test by "
+            "construction."
+        )
+    else:
+        pvalue_note = (
+            f"P-values test the null of no difference across train / validation / test ({test} for "
+            "continuous variables, chi-square for categorical). They are a balance check on the random "
+            "split and are not adjusted for multiplicity. The split is stratified by bariatric procedure, "
+            "so procedure balance is by design."
+        )
     return [
         f"Continuous variables are summarized as {summary}; categorical variables as n (%). "
         "Percentages are column percentages (of each split's patients); for continuous variables a "
         "Missing row is shown when any value is absent.",
-        f"P-values test the null of no difference across train / validation / test ({test} for continuous "
-        "variables, chi-square for categorical). They are a balance check on the random split and are not "
-        "adjusted for multiplicity. The split is stratified by bariatric procedure, so procedure balance is by design.",
+        pvalue_note,
         f"{MARK_FLOW} Conditioning feature for the flow-matching model (also used by the gradient-boosted risk model).",
         f"{MARK_GBM} Additional feature used by the gradient-boosted MACE risk model only.",
         f"{MARK_CAND} Candidate feature available in the cohort but not currently a model input.",
@@ -421,11 +443,17 @@ def footnotes(cfg: TableConfig) -> list[str]:
 
 
 def caption(dataset: fm.FlowDataset, cfg: TableConfig) -> str:
+    fracs = f"{cfg.train_frac:g}/{cfg.val_frac:g}/{cfg.test_frac:g}"
+    if cfg.split_strategy == "temporal":
+        split_desc = (
+            f"{fracs} temporal / out-of-time split by surgery date "
+            "(earliest surgeries in Train, latest in Test)"
+        )
+    else:
+        split_desc = f"split seed {cfg.split_seed}, {fracs} stratified by procedure"
     return (
         "Table 1. Baseline characteristics of the bariatric surgery modeling cohort, "
-        f"overall and by data split (n = {len(dataset.subject_ids):,}; "
-        f"split seed {cfg.split_seed}, {cfg.train_frac:g}/{cfg.val_frac:g}/{cfg.test_frac:g} "
-        "stratified by procedure)."
+        f"overall and by data split (n = {len(dataset.subject_ids):,}; {split_desc})."
     )
 
 
@@ -706,16 +734,32 @@ def make_output_dir(output_dir: str | Path) -> Path:
     return run_dir
 
 
-def generate(dataset: fm.FlowDataset, cfg: TableConfig) -> Path:
-    splits = fm.make_stratified_splits(
-        dataset,
-        fm.TrainConfig(
-            split_seed=cfg.split_seed,
-            train_frac=cfg.train_frac,
-            val_frac=cfg.val_frac,
-            test_frac=cfg.test_frac,
-        ),
+def make_table_splits(dataset: fm.FlowDataset, cfg: TableConfig) -> dict[str, np.ndarray]:
+    """The train/val/test partition the table describes, matched to the model split.
+
+    Routes on ``cfg.split_strategy`` so the Table 1 columns line up patient-for-patient
+    with whichever fold the models use: "surgery" -> fm.make_stratified_splits (default,
+    unchanged), "temporal" -> fm.make_temporal_splits (earliest surgeries -> Train, latest
+    -> Test). Both consume the same split_seed/fractions as the trainers, so identical
+    inputs yield the identical partition.
+    """
+    split_cfg = fm.TrainConfig(
+        split_seed=cfg.split_seed,
+        train_frac=cfg.train_frac,
+        val_frac=cfg.val_frac,
+        test_frac=cfg.test_frac,
     )
+    if cfg.split_strategy == "temporal":
+        return fm.make_temporal_splits(dataset, split_cfg)
+    if cfg.split_strategy != "surgery":
+        raise ValueError(
+            f"Unknown split_strategy: {cfg.split_strategy!r} (expected 'surgery' or 'temporal')"
+        )
+    return fm.make_stratified_splits(dataset, split_cfg)
+
+
+def generate(dataset: fm.FlowDataset, cfg: TableConfig) -> Path:
+    splits = make_table_splits(dataset, cfg)
     df = build_table(dataset, splits, cfg)
     ns = split_ns(splits, dataset)
     cap = caption(dataset, cfg)
@@ -758,6 +802,9 @@ def main() -> None:
     parser.add_argument("--test-frac", type=float, default=0.15)
     parser.add_argument("--continuous", choices=["median", "mean"], default="median",
                         help="Summary for continuous variables: median [Q1, Q3] (default) or mean (SD).")
+    parser.add_argument("--split-strategy", type=str, default="surgery", choices=["surgery", "temporal"],
+                        help="Which model fold the Train/Validation/Test columns describe: 'surgery' "
+                             "(stratified, default) or 'temporal' (out-of-time, by surgery date).")
     args = parser.parse_args()
 
     cfg = TableConfig(
@@ -767,6 +814,7 @@ def main() -> None:
         val_frac=args.val_frac,
         test_frac=args.test_frac,
         continuous=args.continuous,
+        split_strategy=args.split_strategy,
     )
     try:
         if args.csv_path:
