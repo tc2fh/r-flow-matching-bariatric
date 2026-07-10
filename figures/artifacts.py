@@ -149,7 +149,20 @@ def resolve(run_path: Path | str) -> RunArtifacts:
 
     gbm_run_dir = _pick(summary.get("gbm_run_dir"), manifest.get("gbm_run_dir"))
     twin_run_dir = _pick(summary.get("twin_run_dir"), manifest.get("twin_final_run_dir"))
-    source_csv = summary.get("csv_path") or manifest.get("source_label")
+
+    # summary["csv_path"] is the authoritative source CSV -- and it is None for a
+    # DB-sourced run (the cohort is queried from Cosmos, never written to disk).
+    # manifest["source_label"] is only a *label*: for a CSV run it happens to equal
+    # the CSV path, but for a DB run it is "Cosmos MBSCohort", which is NOT a file.
+    # Only accept the label as a CSV when it actually resolves to a readable file;
+    # otherwise leave source_csv None so the cohort-backed figures re-query the DB
+    # instead of trying to read a nonexistent path. (Falling through to the label
+    # blindly is what made CONSORT / counterfactual / per-patient crash on VM runs
+    # with "No such file or directory: ...\\Cosmos MBSCohort".)
+    source_csv = summary.get("csv_path")
+    if not source_csv:
+        label = manifest.get("source_label")
+        source_csv = str(label) if (label and Path(label).exists()) else None
 
     attrition_dir = root / "attrition"
     attrition_txt = None

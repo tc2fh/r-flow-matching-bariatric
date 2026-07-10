@@ -54,11 +54,17 @@ def build(art: RunArtifacts, out_stem: Path, *, use_db: bool = False,
     style.apply_rcparams()
     src = csv_path or art.source_csv
     if src is None:
-        raise FileNotFoundError("No source CSV recorded for this run; pass csv_path=... to build the CONSORT figure.")
-    src_path = Path(src)
-    if not src_path.exists() and not src_path.is_absolute():
-        src_path = Path.cwd() / src
-    raw_df = da.load_raw_csv(src_path)
+        # DB-sourced run: the cohort was queried from Cosmos and never written to
+        # disk, so there is no CSV to read. Re-query the database exactly as
+        # debug_attrition does in --db mode. On a box without pyodbc / DB access this
+        # raises a clear RuntimeError that build_all records as this one figure
+        # FAILing (the rest still render); pass csv_path=... to render it locally.
+        raw_df = da.load_raw_db()
+    else:
+        src_path = Path(src)
+        if not src_path.exists() and not src_path.is_absolute():
+            src_path = Path.cwd() / src
+        raw_df = da.load_raw_csv(src_path)
     info = da.python_attrition(raw_df)
     db_counts = da.db_prefilter_counts() if use_db else None
 
