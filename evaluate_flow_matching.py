@@ -44,6 +44,7 @@ import pandas as pd
 import torch
 
 import train_flow_matching as fm
+import baselines_trajectory as bt  # PHYSIOLOGIC_BOUNDS + plausible_mask (observed-value QC)
 
 try:
     from scipy import stats as scipy_stats
@@ -378,9 +379,16 @@ def timepoint_metric_table(
     labels = {"bmi": "BMI", "hba1c": "HbA1c"}
     for group in ("bmi", "hba1c"):
         dims, months = target_dims(dataset, group)
+        bounds = bt.PHYSIOLOGIC_BOUNDS.get(group)
         for dim, month in zip(dims, months):
-            observed = dataset.mask[patient_idx, dim] == 1
+            has_obs = dataset.mask[patient_idx, dim] == 1
+            # Physiologic QC: drop implausible observed values (data-entry errors) so RMSE is
+            # not detonated by one garbage record. MAD is a median (SOPHIA def) and robust either
+            # way; RMSE (mean of squares) is the outlier-sensitive companion -- see note_mad.
+            plausible = bt.plausible_mask(dataset.x[patient_idx, dim], bounds)
+            observed = has_obs & plausible
             n_observed = int(observed.sum())
+            n_excluded = int((has_obs & ~plausible).sum())
             if n_observed == 0:
                 mad = np.nan
                 rmse = np.nan
@@ -388,13 +396,14 @@ def timepoint_metric_table(
                 truth = dataset.x[patient_idx[observed], dim]
                 pred = point_predictions[observed, dim]
                 diff = pred - truth
-                mad = float(np.median(np.abs(diff)))
+                mad = float(np.median(np.abs(diff)))        # MEDIAN absolute deviation (SOPHIA def)
                 rmse = float(np.sqrt(np.mean(diff**2)))
             rows.append(
                 {
                     "outcome": labels[group],
                     "timepoint": f"{_format_month(float(month))}m",
                     "n_observed": n_observed,
+                    "n_excluded": n_excluded,
                     "MAD": mad,
                     "RMSE": rmse,
                 }

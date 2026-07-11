@@ -589,6 +589,10 @@ def evaluate_flow(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preproce
 
     point_predictions = np.median(full, axis=1)
     timepoint = ev.timepoint_metric_table(dataset, test_idx, point_predictions)
+    n_excl = int(timepoint["n_excluded"].sum()) if "n_excluded" in timepoint else 0
+    if n_excl:
+        print(f"[eval] physiologic QC excluded {n_excl} implausible observed value(s) "
+              f"from Mode-A MAD/RMSE (bounds {bt.PHYSIOLOGIC_BOUNDS})")
     timepoint.to_csv(output_dir / "eval_flow_timepoint_metrics_test.csv", index=False)
     ev.report_saved(output_dir / "eval_flow_timepoint_metrics_test.csv", "flow Mode-A timepoint metrics")
     ev.render_table(timepoint.round(3), output_dir / "eval_flow_timepoint_metrics_test.png",
@@ -1030,7 +1034,9 @@ def compare_trajectory_models(
     metric_rows: list[dict] = []
     for h, name in enumerate(cont_names):
         for arm in present:
-            score = bt.horizon_score(arm_samples[arm][:, :, h], obs[:, h], mask[:, h], has_density=arm in DENSITY_ARMS)
+            score = bt.horizon_score(arm_samples[arm][:, :, h], obs[:, h], mask[:, h],
+                                     has_density=arm in DENSITY_ARMS,
+                                     obs_bounds=bt.PHYSIOLOGIC_BOUNDS.get(cont_groups[h]))
             per_patient[arm][h] = score
             metric_rows.append({"horizon": name, "group": cont_groups[h], "arm": arm, "n_obs": score["n_obs"],
                                  "mad": score["mad"], "rmse": score["rmse"], "crps": score["crps"], "nll": score["nll"]})
@@ -1043,7 +1049,7 @@ def compare_trajectory_models(
             abs_err, sq_err = _pool(per_patient, arm, dims, "abs_err"), _pool(per_patient, arm, dims, "sq_err")
             crps_pp, nll_pp = _pool(per_patient, arm, dims, "crps_pp"), _pool(per_patient, arm, dims, "nll_pp")
             metric_rows.append({"horizon": f"__{gname}__", "group": gname, "arm": arm, "n_obs": int(abs_err.size),
-                                "mad": float(np.mean(abs_err)) if abs_err.size else float("nan"),
+                                "mad": float(np.median(abs_err)) if abs_err.size else float("nan"),
                                 "rmse": float(np.sqrt(np.mean(sq_err))) if sq_err.size else float("nan"),
                                 "crps": float(np.mean(crps_pp)) if crps_pp.size else float("nan"),
                                 "nll": float(np.nanmean(nll_pp)) if np.isfinite(nll_pp).any() else float("nan")})
@@ -1088,7 +1094,7 @@ def compare_trajectory_models(
         "metrics_csv": str(metrics_path),
         "paired_tests_csv": str(paired_path),
         "paired_test": "Wilcoxon signed-rank + paired t on per-patient CRPS",
-        "note_mad": "MAD = mean absolute error of the ensemble mean; equals point-CRPS for the xgb/ridge arms",
+        "note_mad": "MAD = median absolute deviation (median_i|mean-pred_i - y_i|); Saux et al./SOPHIA definition, robust to outliers",
         "note_nll": "flow arms only: Gaussian predictive NLL moment-matched from samples (exact CNF NLL deferred to VM)",
         "note_ridge": "Ridge per-horizon stands in for a linear mixed model (statsmodels not installed here)",
     }

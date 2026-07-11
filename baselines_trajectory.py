@@ -77,6 +77,25 @@ ARM_XGB = "xgb"
 ARM_RIDGE = "ridge"
 
 
+# Physiologic-plausibility bounds for OBSERVED outcomes, applied as data QC before
+# scoring. A value outside these is a data-entry error (e.g. a raw weight logged as a
+# BMI) and is excluded from MAD/RMSE/CRPS so one garbage record cannot detonate RMSE
+# (Saux et al./SOPHIA QC their outcomes similarly; RMSE is outlier-sensitive by design).
+# Bounds are deliberately wide -- they catch gross errors, not real post-op extremes.
+PHYSIOLOGIC_BOUNDS = {"bmi": (10.0, 100.0), "hba1c": (3.0, 20.0)}
+
+
+def plausible_mask(obs: np.ndarray, bounds: "tuple[float, float] | None") -> np.ndarray:
+    """Boolean mask of physiologically-plausible observed values (finite AND in range).
+    ``bounds`` is a ``(lo, hi)`` tuple or ``None`` (None -> finiteness check only)."""
+    obs = np.asarray(obs, dtype=float)
+    ok = np.isfinite(obs)
+    if bounds is not None:
+        lo, hi = bounds
+        ok = ok & (obs >= lo) & (obs <= hi)
+    return ok
+
+
 # --------------------------------------------------------------------------- #
 # Proper scoring primitives (shared with the four-arm comparison)
 # --------------------------------------------------------------------------- #
@@ -92,8 +111,10 @@ def crps_ensemble(samples: np.ndarray, obs: np.ndarray) -> np.ndarray:
     where ``x_(i)`` are the samples sorted ascending. For a degenerate one-sample
     ensemble (m=1, i.e. a point forecast) the pairwise term is exactly 0, so this
     returns ``|x - y|`` -- meaning a point predictor's CRPS equals its absolute
-    error, and its per-horizon mean CRPS equals its MAD. That identity lets the flow
-    arms (real predictive spread) and the point baselines be scored by one function.
+    error, so its per-horizon mean CRPS is the mean absolute error. That identity lets
+    the flow arms (real predictive spread) and the point baselines be scored by one
+    function. (MAD elsewhere is reported as the MEDIAN absolute deviation -- the Saux
+    et al./SOPHIA definition -- so it is robust and is NOT this mean quantity.)
     """
     samples = np.asarray(samples, dtype=np.float64)
     obs = np.asarray(obs, dtype=np.float64)
@@ -167,18 +188,23 @@ def paired_test(score_a: np.ndarray, score_b: np.ndarray) -> dict:
     return out
 
 
-def horizon_score(samples_h: np.ndarray, obs_h: np.ndarray, mask_h: np.ndarray, has_density: bool) -> dict:
+def horizon_score(samples_h: np.ndarray, obs_h: np.ndarray, mask_h: np.ndarray, has_density: bool,
+                  obs_bounds: "tuple[float, float] | None" = None) -> dict:
     """Score one arm at one horizon on the observed test patients.
 
     ``samples_h`` is ``[n, m]`` predictive draws (m=1 for a point baseline), ``obs_h``
     the observed original-unit target ``[n]``, ``mask_h`` the 1/0 observed indicator.
-    The point estimate is the ensemble MEAN, so MAD is the mean absolute error and
-    equals point-CRPS for a one-sample ensemble. Returns both the scalar summaries and
-    the per-patient arrays (over the observed subset, in mask order) so callers can
-    pool across horizons for group rows and run paired tests.
+    ``obs_bounds`` (lo, hi) excludes physiologically-implausible observed values from the
+    scored set (data QC; pass ``PHYSIOLOGIC_BOUNDS[group]``); None keeps every finite obs.
+    The point estimate is the ensemble MEAN. MAD is the MEDIAN absolute deviation
+    (median_i |point_i - y_i|) -- the Saux et al./SOPHIA definition, robust to outliers
+    and directly comparable to their reported MAD; RMSE (mean of squares) is the
+    outlier-sensitive companion (SOPHIA note this too). Returns both the scalar
+    summaries and the per-patient arrays (over the observed subset, in mask order) so
+    callers can pool across horizons for group rows and run paired tests.
     """
     obs_h = np.asarray(obs_h, dtype=np.float64)
-    sel = (np.asarray(mask_h) == 1) & np.isfinite(obs_h)
+    sel = (np.asarray(mask_h) == 1) & plausible_mask(obs_h, obs_bounds)
     empty = np.array([], dtype=np.float64)
     if not sel.any():
         return {"n_obs": 0, "mad": float("nan"), "rmse": float("nan"), "crps": float("nan"),
@@ -192,7 +218,7 @@ def horizon_score(samples_h: np.ndarray, obs_h: np.ndarray, mask_h: np.ndarray, 
     crps_pp = crps_ensemble(s, y)
     nll_pp = gaussian_predictive_nll(s, y) if has_density else np.full(y.size, np.nan)
     nll = float(np.nanmean(nll_pp)) if np.isfinite(nll_pp).any() else float("nan")
-    return {"n_obs": int(sel.sum()), "mad": float(np.mean(abs_err)),
+    return {"n_obs": int(sel.sum()), "mad": float(np.median(abs_err)),
             "rmse": float(np.sqrt(np.mean(sq_err))), "crps": float(np.mean(crps_pp)), "nll": nll,
             "abs_err": abs_err, "sq_err": sq_err, "crps_pp": crps_pp, "nll_pp": nll_pp}
 
@@ -314,7 +340,8 @@ def baseline_metric_table(dataset: fm.FlowDataset, splits: dict[str, np.ndarray]
     rows = []
     for h, name in enumerate(tw.CONT_NAMES):
         for arm, pred in arm_pred.items():
-            score = horizon_score(pred[:, h][:, None], obs[:, h], mask[:, h], has_density=False)
+            score = horizon_score(pred[:, h][:, None], obs[:, h], mask[:, h], has_density=False,
+                                  obs_bounds=PHYSIOLOGIC_BOUNDS.get(tw.CONT_GROUPS[h]))
             rows.append({"horizon": name, "group": tw.CONT_GROUPS[h], "arm": arm,
                          "n_obs": score["n_obs"], "mad": score["mad"], "rmse": score["rmse"],
                          "crps": score["crps"], "nll": score["nll"]})
