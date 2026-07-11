@@ -907,19 +907,26 @@ def evaluate_threshold_probabilities(model, dataset: fm.FlowDataset, splits: dic
 
 
 # --------------------------------------------------------------------------- #
-# W4: four-arm trajectory ablation (does event conditioning actually help?)
+# W4: trajectory ablation (does event conditioning actually help?) + quantile yard-stick
 # --------------------------------------------------------------------------- #
-# The four arms scored on the held-out test set, all on the same patients/horizons:
+# The arms scored on the held-out test set, all on the same patients/horizons:
 #   event_flow    -- the coupled twin (event-conditioned flow), Mode-A true event
 #   no_event_flow -- same architecture, event embedding dropped (use_event=False)
+#   qgbm / qreg   -- quantile GBM + linear quantile regression (predictive ensembles)
 #   xgb / ridge   -- one point regressor per horizon on the SAME conditioning
-# This table is what decides whether the coupling claim survives.
-TRAJECTORY_ARMS = ("event_flow", "no_event_flow", "xgb", "ridge")
-DENSITY_ARMS = {"event_flow", "no_event_flow"}  # only these have a predictive spread -> NLL
+# This table is what decides whether the coupling claim survives, and whether the flow's
+# predictive distribution beats a strong quantile model's.
+# qgbm / qreg are the quantile arms (baselines_trajectory.fit_quantile_baselines): unlike the
+# point xgb/ridge arms they predict a whole quantile grid, i.e. a real predictive ensemble, so
+# they carry a spread (NLL is defined) and are the fair distributional yard-stick for the flow.
+TRAJECTORY_ARMS = ("event_flow", "no_event_flow", "qgbm", "qreg", "xgb", "ridge")
+DENSITY_ARMS = {"event_flow", "no_event_flow", "qgbm", "qreg"}  # arms with a predictive spread -> NLL
 # Paired comparisons written to the table. event_flow is the reference; the first row
 # is the decisive coupling test (event-conditioned vs unconditioned flow).
 TRAJECTORY_COMPARISONS = (
     ("event_flow", "no_event_flow"),
+    ("event_flow", "qgbm"),
+    ("event_flow", "qreg"),
     ("event_flow", "xgb"),
     ("event_flow", "ridge"),
     ("no_event_flow", "xgb"),
@@ -978,13 +985,17 @@ def compare_trajectory_models(
     device_name: str = "auto",
     include_baselines: bool = True,
     baseline_use_event: bool = True,
+    include_quantile: bool = True,
+    quantiles: "tuple[float, ...] | None" = None,
 ) -> dict:
-    """Score the four trajectory arms on the shared test split and write the table.
+    """Score the trajectory arms on the shared test split and write the table.
 
-    Emits, per horizon (and pooled overall/bmi/hba1c rows), MAD / RMSE / CRPS and (for
-    the flow arms) Gaussian predictive NLL, plus a paired-test CSV (Wilcoxon signed-rank
-    + paired t) on per-patient CRPS for every arm pair. Everything is aligned
-    patient-for-patient off ``splits['test']``. ``evaluate()`` is untouched.
+    Arms: the event / no-event flow, the two quantile arms (``qgbm`` = quantile GBM, ``qreg``
+    = linear quantile regression; on by default via ``include_quantile``), and the ``xgb`` /
+    ``ridge`` point arms. Emits, per horizon (and pooled overall/bmi/hba1c rows), MAD / RMSE /
+    CRPS and (for the spread-carrying flow + quantile arms) Gaussian predictive NLL, plus a
+    paired-test CSV (Wilcoxon signed-rank + paired t) on per-patient CRPS for every arm pair.
+    Everything is aligned patient-for-patient off ``splits['test']``. ``evaluate()`` is untouched.
     """
     if event_twin_run is None:
         if pipeline is None:
@@ -1021,7 +1032,20 @@ def compare_trajectory_models(
         dataset, event_cfg, noevent_twin_run, noevent_num_steps, output_dir, device)
     arm_samples["no_event_flow"] = _sample_twin_arm(
         noevent_model, dataset, test_idx, pre, noevent_cfg, n_samples, n_steps, device)
-    # Arms 3 & 4: per-horizon XGB + Ridge (degenerate one-sample "ensembles").
+    # Arms qgbm & qreg: quantile GBM + linear quantile regression -- real predictive ensembles
+    # [n_test, n_q, 15] shaped like the flow block, so they get proper CRPS/NLL (not the point
+    # arms' degenerate CRPS=MAE). Guarded: a quantile-fit failure degrades to the other arms.
+    quantile_baselines = None
+    if include_quantile:
+        q_grid = bt.DEFAULT_QUANTILES if quantiles is None else tuple(quantiles)
+        try:
+            quantile_baselines = bt.fit_quantile_baselines(
+                dataset, splits, quantiles=q_grid, use_event=baseline_use_event, seed=seed)
+            arm_samples["qgbm"] = quantile_baselines["qgbm_pred"]
+            arm_samples["qreg"] = quantile_baselines["qreg_pred"]
+        except Exception as exc:  # noqa: BLE001 - never let a baseline sink the flow comparison
+            warnings.warn(f"quantile arms skipped ({type(exc).__name__}: {exc})", stacklevel=2)
+    # Arms xgb & ridge: per-horizon point regressors (degenerate one-sample "ensembles").
     baselines = None
     if include_baselines:
         baselines = bt.fit_trajectory_baselines(dataset, splits, use_event=baseline_use_event, seed=seed)
@@ -1056,7 +1080,7 @@ def compare_trajectory_models(
     metrics = pd.DataFrame(metric_rows)
     metrics_path = output_dir / "trajectory_comparison_metrics.csv"
     metrics.to_csv(metrics_path, index=False)
-    ev.report_saved(metrics_path, "four-arm per-horizon trajectory metrics")
+    ev.report_saved(metrics_path, "per-horizon trajectory metrics (flow / quantile / point arms)")
 
     # Paired tests on per-patient CRPS (the proper score defined for every arm).
     paired_rows: list[dict] = []
@@ -1073,9 +1097,9 @@ def compare_trajectory_models(
     paired = pd.DataFrame(paired_rows)
     paired_path = output_dir / "trajectory_comparison_paired_tests.csv"
     paired.to_csv(paired_path, index=False)
-    ev.report_saved(paired_path, "four-arm paired CRPS tests (Wilcoxon + paired t)")
+    ev.report_saved(paired_path, "paired CRPS tests across arms (Wilcoxon + paired t)")
 
-    print("\nFour-arm trajectory comparison (pooled group rows, test split):")
+    print("\nTrajectory comparison (pooled group rows, test split):")
     with pd.option_context("display.max_columns", None, "display.width", 220):
         print(metrics[metrics["horizon"].str.startswith("__")].round(4).to_string(index=False))
         print("\nPaired CRPS tests (overall; mean_diff<0 => first arm better):")
@@ -1091,6 +1115,8 @@ def compare_trajectory_models(
         "n_steps": n_steps,
         "baseline_use_event": baseline_use_event,
         "baseline_feature_names": baselines["feature_names"] if baselines else None,
+        "quantile_arms": ["qgbm", "qreg"] if quantile_baselines else [],
+        "n_quantiles": int(np.asarray(quantile_baselines["quantiles"]).size) if quantile_baselines else 0,
         "metrics_csv": str(metrics_path),
         "paired_tests_csv": str(paired_path),
         "paired_test": "Wilcoxon signed-rank + paired t on per-patient CRPS",
@@ -1101,7 +1127,7 @@ def compare_trajectory_models(
     summary_path = output_dir / "trajectory_comparison_summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, default=float), encoding="utf-8")
     ev.report_saved(summary_path, "trajectory comparison summary")
-    print(f"\nSaved four-arm trajectory comparison to {output_dir}")
+    print(f"\nSaved trajectory comparison ({len(present)} arms: {', '.join(present)}) to {output_dir}")
     return summary
 
 
@@ -1242,9 +1268,10 @@ def main() -> None:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--compare-predictions", type=Path, default=None,
                         help="Optional CSV (subject_id, prob) for a DeLong AUROC delta vs the GBM.")
-    # W4 four-arm trajectory ablation (separate entrypoint; leaves evaluate() intact).
+    # W4 trajectory ablation (separate entrypoint; leaves evaluate() intact).
     parser.add_argument("--trajectory-comparison", dest="trajectory_comparison", action="store_true",
-                        help="Run the four-arm {event-flow, no-event-flow, XGB, Ridge} comparison instead of evaluate().")
+                        help="Run the trajectory comparison {event/no-event flow, quantile GBM + regression, "
+                             "XGB, Ridge} instead of evaluate().")
     parser.add_argument("--noevent-twin-run", type=Path, default=None,
                         help="Pre-trained no-event twin run dir; if omitted it is trained inline from the event arm's config.")
     parser.add_argument("--noevent-num-steps", type=int, default=None,

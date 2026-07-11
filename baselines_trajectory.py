@@ -60,7 +60,7 @@ import pandas as pd
 
 import xgboost as xgb
 from sklearn.impute import SimpleImputer
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import QuantileRegressor, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -75,6 +75,18 @@ except ImportError:  # pragma: no cover
 
 ARM_XGB = "xgb"
 ARM_RIDGE = "ridge"
+ARM_QGBM = "qgbm"    # quantile gradient boosting (pinball-loss XGBoost, all quantiles jointly)
+ARM_QREG = "qreg"    # linear conditional quantile regression (Koenker-Bassett, per quantile)
+
+# Shared quantile grid for both quantile arms. Symmetric and dense enough that the predicted
+# quantiles, treated as an equally-weighted predictive ensemble, give a faithful sample-CRPS
+# and let the coverage curve read its (0.5, 0.8, 0.9, 0.95) nominal bands off exact grid points
+# (0.25/0.75, 0.1/0.9, 0.05/0.95, 0.025/0.975 are all present). Both arms use the SAME grid so
+# they are scored by identical code and compared like-for-like against the flow's draws.
+DEFAULT_QUANTILES = (
+    0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
+    0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.975,
+)
 
 
 # Physiologic-plausibility bounds for OBSERVED outcomes, applied as data QC before
@@ -348,6 +360,162 @@ def baseline_metric_table(dataset: fm.FlowDataset, splits: dict[str, np.ndarray]
     return pd.DataFrame(rows)
 
 
+# --------------------------------------------------------------------------- #
+# Quantile arms: a richer, distribution-valued baseline than the point arms
+# --------------------------------------------------------------------------- #
+# The xgb/ridge arms above are POINT predictors (one number per horizon), so their CRPS
+# degenerates to MAE and they have no predictive spread (NLL is undefined). The two arms
+# below predict a whole GRID of conditional quantiles per horizon, which - after monotone
+# rearrangement - is a genuine predictive ensemble shaped exactly like the flow's per-patient
+# sample block. That makes them the fair distributional yard-stick for the flow: scored by the
+# same proper-scoring code (real CRPS, coverage, pinball, moment-matched NLL), on the same
+# conditioning information, splits, and observed test rows.
+def monotone_rearrange(pred: np.ndarray) -> np.ndarray:
+    """Chernozhukov-Fernandez-Val-Galichon rearrangement of a quantile block ``[n, n_q]``.
+
+    Sorting each row ascending turns a possibly-crossing set of estimated quantiles into a
+    valid non-decreasing quantile function (and hence a coherent predictive ensemble). Neither
+    the pinball-loss GBM nor per-level linear quantile regression guarantees monotonicity, so
+    this is applied to both arms; it never increases pinball loss (rearrangement is a
+    weak improvement, Chernozhukov et al. 2010).
+    """
+    return np.sort(np.asarray(pred, dtype=np.float64), axis=1)
+
+
+def make_quantile_gbm(quantiles: np.ndarray, seed: int = 0, params: dict | None = None) -> "xgb.XGBRegressor":
+    """One XGBoost booster that predicts ALL quantiles jointly via the pinball objective.
+
+    xgboost>=2.0's ``reg:quantileerror`` takes a VECTOR ``quantile_alpha``; the fitted model's
+    ``.predict`` returns ``[n, len(quantiles)]`` (one column per level) from a single training
+    run - far cheaper and more coherent than one booster per level. Missing features route the
+    tree-native way (NaNs kept, no imputation), matching the point-xgb arm. Cross-quantile
+    monotonicity is only approximate, so the caller rearranges (``monotone_rearrange``).
+    """
+    q = np.asarray(quantiles, dtype=np.float64)
+    defaults = dict(
+        n_estimators=300, max_depth=4, learning_rate=0.05, subsample=0.8,
+        colsample_bytree=0.8, reg_lambda=1.0, min_child_weight=1.0,
+        tree_method="hist", objective="reg:quantileerror", quantile_alpha=q,
+        random_state=seed, n_jobs=1,
+    )
+    if params:
+        defaults.update(params)
+    return xgb.XGBRegressor(**defaults)
+
+
+def make_quantile_regressor(quantile: float, alpha: float = 0.0) -> Pipeline:
+    """Linear conditional quantile regression (Koenker-Bassett) for one quantile level.
+
+    sklearn's ``QuantileRegressor`` minimises the pinball loss by linear programming (HiGHS);
+    ``alpha=0`` is the classic unregularised estimator. Wrapped in the SAME median-impute ->
+    standardise pipeline as the Ridge arm (``QuantileRegressor``, like ``Ridge``, cannot take
+    NaNs), with ``keep_empty_features=True`` so an all-NaN column on a tiny CSV becomes a
+    constant instead of erroring.
+    """
+    return Pipeline([
+        ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),
+        ("scale", StandardScaler()),
+        ("qr", QuantileRegressor(quantile=float(quantile), alpha=float(alpha), solver="highs")),
+    ])
+
+
+def fit_quantile_baselines(
+    dataset: fm.FlowDataset,
+    splits: dict[str, np.ndarray],
+    quantiles: "tuple[float, ...] | np.ndarray" = DEFAULT_QUANTILES,
+    use_event: bool = True,
+    seed: int = 0,
+    gbm_params: dict | None = None,
+    qr_alpha: float = 0.0,
+) -> dict:
+    """Fit a quantile-GBM and a linear quantile-regression arm per horizon; return TEST preds.
+
+    Both arms see the SAME conditioning matrix as the event-conditioned flow and the point
+    baselines (``build_feature_matrix``), are fit on the shared TRAIN split only, on the rows
+    where each horizon is observed, and regress the ORIGINAL-unit target. Each arm predicts the
+    ``quantiles`` grid which - after monotone rearrangement - IS a predictive ensemble: the
+    returned ``qgbm_pred`` / ``qreg_pred`` are ``[n_test, n_quantiles, n_horizon]`` in
+    ``splits['test']`` order, shaped exactly like ``_sample_twin_arm``'s flow block so they drop
+    straight into ``horizon_score`` and the ``distributional_metrics`` scorers.
+
+    A horizon with <2 observed train rows falls back to the empirical marginal quantiles of the
+    observed train target (an unconditional quantile forecast - still a valid distribution), or
+    an all-NaN column if nothing is observed; the metric layer decides observability from the
+    test mask, as with the point arms.
+    """
+    q = np.asarray(quantiles, dtype=np.float64)
+    n_q = int(q.size)
+    features, feature_names = build_feature_matrix(dataset, use_event)
+    x_cont = dataset.x[:, tw.CONT_DIMS].astype(np.float64)
+    mask_cont = dataset.mask[:, tw.CONT_DIMS]
+    train_idx, test_idx = splits["train"], splits["test"]
+
+    n_test = int(test_idx.size)
+    n_h = tw.X_CONT_DIM
+    qgbm_pred = np.full((n_test, n_q, n_h), np.nan, dtype=np.float64)
+    qreg_pred = np.full((n_test, n_q, n_h), np.nan, dtype=np.float64)
+    train_n = []
+
+    for h in range(n_h):
+        y = x_cont[:, h]
+        obs = mask_cont[:, h] == 1
+        tr = train_idx[obs[train_idx]]            # train patients with this horizon observed
+        train_n.append(int(tr.size))
+        obs_train_vals = y[tr]
+        if tr.size < 2:
+            fallback = (np.nanquantile(obs_train_vals, q) if obs_train_vals.size
+                        else np.full(n_q, np.nan))
+            qgbm_pred[:, :, h] = fallback[None, :]
+            qreg_pred[:, :, h] = fallback[None, :]
+            continue
+        gbm = make_quantile_gbm(q, seed=seed, params=gbm_params)
+        gbm.fit(features[tr], y[tr])
+        gbm_out = np.asarray(gbm.predict(features[test_idx]), dtype=np.float64).reshape(n_test, n_q)
+        qgbm_pred[:, :, h] = monotone_rearrange(gbm_out)
+        qr_cols = []
+        for qi in q:
+            model = make_quantile_regressor(float(qi), alpha=qr_alpha)
+            model.fit(features[tr], y[tr])
+            qr_cols.append(model.predict(features[test_idx]))
+        qreg_pred[:, :, h] = monotone_rearrange(np.stack(qr_cols, axis=1))
+
+    return {
+        "feature_names": feature_names,
+        "use_event": use_event,
+        "quantiles": q,
+        "test_idx": np.asarray(test_idx),
+        "qgbm_pred": qgbm_pred,
+        "qreg_pred": qreg_pred,
+        "train_n_per_horizon": train_n,
+    }
+
+
+def quantile_metric_table(dataset: fm.FlowDataset, splits: dict[str, np.ndarray], quantile_baselines: dict) -> pd.DataFrame:
+    """Per-horizon MAD/RMSE/CRPS/NLL for the two quantile arms on the test split.
+
+    Unlike the point arms these carry a real predictive spread, so CRPS is the proper
+    (non-degenerate) score and the moment-matched Gaussian NLL is finite. The richer calibration
+    read-outs (coverage curve, interval score, pinball) live in the comparison scripts that may
+    import ``distributional_metrics``; they are kept OUT of this module so the dependency stays
+    one-directional (baselines_trajectory <- distributional_metrics).
+    """
+    x_cont = dataset.x[:, tw.CONT_DIMS].astype(np.float64)
+    mask_cont = dataset.mask[:, tw.CONT_DIMS]
+    test_idx = splits["test"]
+    obs = x_cont[test_idx]
+    mask = mask_cont[test_idx]
+    arm_pred = {ARM_QGBM: quantile_baselines["qgbm_pred"], ARM_QREG: quantile_baselines["qreg_pred"]}
+    rows = []
+    for h, name in enumerate(tw.CONT_NAMES):
+        for arm, pred in arm_pred.items():
+            score = horizon_score(pred[:, :, h], obs[:, h], mask[:, h], has_density=True,
+                                  obs_bounds=PHYSIOLOGIC_BOUNDS.get(tw.CONT_GROUPS[h]))
+            rows.append({"horizon": name, "group": tw.CONT_GROUPS[h], "arm": arm,
+                         "n_obs": score["n_obs"], "mad": score["mad"], "rmse": score["rmse"],
+                         "crps": score["crps"], "nll": score["nll"]})
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--csv", "--csv-path", dest="csv_path", type=str, default=None)
@@ -359,6 +527,8 @@ def main() -> None:
     parser.add_argument("--test-frac", type=float, default=0.15)
     parser.add_argument("--no-event", dest="no_event", action="store_true",
                         help="Drop the event feature (mirror the no-event flow arm).")
+    parser.add_argument("--no-quantile", dest="no_quantile", action="store_true",
+                        help="Skip the quantile arms (qgbm/qreg); dump only the point baselines.")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -379,11 +549,22 @@ def main() -> None:
     tag = "noevent" if args.no_event else "event"
     out_csv = output_dir / f"baseline_trajectory_metrics_{tag}.csv"
     table.to_csv(out_csv, index=False)
-    print(f"Trajectory baselines ({tag} features={baselines['feature_names']})")
+    print(f"Point baselines ({tag} features={baselines['feature_names']})")
     print(f"Train rows per horizon: {baselines['train_n_per_horizon']}")
     with pd.option_context("display.max_columns", None, "display.width", 200):
         print(table.round(4).to_string(index=False))
-    print(f"  [saved] per-horizon baseline metrics -> {out_csv}")
+    print(f"  [saved] per-horizon point-baseline metrics -> {out_csv}")
+
+    if not args.no_quantile:
+        q_baselines = fit_quantile_baselines(dataset, splits, use_event=not args.no_event, seed=args.seed)
+        q_table = quantile_metric_table(dataset, splits, q_baselines)
+        q_csv = output_dir / f"quantile_trajectory_metrics_{tag}.csv"
+        q_table.to_csv(q_csv, index=False)
+        print(f"\nQuantile baselines ({tag}, {q_baselines['quantiles'].size} levels): "
+              f"qgbm=pinball-XGBoost, qreg=linear Koenker-Bassett")
+        with pd.option_context("display.max_columns", None, "display.width", 200):
+            print(q_table.round(4).to_string(index=False))
+        print(f"  [saved] per-horizon quantile-baseline metrics -> {q_csv}")
 
 
 if __name__ == "__main__":

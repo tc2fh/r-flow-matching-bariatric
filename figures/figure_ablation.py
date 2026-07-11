@@ -1,14 +1,15 @@
-"""Supplement figure - four-arm trajectory ablation (does event conditioning help?).
+"""Supplement figure - trajectory ablation (does event conditioning help?) + baselines.
 
-Grouped bars of pooled CRPS (lower = better) for the four arms across overall / BMI /
-HbA1c, with the decisive event-conditioned-vs-unconditioned flow contrast as the two
-accent hues and the XGB / Ridge point regressors as neutral references. Annotates the
-paired-test evidence for the coupling claim.
+Grouped bars of pooled CRPS (lower = better) for every present arm across overall / BMI /
+HbA1c, with the decisive event-conditioned-vs-unconditioned flow contrast as the two accent
+hues. The baselines recede behind the flows: the quantile arms (quantile GBM = green, the
+strongest distributional baseline; quantile regression) and the XGB / Ridge point regressors
+as neutral references. Annotates the paired-test evidence for the coupling claim. Whichever
+arms are present in the CSV are drawn, so this stays correct as arms are added or removed.
 
 Reads (optional): trajectory_comparison_metrics.csv (pooled __overall__/__bmi__/
 __hba1c__ rows), trajectory_comparison_paired_tests.csv (event_flow_vs_no_event_flow).
-Returns [] (skips) if the ablation CSV is absent - it is emitted by a separate
-`evaluate_twin.py --trajectory-comparison` run, not by freeze_run.
+Returns [] (skips) if the ablation CSV is absent.
 """
 
 from __future__ import annotations
@@ -21,10 +22,14 @@ import numpy as np
 from . import style
 from .artifacts import RunArtifacts
 
-ARM_ORDER = ["event_flow", "no_event_flow", "xgb", "ridge"]
+ARM_ORDER = ["event_flow", "no_event_flow", "qgbm", "qreg", "xgb", "ridge"]
 ARM_LABEL = {"event_flow": "event-conditioned flow", "no_event_flow": "unconditioned flow",
+             "qgbm": "quantile GBM", "qreg": "quantile regression",
              "xgb": "XGBoost (point)", "ridge": "Ridge (point)"}
+# Two flow arms pop in the accent hues; the four baselines take a green + graded-neutral ramp
+# so they read as the "baseline field" the flow is measured against.
 ARM_COLOR = {"event_flow": style.ACCENT, "no_event_flow": style.CONTRAST,
+             "qgbm": style.AQUA, "qreg": style.INK_SECONDARY,
              "xgb": style.MUTED, "ridge": style.BASELINE}
 GROUPS = [("overall", "Overall"), ("bmi", "BMI"), ("hba1c", "HbA1c")]
 
@@ -42,7 +47,8 @@ def build(art: RunArtifacts, out_stem: Path) -> list[Path]:
     pooled["gkey"] = pooled["group"].astype(str)
 
     arms_present = [a for a in ARM_ORDER if a in set(metrics["arm"])]
-    fig, ax = plt.subplots(figsize=(7.6, 3.9))
+    # Wider canvas so the legend sits fully outside the axes (it grows with the arm count).
+    fig, ax = plt.subplots(figsize=(9.4, 3.9))
     n_arms = len(arms_present)
     gwidth = 0.8
     bw = gwidth / n_arms
@@ -63,7 +69,9 @@ def build(art: RunArtifacts, out_stem: Path) -> list[Path]:
     ax.set_xticks(xbase)
     ax.set_xticklabels([lbl for _, lbl in GROUPS])
     ax.set(ylabel="CRPS (lower is better)", title="Trajectory ablation: event conditioning vs baselines")
-    ax.legend(loc="upper left", ncol=2, fontsize=7.0)
+    # Headroom for the bar-value labels, and legend outside on the right so it never covers a bar.
+    ax.margins(y=0.14)
+    ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=7.0, frameon=False)
     style.style_axis(ax)
 
     # coupling evidence annotation
