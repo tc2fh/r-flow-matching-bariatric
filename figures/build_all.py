@@ -20,7 +20,7 @@ from pathlib import Path
 
 from . import artifacts as A
 from . import figure_consort, figure_gbm, figure_trajectory, figure_counterfactual
-from . import figure_perpatient, figure_ablation
+from . import figure_perpatient, figure_ablation, figure_causal, figure_distributional
 
 
 # Existing artifacts routed to supplement/ (screenshots + diagnostic panels). (src name, dest name)
@@ -93,6 +93,10 @@ def main() -> int:
         art, main_dir / "fig1_consort", use_db=args.use_db, csv_path=args.csv))
     _run("Fig2 GBM (ROC/reliability/DCA)", lambda: figure_gbm.build(art, main_dir / "fig2_gbm"))
     _run("Fig4 Calibrated trajectory", lambda: figure_trajectory.build(art, main_dir / "fig4_trajectory_calibrated"))
+    # tte_*/dist_* CSV -> figure (skips cleanly when a run has no causal/distributional artifacts)
+    _run("Fig5 Causal effects (TTE)", lambda: figure_causal.build(art, main_dir / "fig5_causal_effects"))
+    _run("Fig6 Distributional validation",
+         lambda: figure_distributional.build(art, main_dir / "fig6_distributional"))
 
     # --- model-backed figures (load the twin once, share) --- #
     bundle = None
