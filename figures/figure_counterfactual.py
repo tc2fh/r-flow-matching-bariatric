@@ -85,6 +85,7 @@ def build(art: RunArtifacts, out_stem: Path, *, bundle: S.TwinBundle | None = No
     fig.suptitle("RYGB vs sleeve: cohort comparative effectiveness (held-out test set)", y=1.05)
     style.caption(fig,
                   f"n = {diff.shape[0]} test patients, {n_samples} samples/patient, {n_boot} bootstrap resamples. "
-                  "Negative = RYGB lower. " + style.CALIBRATION_CAUTION,
+                  "Negative = RYGB lower. Display samples are truncated to predeclared physiological bounds; "
+                  "the counterfactual safety supplement reports every raw violation. " + style.CALIBRATION_CAUTION,
                   y=-0.16, size=6.8)
     return style.save_figure(fig, out_stem)

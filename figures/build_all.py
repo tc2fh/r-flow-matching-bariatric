@@ -21,6 +21,7 @@ from pathlib import Path
 from . import artifacts as A
 from . import figure_consort, figure_gbm, figure_trajectory, figure_counterfactual
 from . import figure_perpatient, figure_ablation, figure_causal, figure_distributional
+from . import figure_counterfactual_diagnostics
 
 
 # Existing artifacts routed to supplement/ (screenshots + diagnostic panels). (src name, dest name)
@@ -117,6 +118,10 @@ def main() -> int:
 
     # --- supplement --- #
     _run("Supp ablation", lambda: figure_ablation.build(art, supp_dir / "supp_ablation_event_conditioning"))
+    if bundle is not None:
+        _run("Supp counterfactual safety", lambda: figure_counterfactual_diagnostics.build(
+            bundle, supp_dir / "supp_counterfactual_safety", n_samples=args.n_samples,
+            n_steps=args.n_steps, seed=args.seed))
     routed = _route_supplement(art, supp_dir)
     print(f"\nRouted {len(routed)} existing artifacts to supplement/.")
 

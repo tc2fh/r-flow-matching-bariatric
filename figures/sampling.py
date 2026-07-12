@@ -76,10 +76,16 @@ def cohort_surgery_medians(bundle: TwinBundle, *, n_samples: int = 200, n_steps:
     base = ev.arrays_for(bundle.dataset, bundle.test_idx, bundle.pre)
     event = base["y_mace"].astype(np.float32)
     cfg = replace(bundle.twin_cfg, n_samples_per_patient=n_samples, sample_steps=n_steps)
+    noise = np.random.default_rng(seed).standard_normal(
+        (bundle.test_idx.size, n_samples, tw.X_CONT_DIM)
+    ).astype(np.float32)
     medians: dict[str, np.ndarray] = {}
     for name, sidx in (("sleeve", SLEEVE_IDX), ("rnygb", RNYGB_IDX)):
         arms = {**base, "surgery_idx": np.full_like(base["surgery_idx"], sidx)}
-        samp15 = ev.twin_samples_15(bundle.model, arms, event, cfg, bundle.pre, bundle.device)  # (n,S,15)
+        samp15 = ev.twin_samples_15(
+            bundle.model, arms, event, cfg, bundle.pre, bundle.device,
+            initial_noise=noise, bound_output=True,
+        )  # (n,S,15)
         medians[name] = np.median(samp15, axis=1)  # (n,15) native units
     return list(tw.CONT_NAMES), medians
 
@@ -95,7 +101,16 @@ def display_patient_samples(bundle: TwinBundle, *, n_show: int = 3, n_samples: i
     event = arrays["y_mace"]
     cfg = replace(bundle.twin_cfg, n_samples_per_patient=n_samples, sample_steps=n_steps)
     torch.manual_seed(seed); np.random.seed(seed)
-    factual = ev.scatter_to_full(ev.twin_samples_15(bundle.model, arrays, event, cfg, bundle.pre, bundle.device))
+    noise = np.random.default_rng(seed).standard_normal(
+        (selected.size, n_samples, tw.X_CONT_DIM)
+    ).astype(np.float32)
+    factual = ev.scatter_to_full(ev.twin_samples_15(
+        bundle.model, arrays, event, cfg, bundle.pre, bundle.device,
+        initial_noise=noise, bound_output=True,
+    ))
     counterfactual = ev.scatter_to_full(
-        ev.twin_samples_15(bundle.model, arrays, event, cfg, bundle.pre, bundle.device, flip_surgery=True))
+        ev.twin_samples_15(
+            bundle.model, arrays, event, cfg, bundle.pre, bundle.device,
+            flip_surgery=True, initial_noise=noise, bound_output=True,
+        ))
     return selected, factual, counterfactual

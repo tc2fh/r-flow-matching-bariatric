@@ -49,7 +49,7 @@ def build(art: RunArtifacts, out_dir: Path, *, prefix: str = "figA", bundle: S.T
             bundle.dataset, selected, factual, counterfactual, group, y_label,
             stem.with_suffix(".png"),
             f"Per-patient {y_label}: factual vs surgery-counterfactual + P({thr_label}) "
-            f"({n_show}/arm)",
+            f"({n_show}/arm; bounded display, raw violations in safety supplement)",
             max_sample_lines=50, y_limits=ylim,
             threshold=thr, threshold_label=thr_label,
             trustworthy_months=_trust_months(art, group),

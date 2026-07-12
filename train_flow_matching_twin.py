@@ -147,6 +147,10 @@ class TwinConfig:
     val_repeats: int = 8
     # Sampling / evaluation.
     sample_steps: int = 50
+    # Heun's predictor-corrector integrator is the default for new and legacy
+    # checkpoints. It costs two vector-field evaluations per step but is materially
+    # more stable than first-order Euler in counterfactual tails.
+    sample_solver: str = "heun"
     n_samples_per_patient: int = 50
     # Maximum number of patient-sample trajectories evaluated by the flow at once.
     # Cohort figures may request millions of trajectories; bounding the flattened
@@ -308,6 +312,8 @@ def sample_trajectories(
     device: torch.device,
     x_cont_dim: int,
     event: np.ndarray | None = None,
+    initial_noise: np.ndarray | torch.Tensor | None = None,
+    solver: str | None = None,
 ) -> np.ndarray:
     """Sample the 15 continuous dims for each patient, conditioned on ``event``.
 
@@ -322,6 +328,9 @@ def sample_trajectories(
         event = arrays["y_mace"]
     event = np.asarray(event).reshape(-1).astype(np.int64)
     n_samples = cfg.n_samples_per_patient
+    solver = str(solver or cfg.sample_solver).lower()
+    if solver not in {"euler", "heun"}:
+        raise ValueError(f"Unknown sampling solver {solver!r}; expected 'euler' or 'heun'.")
     batch_size = cfg.sample_batch_size
     if n_samples <= 0:
         raise ValueError(f"n_samples_per_patient must be positive, got {n_samples}.")
@@ -350,7 +359,22 @@ def sample_trajectories(
             # drawing per batch would silently change results when the memory cap
             # changes. This tensor is small compared with the repeated hidden-layer
             # activations that batching bounds (about 52 MB for the full VM run).
-            initial_noise = torch.randn(total, x_cont_dim, device=device)
+            if initial_noise is None:
+                noise = torch.randn(total, x_cont_dim, device=device)
+            else:
+                noise = torch.as_tensor(initial_noise, dtype=torch.float32, device=device)
+                if noise.ndim == 3:
+                    expected_3d = (n_patients, n_samples, x_cont_dim)
+                    if tuple(noise.shape) != expected_3d:
+                        raise ValueError(
+                            f"initial_noise shape {tuple(noise.shape)} != expected {expected_3d}."
+                        )
+                    noise = noise.reshape(total, x_cont_dim)
+                expected_2d = (total, x_cont_dim)
+                if noise.ndim != 2 or tuple(noise.shape) != expected_2d:
+                    raise ValueError(
+                        f"initial_noise shape {tuple(noise.shape)} != expected {expected_2d}."
+                    )
             for start in range(0, total, batch_size):
                 stop = min(start + batch_size, total)
                 # Flattened output is patient-major, with all draws for patient 0
@@ -365,12 +389,22 @@ def sample_trajectories(
                 )
                 event_idx = fm.as_tensor(event[patient_idx], device, torch.long)
                 cond = model.encode(surgery_idx, patient_features, event_idx)
-                x = initial_noise[start:stop]
+                x = noise[start:stop].clone()
                 for step in range(cfg.sample_steps):
                     t = torch.full(
                         (stop - start,), step * dt, dtype=torch.float32, device=device
                     )
-                    x = x + dt * model.velocity(x, t, cond)
+                    velocity = model.velocity(x, t, cond)
+                    if solver == "euler":
+                        x = x + dt * velocity
+                    else:
+                        predictor = x + dt * velocity
+                        t_next = torch.full(
+                            (stop - start,), (step + 1) * dt,
+                            dtype=torch.float32, device=device,
+                        )
+                        corrected = model.velocity(predictor, t_next, cond)
+                        x = x + 0.5 * dt * (velocity + corrected)
                 samples[start:stop] = x.detach().cpu().numpy()
     finally:
         model.train(was_training)

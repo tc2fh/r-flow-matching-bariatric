@@ -27,6 +27,18 @@ class RecordingTwin(torch.nn.Module):
         return torch.zeros_like(x)
 
 
+class ExponentialTwin(RecordingTwin):
+    """dx/dt=x has an analytic solution and exposes integration error."""
+
+    def velocity(self, x, t, cond):
+        return x
+
+
+class SurgeryShiftTwin(RecordingTwin):
+    def velocity(self, x, t, cond):
+        return cond[:, :1].expand_as(x)
+
+
 def _arrays(n_patients: int) -> dict[str, np.ndarray]:
     return {
         "patient_features": np.arange(n_patients * 2, dtype=np.float32).reshape(n_patients, 2),
@@ -74,3 +86,37 @@ def test_batched_sampling_is_repeatable_and_restores_model_mode():
     np.testing.assert_array_equal(unbatched, batched)
     assert unbatched_model.training is False
     assert batched_model.training is False
+
+
+def test_heun_is_more_accurate_than_euler_for_same_latent_draws():
+    arrays = _arrays(1)
+    cfg = tw.TwinConfig(n_samples_per_patient=1, sample_steps=10)
+    noise = np.ones((1, 1, 1), dtype=np.float32)
+    euler = tw.sample_trajectories(
+        ExponentialTwin(), arrays, cfg, torch.device("cpu"), 1,
+        initial_noise=noise, solver="euler",
+    )[0, 0, 0]
+    heun = tw.sample_trajectories(
+        ExponentialTwin(), arrays, cfg, torch.device("cpu"), 1,
+        initial_noise=noise, solver="heun",
+    )[0, 0, 0]
+
+    assert abs(heun - np.e) < abs(euler - np.e)
+
+
+def test_common_noise_is_reused_for_paired_surgery_contrast():
+    arrays = _arrays(2)
+    cfg = tw.TwinConfig(n_samples_per_patient=3, sample_steps=4)
+    noise = np.arange(6, dtype=np.float32).reshape(2, 3, 1)
+    sleeve = {**arrays, "surgery_idx": np.zeros(2, dtype=np.int64)}
+    rygb = {**arrays, "surgery_idx": np.ones(2, dtype=np.int64)}
+    y0 = tw.sample_trajectories(
+        SurgeryShiftTwin(), sleeve, cfg, torch.device("cpu"), 1,
+        initial_noise=noise,
+    )
+    y1 = tw.sample_trajectories(
+        SurgeryShiftTwin(), rygb, cfg, torch.device("cpu"), 1,
+        initial_noise=noise,
+    )
+
+    np.testing.assert_allclose(y1 - y0, 1.0, atol=1e-6)

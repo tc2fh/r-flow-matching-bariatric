@@ -317,12 +317,24 @@ def arrays_for(dataset: fm.FlowDataset, idx: np.ndarray, pre: mt.Preprocessing) 
 
 
 def twin_samples_15(model, arrays: dict, event: np.ndarray, cfg: tw.TwinConfig, pre: mt.Preprocessing,
-                    device: torch.device, flip_surgery: bool = False) -> np.ndarray:
+                    device: torch.device, flip_surgery: bool = False,
+                    initial_noise: np.ndarray | torch.Tensor | None = None,
+                    solver: str | None = None, bound_output: bool = False) -> np.ndarray:
     """[n, n_samples, 15] BMI/HbA1c samples in ORIGINAL units, conditioned on event."""
     if flip_surgery:
         arrays = {**arrays, "surgery_idx": (1 - arrays["surgery_idx"]).astype(np.int64)}
-    std = tw.sample_trajectories(model, arrays, cfg, device, tw.X_CONT_DIM, event=event)
-    return mt.unstandardize(std, pre)
+    std = tw.sample_trajectories(
+        model, arrays, cfg, device, tw.X_CONT_DIM, event=event,
+        initial_noise=initial_noise, solver=solver,
+    )
+    original = mt.unstandardize(std, pre)
+    if bound_output:
+        # Presentation safety only. Raw samples remain the source for calibration,
+        # scoring, and counterfactual diagnostics so clipping can never hide failure.
+        for dim, group in enumerate(tw.CONT_GROUPS):
+            lo, hi = bt.PHYSIOLOGIC_BOUNDS[group]
+            original[:, :, dim] = np.clip(original[:, :, dim], lo, hi)
+    return original
 
 
 def scatter_to_full(samples_15: np.ndarray) -> np.ndarray:
@@ -527,9 +539,18 @@ def evaluate_flow(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Preproce
     selected = ev.select_display_patients(dataset, test_idx, np.random.default_rng(seed), n_show)
     sel_arrays = arrays_for(dataset, selected, pre)
     true_event_sel = sel_arrays["y_mace"]
-    factual = scatter_to_full(twin_samples_15(model, sel_arrays, true_event_sel, sample_cfg, pre, device))
+    display_noise = np.random.default_rng(seed + 17).standard_normal(
+        (selected.size, n_samples, tw.X_CONT_DIM)
+    ).astype(np.float32)
+    factual = scatter_to_full(twin_samples_15(
+        model, sel_arrays, true_event_sel, sample_cfg, pre, device,
+        initial_noise=display_noise, bound_output=True,
+    ))
     counterfactual = scatter_to_full(
-        twin_samples_15(model, sel_arrays, true_event_sel, sample_cfg, pre, device, flip_surgery=True)
+        twin_samples_15(
+            model, sel_arrays, true_event_sel, sample_cfg, pre, device,
+            flip_surgery=True, initial_noise=display_noise, bound_output=True,
+        )
     )
     ev.selected_patient_frame(dataset, selected).to_csv(output_dir / "eval_flow_selected_test_patients.csv", index=False)
     ev.report_saved(output_dir / "eval_flow_selected_test_patients.csv", "selected display patients")
@@ -731,8 +752,19 @@ def evaluate_simulator(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Pre
     # (C4) surgery counterfactual coherence: flip surgery -> risk delta & traj delta
     p_cf = gbm["test_cf_cal"] if gbm["calibrated"] else gbm["test_cf_raw"]
     risk_delta = p_cf - p
-    mu_fac = twin_samples_15(model, test_arrays, test_arrays["y_mace"], sample_cfg, pre, device).mean(axis=1)
-    mu_cf = twin_samples_15(model, test_arrays, test_arrays["y_mace"], sample_cfg, pre, device, flip_surgery=True).mean(axis=1)
+    # Use common random numbers so the contrast isolates the surgery clamp instead
+    # of subtracting two independent Monte Carlo samples.
+    cf_noise = np.random.default_rng(seed + 4104).standard_normal(
+        (test_idx.size, n_samples, tw.X_CONT_DIM)
+    ).astype(np.float32)
+    mu_fac = twin_samples_15(
+        model, test_arrays, test_arrays["y_mace"], sample_cfg, pre, device,
+        initial_noise=cf_noise,
+    ).mean(axis=1)
+    mu_cf = twin_samples_15(
+        model, test_arrays, test_arrays["y_mace"], sample_cfg, pre, device,
+        flip_surgery=True, initial_noise=cf_noise,
+    ).mean(axis=1)
     bmi_dims = _group_dims("bmi")
     traj_delta_bmi = (mu_cf[:, bmi_dims] - mu_fac[:, bmi_dims]).mean(axis=1)  # mean BMI shift per patient
     coherence = float("nan")
@@ -748,6 +780,27 @@ def evaluate_simulator(model, dataset: fm.FlowDataset, splits: dict, pre: mt.Pre
     ev.report_saved(output_dir / "eval_sim_surgery_counterfactual.csv", "Mode C surgery counterfactual coherence")
     _plot_surgery_counterfactual(risk_delta, traj_delta_bmi, output_dir / "eval_sim_surgery_counterfactual.png")
     summary["surgery_counterfactual"] = cf.to_dict(orient="records")[0]
+
+    # Detailed paired-noise, support, physiological-bound, and solver audit. This is
+    # guarded so a diagnostic failure cannot discard the core evaluator artifacts.
+    try:
+        import counterfactual_audit
+        summary["counterfactual_audit"] = counterfactual_audit.run(
+            dataset=dataset, splits=splits, pre=pre, model=model, twin_cfg=twin_cfg,
+            device=device, output_dir=output_dir, prefix="eval_counterfactual",
+            n_samples=min(n_samples, 64), n_steps=n_steps, seed=seed,
+        )
+        print("  [saved] paired counterfactual safety dashboard + audit tables")
+    except Exception as exc:  # noqa: BLE001 - diagnostic must not lose the evaluation
+        import traceback
+        traceback.print_exc()
+        warnings.warn(
+            f"counterfactual safety audit FAILED ({type(exc).__name__}: {exc})",
+            stacklevel=2,
+        )
+        summary["counterfactual_audit"] = {
+            "status": "failed", "error": f"{type(exc).__name__}: {exc}"
+        }
 
     return summary
 
