@@ -16,7 +16,8 @@ Pinned to ONE config, this thin orchestrator runs, in sequence, into
                                              figures; guarded so a figure crash never loses the run)
 
 then writes a top-level ``RUN_MANIFEST.json`` capturing everything needed to
-reproduce the run and to make the backend unmistakable: git SHA, all seeds,
+reproduce the run and to make the backend unmistakable: a deterministic source
+fingerprint (plus Git SHA when available), all seeds,
 ``split_strategy``, the actual GBM backend (xgboost vs HistGradientBoosting) +
 xgboost / scikit-learn / torch versions, a full ``uv pip freeze``, the input
 CSV path + SHA-256, the resolved GBM and twin configs, and the pinned
@@ -91,6 +92,7 @@ import evaluate_flow_matching as ev
 import evaluate_twin as ev_twin
 import make_table_one as t1
 import debug_attrition as attrition
+from study_reproducibility import source_fingerprint
 
 
 DEFAULT_OUTPUT_ROOT = fm.REPO_ROOT / "runs" / "frozen"
@@ -344,11 +346,15 @@ def build_manifest(cfg: FreezeConfig, frozen_dir: Path, dataset: fm.FlowDataset,
                    csv_path: Path | None, attrition_report: Path, pipeline_dir: Path,
                    pipe_manifest: dict, gbm_run_dir: Path, twin_final_run_dir: Path,
                    eval_summary: dict, table_dir: Path,
-                   traj_result: dict | None = None, figures_result: dict | None = None) -> dict:
+                   traj_result: dict | None = None, figures_result: dict | None = None,
+                   source_fingerprint_start: dict | None = None,
+                   source_fingerprint_end: dict | None = None) -> dict:
     gbm_config = _read_json(gbm_run_dir / "config.json")
     twin_config = _read_json(twin_final_run_dir / "config.json")
     traj_result = traj_result or {}
     figures_result = figures_result or {}
+    source_fingerprint_start = source_fingerprint_start or source_fingerprint(fm.REPO_ROOT)
+    source_fingerprint_end = source_fingerprint_end or source_fingerprint(fm.REPO_ROOT)
 
     backend = "xgboost" if gb.xgboost_available() else "hist_gradient_boosting"
 
@@ -367,6 +373,11 @@ def build_manifest(cfg: FreezeConfig, frozen_dir: Path, dataset: fm.FlowDataset,
         "git": git_info(),
         # --- reproducibility guard: code SHA is paired with the feature width ----
         "code": {
+            "source_fingerprint": source_fingerprint_start,
+            "source_fingerprint_at_manifest": source_fingerprint_end,
+            "source_stable_during_run": (
+                source_fingerprint_start.get("sha256") == source_fingerprint_end.get("sha256")
+            ),
             "patient_feature_width": len(patient_features),
             "patient_features": patient_features,
             "twin_x_cont_dim": int(tw.X_CONT_DIM),
@@ -587,6 +598,11 @@ def freeze(cfg: FreezeConfig) -> Path:
     if not cfg.final_train_best:
         raise RuntimeError("final_train_best must be True: the evaluator needs a final twin run dir.")
 
+    # Git is intentionally absent on the Cosmos VM. Capture a deterministic
+    # first-party source snapshot before any long-running work so paired freezes
+    # can still prove that they used identical transferred files.
+    source_start = source_fingerprint(fm.REPO_ROOT)
+
     # Reproducibility: seed the module RNGs up front. With --deterministic we also
     # flip on torch.use_deterministic_algorithms (may raise on an unsupported op, so
     # it stays opt-in); without it we still pin the seeds, which is harmless.
@@ -677,10 +693,11 @@ def freeze(cfg: FreezeConfig) -> Path:
     figures_result = build_figures(cfg, frozen_dir, csv_path)
 
     # --- RUN_MANIFEST.json ----------------------------------------------------- #
+    source_end = source_fingerprint(fm.REPO_ROOT)
     manifest = build_manifest(
         cfg, frozen_dir, dataset, csv_path, attrition_report, pipeline_dir,
         pipe_manifest, gbm_run_dir, twin_final_run_dir, eval_summary, table_dir,
-        traj_result, figures_result,
+        traj_result, figures_result, source_start, source_end,
     )
     manifest_path = frozen_dir / "RUN_MANIFEST.json"
     manifest_path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
@@ -691,6 +708,12 @@ def freeze(cfg: FreezeConfig) -> Path:
     print(f"[freeze] patient_feature_width={manifest['code']['patient_feature_width']} "
           f"checkpoint_in_features={manifest['code']['twin_checkpoint_encoder_in_features']} "
           f"match={manifest['code']['checkpoint_width_matches_code']}")
+    print(f"[freeze] source fingerprint={manifest['code']['source_fingerprint']['sha256']} "
+          f"({manifest['code']['source_fingerprint']['file_count']} Python files) "
+          f"stable={manifest['code']['source_stable_during_run']}")
+    if not manifest["code"]["source_stable_during_run"]:
+        print("[freeze] WARNING: project source files changed while the freeze was running; "
+              "do not pair this run with another validation fold.", file=sys.stderr)
     fig_art = manifest["artifacts"]["figures"]
     print(f"[freeze] trajectory ablation: {traj_result.get('status')} "
           f"(arms={traj_result.get('arms')}) | figures: {fig_art['status']} "

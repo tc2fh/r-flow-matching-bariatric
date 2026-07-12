@@ -1,10 +1,23 @@
 #!/usr/bin/env python3
-'''
-full study on the cosmos VM
-'''
+"""Run the paired internal/temporal study on the Cosmos VM.
+
+Normal run::
+
+    python run_full_study.py
+
+Resume a legacy no-Git study after steps 1-3 completed::
+
+    python run_full_study.py --resume-study runs/full_study/study_<timestamp> \
+        --allow-missing-code-identity
+
+New freezes record deterministic source fingerprints, so future paired runs do
+not need Git and do not need the legacy override.
+"""
 from __future__ import annotations
 
+import argparse
 import glob
+import hashlib
 import json
 import os
 import shutil
@@ -79,7 +92,7 @@ def ensure_project_python() -> None:
     if Path(python) != Path(sys.executable).resolve():
         env = os.environ.copy()
         env["MBSAQIP_PYTHON_SELECTED"] = "1"
-        completed = subprocess.run([python, str(Path(__file__).resolve())], env=env)
+        completed = subprocess.run([python, str(Path(__file__).resolve()), *sys.argv[1:]], env=env)
         raise SystemExit(completed.returncode)
 
 
@@ -184,7 +197,13 @@ def validated_freeze(output_root: Path, expected_split: str) -> tuple[Path, dict
     return frozen, manifest
 
 
-def validate_paired_runs(internal: dict, temporal: dict) -> None:
+def _source_sha(manifest: dict) -> str | None:
+    fingerprint = (manifest.get("code") or {}).get("source_fingerprint") or {}
+    return fingerprint.get("sha256")
+
+
+def validate_paired_runs(internal: dict, temporal: dict, *,
+                         allow_missing_code_identity: bool = False) -> dict:
     """Confirm that split strategy, rather than cohort or code, defines the comparison."""
     internal_hash = (internal.get("input") or {}).get("sha256")
     temporal_hash = (temporal.get("input") or {}).get("sha256")
@@ -193,16 +212,55 @@ def validate_paired_runs(internal: dict, temporal: dict) -> None:
             "The internal and temporal runs do not record the same cohort SHA-256; "
             "a cross-run drift comparison would not be valid."
         )
-    internal_sha = (internal.get("git") or {}).get("sha")
-    temporal_sha = (temporal.get("git") or {}).get("sha")
-    if not internal_sha or internal_sha != temporal_sha:
-        fail(
-            "The internal and temporal runs do not record the same git revision; "
-            "a cross-run drift comparison would not be valid."
-        )
     print(f"  paired-run cohort SHA-256: {internal_hash}")
-    print(f"  paired-run git revision:  {internal_sha}")
-    print("  comparison validity check passed: same cohort and code, different time split")
+
+    internal_source = _source_sha(internal)
+    temporal_source = _source_sha(temporal)
+    if internal_source or temporal_source:
+        if not internal_source or not temporal_source:
+            fail(
+                "Only one paired run records a source fingerprint; code identity cannot be verified."
+            )
+        if internal_source != temporal_source:
+            fail(
+                "The internal and temporal source fingerprints differ; a cross-run drift "
+                "comparison would not be valid."
+            )
+        for label, manifest in (("internal", internal), ("temporal", temporal)):
+            stable = (manifest.get("code") or {}).get("source_stable_during_run")
+            if stable is False:
+                fail(f"The {label} run records source changes during its freeze; it cannot be paired.")
+        identity = {"kind": "source_sha256", "value": internal_source, "verified": True}
+        print(f"  paired-run source SHA-256: {internal_source}")
+    else:
+        internal_sha = (internal.get("git") or {}).get("sha")
+        temporal_sha = (temporal.get("git") or {}).get("sha")
+        if internal_sha or temporal_sha:
+            if not internal_sha or not temporal_sha or internal_sha != temporal_sha:
+                fail(
+                    "The internal and temporal Git revisions differ or one is missing; "
+                    "a cross-run drift comparison would not be valid."
+                )
+            identity = {"kind": "git", "value": internal_sha, "verified": True}
+            print(f"  paired-run Git revision: {internal_sha}")
+        elif allow_missing_code_identity:
+            identity = {"kind": "legacy_unverified", "value": None, "verified": False}
+            print(
+                "  WARNING: legacy manifests contain no Git revision or source fingerprint.\n"
+                "  Continuing only because --allow-missing-code-identity was explicitly supplied.\n"
+                "  This override does not permit a known code or cohort mismatch."
+            )
+        else:
+            fail(
+                "Both paired runs have no Git revision or source fingerprint. For legacy no-Git "
+                "VM results, resume with --allow-missing-code-identity only after confirming that "
+                "no source files were transferred between the two freezes."
+            )
+    if identity["verified"]:
+        print("  comparison validity check passed: same cohort and code, different time split")
+    else:
+        print("  legacy comparison override accepted: same cohort; code identity remains unverified")
+    return identity
 
 
 def find_pipeline(frozen: Path) -> Path:
@@ -225,106 +283,113 @@ def validate_quantile_comparison(output_dir: Path, label: str) -> None:
     print(f"  verified {label} quantile comparison: {output_dir}")
 
 
-def main() -> None:
-    global LOG
-    ensure_project_python()
-    os.chdir(ROOT)
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    started = datetime.now()
-    study_dir = ROOT / "runs/full_study" / f"study_{started:%Y%m%d_%H%M%S}"
-    study_dir.mkdir(parents=True, exist_ok=False)
-    log_dir = ROOT / "runs/study_logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    LOG = log_dir / f"run_full_study_{started:%Y%m%d_%H%M%S}.log"
-    log_file = LOG.open("a", encoding="utf-8", buffering=1)
-    sys.stdout = Tee(sys.__stdout__, log_file)
-    sys.stderr = Tee(sys.__stderr__, log_file)
 
-    print("MBSAQIP digital-twin study - full run")
-    print(f"started: {started.astimezone():%Y-%m-%d %H:%M:%S %Z}")
-    print(f"logging to: {LOG.relative_to(ROOT)}")
-    print(f"paired study output: {study_dir.relative_to(ROOT)}")
-    print("validation plan:")
-    print("  1. Internal validation: random split stratified by surgery type")
-    print("  2. Temporal validation: earliest surgeries train, latest surgeries test")
-    print("  3. Cross-run calibration-drift figure using both held-out folds")
+def resolve_resume_study(study_dir: str | Path) -> tuple[Path, dict, Path, dict, Path]:
+    """Load the two completed freezes and their unchanged shared cohort for post-processing."""
+    study_dir = Path(study_dir).expanduser().resolve()
+    if not study_dir.is_dir():
+        fail(f"Resume study directory does not exist: {study_dir}")
 
-    banner("Preflight: checking the Python environment")
-    print(f"  using Python: {sys.executable}")
-    code = (
-        "import sklearn,xgboost,torch,numpy,scipy; "
-        "print(f'  sklearn {sklearn.__version__} | xgboost {xgboost.__version__} | '"
-        "f'torch {torch.__version__} | numpy {numpy.__version__} | scipy {scipy.__version__}'); "
-        "assert int(xgboost.__version__.split('.')[0]) >= 2"
+    internal_frozen, internal_manifest = validated_freeze(
+        study_dir / "internal_validation", "surgery"
     )
-    check = subprocess.run(
-        [sys.executable, "-c", code], cwd=ROOT, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+    temporal_frozen, temporal_manifest = validated_freeze(
+        study_dir / "temporal_validation", "temporal"
     )
-    print(check.stdout, end="")
-    if check.returncode:
-        fail("xgboost >= 2.0 and the project dependencies are required.")
 
-    smoke = bool(os.environ.get("STUDY_SMOKE"))
-    smoke_args = ["--smoke"] if smoke else []
-    compare_args = ["--n-samples", "100", "--n-steps", "25"] if smoke else []
-    if smoke:
-        print("  STUDY_SMOKE set: using fast sanity settings.")
-
-    banner("Step 1/6: preparing one shared cohort CSV for both validation runs")
-    csv_path = Path(os.environ.get("STUDY_CSV", ROOT / "data/cosmos_mbs_flow_input.csv"))
-    csv_path = csv_path.expanduser().resolve()
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-
-    import train_flow_matching as fm
-
-    if os.environ.get("STUDY_CSV"):
-        print(f"  using STUDY_CSV: {csv_path}")
-        dataset = fm.load_dataset_from_csv(str(csv_path))
+    source = os.environ.get("STUDY_CSV")
+    if source:
+        csv_path = Path(source).expanduser().resolve()
     else:
-        print("  querying MBSCohort via pyodbc (live VM database access required)...")
-        frame = fm.load_mbs_from_database()
-        frame.to_csv(csv_path, index=False)
-        dataset = fm.load_dataset_from_csv(str(csv_path))
-        print(f"  exported {len(frame)} database rows -> {csv_path}")
-    print(f"  cohort OK: {dataset.x.shape[0]} patients, {len(fm.PATIENT_FEATURES)} features")
+        input_block = internal_manifest.get("input") or {}
+        source = input_block.get("source_abspath") or input_block.get("source")
+        if not source:
+            fail(
+                "The internal manifest has no cohort CSV path. Set STUDY_CSV to the exact CSV "
+                "used by both freezes."
+            )
+        csv_path = Path(source).expanduser().resolve()
+    if not csv_path.is_file():
+        fail(f"The shared cohort CSV needed for resume does not exist: {csv_path}")
 
-    banner("Step 2/6: internal validation freeze (random, surgery-stratified split)")
-    print("  Purpose: estimate performance on held-out patients from the same overall era.")
-    internal_root = study_dir / "internal_validation"
-    run(
-        sys.executable, ROOT / "freeze_run.py", "--csv", csv_path,
-        "--output-root", internal_root, "--split-strategy", "surgery",
-        "--causal", "--fairness", *smoke_args,
-    )
-    internal_frozen, internal_manifest = validated_freeze(internal_root, "surgery")
-    internal_pipeline = find_pipeline(internal_frozen)
+    expected_hash = (internal_manifest.get("input") or {}).get("sha256")
+    actual_hash = sha256_file(csv_path)
+    if not expected_hash or actual_hash != expected_hash:
+        fail(
+            f"The resume cohort CSV does not match the frozen runs: expected {expected_hash}, "
+            f"found {actual_hash} at {csv_path}."
+        )
+    return internal_frozen, internal_manifest, temporal_frozen, temporal_manifest, csv_path
 
-    banner("Step 3/6: temporal validation freeze (earlier train, later test)")
-    print("  Purpose: test transport to a later clinical era and expose temporal drift.")
-    print("  Note: long-horizon outcomes may have smaller n because later patients have less follow-up.")
-    temporal_root = study_dir / "temporal_validation"
-    run(
-        sys.executable, ROOT / "freeze_run.py", "--csv", csv_path,
-        "--output-root", temporal_root, "--split-strategy", "temporal",
-        "--causal", "--fairness", *smoke_args,
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--resume-study",
+        type=Path,
+        default=None,
+        help="Reuse completed internal/temporal freezes in this study directory and run steps 4-6 only.",
     )
-    temporal_frozen, temporal_manifest = validated_freeze(temporal_root, "temporal")
-    temporal_pipeline = find_pipeline(temporal_frozen)
+    parser.add_argument(
+        "--allow-missing-code-identity",
+        action="store_true",
+        help="Resume legacy no-Git manifests that predate source fingerprints. Never permits a known mismatch.",
+    )
+    parser.add_argument(
+        "--force-comparisons",
+        action="store_true",
+        help="Rebuild comparison outputs even when complete artifacts already exist.",
+    )
+    args = parser.parse_args()
+    if args.allow_missing_code_identity and not args.resume_study:
+        parser.error("--allow-missing-code-identity is only valid with --resume-study")
+    return args
+
+
+def _quantile_outputs_complete(output_dir: Path) -> bool:
+    return all((output_dir / name).is_file() for name in (
+        "quantile_comparison_summary.json",
+        "quantile_comparison_metrics.csv",
+        "quantile_comparison_paired_tests.csv",
+        "quantile_comparison.png",
+    ))
+
+
+def run_postprocessing(*, study_dir: Path, csv_path: Path,
+                       internal_frozen: Path, internal_manifest: dict, internal_pipeline: Path,
+                       temporal_frozen: Path, temporal_manifest: dict, temporal_pipeline: Path,
+                       smoke: bool, allow_missing_code_identity: bool = False,
+                       force_comparisons: bool = False) -> Path:
+    """Run paired drift and baseline comparisons against two completed freezes."""
+    compare_args = ["--n-samples", "100", "--n-steps", "25"] if smoke else []
 
     banner("Step 4/6: paired internal-versus-temporal distributional comparison")
-    validate_paired_runs(internal_manifest, temporal_manifest)
-    cross_run_figures = study_dir / "cross_run_comparison"
-    run(
-        sys.executable, "-m", "figures.figure_distributional",
-        "--eval-dir", internal_frozen / "evaluation",
-        "--temporal-eval-dir", temporal_frozen / "evaluation",
-        "--out", cross_run_figures,
+    code_identity = validate_paired_runs(
+        internal_manifest,
+        temporal_manifest,
+        allow_missing_code_identity=allow_missing_code_identity,
     )
+    cross_run_figures = study_dir / "cross_run_comparison"
     expected_comparison = [
         cross_run_figures / f"figC2_distributional.{suffix}"
         for suffix in ("png", "pdf", "svg")
     ]
+    if force_comparisons or not all(path.is_file() for path in expected_comparison):
+        run(
+            sys.executable, "-m", "figures.figure_distributional",
+            "--eval-dir", internal_frozen / "evaluation",
+            "--temporal-eval-dir", temporal_frozen / "evaluation",
+            "--out", cross_run_figures,
+        )
+    else:
+        print("  existing cross-run distributional figures are complete; skipping rebuild")
     missing_comparison = [str(path) for path in expected_comparison if not path.is_file()]
     if missing_comparison:
         fail(f"Cross-run comparison figure build did not write: {missing_comparison}")
@@ -334,26 +399,32 @@ def main() -> None:
     banner("Step 5/6: internal-fold flow versus quantile baselines")
     print("  Baselines inherit the internal pipeline's exact patient split.")
     internal_comparison = internal_frozen / "quantile_comparison"
-    run(
-        sys.executable, ROOT / "compare_quantile_baselines.py",
-        "--csv", csv_path, "--pipeline", internal_pipeline, "--with-point",
-        "--output-dir", internal_comparison, *compare_args,
-    )
+    if force_comparisons or not _quantile_outputs_complete(internal_comparison):
+        run(
+            sys.executable, ROOT / "compare_quantile_baselines.py",
+            "--csv", csv_path, "--pipeline", internal_pipeline, "--with-point",
+            "--output-dir", internal_comparison, *compare_args,
+        )
+    else:
+        print("  existing internal-fold comparison is complete; skipping rebuild")
     validate_quantile_comparison(internal_comparison, "internal-fold")
 
     banner("Step 6/6: temporal-fold flow versus quantile baselines")
     print("  Baselines inherit the temporal pipeline's exact later-era test split.")
     temporal_comparison = temporal_frozen / "quantile_comparison"
-    run(
-        sys.executable, ROOT / "compare_quantile_baselines.py",
-        "--csv", csv_path, "--pipeline", temporal_pipeline, "--with-point",
-        "--output-dir", temporal_comparison, *compare_args,
-    )
+    if force_comparisons or not _quantile_outputs_complete(temporal_comparison):
+        run(
+            sys.executable, ROOT / "compare_quantile_baselines.py",
+            "--csv", csv_path, "--pipeline", temporal_pipeline, "--with-point",
+            "--output-dir", temporal_comparison, *compare_args,
+        )
+    else:
+        print("  existing temporal-fold comparison is complete; skipping rebuild")
     validate_quantile_comparison(temporal_comparison, "temporal-fold")
 
     paired_manifest_path = study_dir / "PAIRED_STUDY_MANIFEST.json"
     paired_manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "created_at": datetime.now().astimezone().isoformat(),
         "smoke": smoke,
         "shared_cohort": {
@@ -361,6 +432,7 @@ def main() -> None:
             "sha256": (internal_manifest.get("input") or {}).get("sha256"),
             "n_patients": (internal_manifest.get("input") or {}).get("n_patients"),
         },
+        "code_identity": code_identity,
         "git_revision": (internal_manifest.get("git") or {}).get("sha"),
         "internal_validation": {
             "split_strategy": "surgery",
@@ -406,6 +478,135 @@ def main() -> None:
     Shared cohort CSV:           {csv_path}
     Full log:                    {LOG}
   finished: {datetime.now().astimezone():%Y-%m-%d %H:%M:%S %Z}""")
+    return paired_manifest_path
+
+
+def main() -> None:
+    global LOG
+    ensure_project_python()
+    args = parse_args()
+    os.chdir(ROOT)
+
+    started = datetime.now()
+    if args.resume_study:
+        study_dir = args.resume_study.expanduser().resolve()
+        run_kind = "resume"
+    else:
+        study_dir = ROOT / "runs/full_study" / f"study_{started:%Y%m%d_%H%M%S}"
+        study_dir.mkdir(parents=True, exist_ok=False)
+        run_kind = "full"
+    log_dir = ROOT / "runs/study_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    LOG = log_dir / f"run_full_study_{run_kind}_{started:%Y%m%d_%H%M%S}.log"
+    log_file = LOG.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = Tee(sys.__stdout__, log_file)
+    sys.stderr = Tee(sys.__stderr__, log_file)
+
+    print(f"MBSAQIP digital-twin study - {run_kind} run")
+    print(f"started: {started.astimezone():%Y-%m-%d %H:%M:%S %Z}")
+    print(f"logging to: {LOG}")
+    print(f"paired study output: {study_dir}")
+    print("validation plan:")
+    print("  1. Internal validation: random split stratified by surgery type")
+    print("  2. Temporal validation: earliest surgeries train, latest surgeries test")
+    print("  3. Cross-run calibration-drift figure using both held-out folds")
+
+    banner("Preflight: checking the Python environment")
+    print(f"  using Python: {sys.executable}")
+    code = (
+        "import sklearn,xgboost,torch,numpy,scipy; "
+        "print(f'  sklearn {sklearn.__version__} | xgboost {xgboost.__version__} | '"
+        "f'torch {torch.__version__} | numpy {numpy.__version__} | scipy {scipy.__version__}'); "
+        "assert int(xgboost.__version__.split('.')[0]) >= 2"
+    )
+    check = subprocess.run(
+        [sys.executable, "-c", code], cwd=ROOT, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
+    )
+    print(check.stdout, end="")
+    if check.returncode:
+        fail("xgboost >= 2.0 and the project dependencies are required.")
+
+    smoke = bool(os.environ.get("STUDY_SMOKE"))
+    smoke_args = ["--smoke"] if smoke else []
+    if smoke:
+        print("  STUDY_SMOKE set: using fast sanity settings.")
+
+    if args.resume_study:
+        banner("Resume preflight: loading completed internal and temporal freezes")
+        (internal_frozen, internal_manifest,
+         temporal_frozen, temporal_manifest, csv_path) = resolve_resume_study(study_dir)
+        internal_pipeline = find_pipeline(internal_frozen)
+        temporal_pipeline = find_pipeline(temporal_frozen)
+        print("  completed model freezes found; steps 1-3 will not be rerun")
+        print(f"  shared cohort CSV: {csv_path}")
+        run_postprocessing(
+            study_dir=study_dir,
+            csv_path=csv_path,
+            internal_frozen=internal_frozen,
+            internal_manifest=internal_manifest,
+            internal_pipeline=internal_pipeline,
+            temporal_frozen=temporal_frozen,
+            temporal_manifest=temporal_manifest,
+            temporal_pipeline=temporal_pipeline,
+            smoke=smoke,
+            allow_missing_code_identity=args.allow_missing_code_identity,
+            force_comparisons=args.force_comparisons,
+        )
+        return
+
+    banner("Step 1/6: preparing one shared cohort CSV for both validation runs")
+    csv_path = Path(os.environ.get("STUDY_CSV", ROOT / "data/cosmos_mbs_flow_input.csv"))
+    csv_path = csv_path.expanduser().resolve()
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    import train_flow_matching as fm
+
+    if os.environ.get("STUDY_CSV"):
+        print(f"  using STUDY_CSV: {csv_path}")
+        dataset = fm.load_dataset_from_csv(str(csv_path))
+    else:
+        print("  querying MBSCohort via pyodbc (live VM database access required)...")
+        frame = fm.load_mbs_from_database()
+        frame.to_csv(csv_path, index=False)
+        dataset = fm.load_dataset_from_csv(str(csv_path))
+        print(f"  exported {len(frame)} database rows -> {csv_path}")
+    print(f"  cohort OK: {dataset.x.shape[0]} patients, {len(fm.PATIENT_FEATURES)} features")
+
+    banner("Step 2/6: internal validation freeze (random, surgery-stratified split)")
+    print("  Purpose: estimate performance on held-out patients from the same overall era.")
+    internal_root = study_dir / "internal_validation"
+    run(
+        sys.executable, ROOT / "freeze_run.py", "--csv", csv_path,
+        "--output-root", internal_root, "--split-strategy", "surgery",
+        "--causal", "--fairness", *smoke_args,
+    )
+    internal_frozen, internal_manifest = validated_freeze(internal_root, "surgery")
+    internal_pipeline = find_pipeline(internal_frozen)
+
+    banner("Step 3/6: temporal validation freeze (earlier train, later test)")
+    print("  Purpose: test transport to a later clinical era and expose temporal drift.")
+    print("  Note: long-horizon outcomes may have smaller n because later patients have less follow-up.")
+    temporal_root = study_dir / "temporal_validation"
+    run(
+        sys.executable, ROOT / "freeze_run.py", "--csv", csv_path,
+        "--output-root", temporal_root, "--split-strategy", "temporal",
+        "--causal", "--fairness", *smoke_args,
+    )
+    temporal_frozen, temporal_manifest = validated_freeze(temporal_root, "temporal")
+    temporal_pipeline = find_pipeline(temporal_frozen)
+    run_postprocessing(
+        study_dir=study_dir,
+        csv_path=csv_path,
+        internal_frozen=internal_frozen,
+        internal_manifest=internal_manifest,
+        internal_pipeline=internal_pipeline,
+        temporal_frozen=temporal_frozen,
+        temporal_manifest=temporal_manifest,
+        temporal_pipeline=temporal_pipeline,
+        smoke=smoke,
+        force_comparisons=args.force_comparisons,
+    )
 
 
 if __name__ == "__main__":
