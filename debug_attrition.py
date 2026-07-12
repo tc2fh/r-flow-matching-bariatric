@@ -30,8 +30,8 @@ The report contains, per the build spec:
   (b) leave-one-out on ``REQUIRED_PATIENT_FEATURES`` -- rows recovered if each
       required field alone were demoted to optional (report only; the required
       set is NOT changed);
-  (c) the CPT ``43645`` count surfaced directly (a gastric-bypass variant
-      currently dropped as unrecognized) plus any other unrecognized CPT codes;
+  (c) the included CPT ``43645`` count surfaced directly (a gastric-bypass
+      variant mapped to RYGB) plus any genuinely unrecognized CPT codes;
   (d) an attrition decomposition framed as STAGES with count + % at each step:
       [SQL-filter losses -- VM only] -> [CPT-unrecognized drops] ->
       [missing-required-conditioning drops] -> final N (with the intermediate
@@ -53,7 +53,7 @@ import train_flow_matching as fm
 
 
 DEFAULT_OUTPUT_DIR = fm.REPO_ROOT / "runs" / "debug_attrition"
-GASTRIC_BYPASS_VARIANT_CPT = "43645"  # a bypass variant currently dropped as unrecognized
+GASTRIC_BYPASS_VARIANT_CPT = "43645"  # mapped to rnygb by fm.CPT_TO_SURGERY
 
 # Candidate features to profile (in addition to the six conditioning features).
 # PMH_* columns are discovered dynamically from the frame; these are the rest.
@@ -161,6 +161,7 @@ def python_attrition(raw_df: pd.DataFrame) -> dict:
     return {
         "n_raw": n_raw,
         "stages": stages,
+        "cpt_counts": cpt_norm.fillna("<blank>").value_counts(),
         "unrecognized_codes": unrecognized_codes,
         "dup_patkey": dup_count,
         "pre_required_df": df_glp1,  # denominator for the leave-one-out
@@ -290,7 +291,7 @@ def build_report(source_label: str, raw_df: pd.DataFrame, db_counts: dict | None
     n_raw = attrition["n_raw"]
     n_final = attrition["stages"][-1]["remaining"]
     unrecognized = attrition["unrecognized_codes"]
-    cpt_43645 = int(unrecognized.get(GASTRIC_BYPASS_VARIANT_CPT, 0))
+    cpt_43645 = int(attrition["cpt_counts"].get(GASTRIC_BYPASS_VARIANT_CPT, 0))
     creat_loo = int(
         loo.loc[loo["required_feature"] == "creatinine_at_surgery", "rows_recovered_if_demoted_alone"].iloc[0]
     ) if (loo["required_feature"] == "creatinine_at_surgery").any() else 0
@@ -325,17 +326,17 @@ def build_report(source_label: str, raw_df: pd.DataFrame, db_counts: dict | None
 
     # (c) CPT
     lines.append("")
-    lines.append("[CPT] unrecognized CptCode values dropped (not mapped to sleeve/rnygb):")
+    lines.append("[CPT] surgery mapping audit:")
     lines.append(
         f"  {GASTRIC_BYPASS_VARIANT_CPT} : {cpt_43645}"
-        f"   <-- gastric-bypass variant; candidate to map -> rnygb (currently dropped)"
+        f"   <-- gastric-bypass variant mapped -> rnygb (included)"
     )
     others = [(str(code), int(count)) for code, count in unrecognized.items() if str(code) != GASTRIC_BYPASS_VARIANT_CPT]
     if others:
         for code, count in others:
             lines.append(f"  {code} : {count}")
     else:
-        lines.append("  (no other unrecognized CPT codes)")
+        lines.append("  (no unrecognized CPT codes dropped)")
 
     # (b) leave-one-out
     lines.append("")
@@ -417,7 +418,7 @@ def run(csv_path: Path | None, use_db: bool, output_dir: Path) -> Path:
         f"[debug_attrition] wrote {path} | "
         f"final N={headline['n_final']}/{headline['n_raw']} raw ({headline['retained_pct']} retained) | "
         f"creatinine LOO=+{headline['creatinine_loo']} rows | "
-        f"CPT {GASTRIC_BYPASS_VARIANT_CPT}={headline['cpt_43645']}",
+        f"CPT {GASTRIC_BYPASS_VARIANT_CPT}->rnygb={headline['cpt_43645']}",
         flush=True,
     )
     return path

@@ -30,11 +30,10 @@ ABSENT confounders - the exchangeability threat, documented prominently (see man
   * Smoking / tobacco, weight history, patient preference, frailty - absent.
 
 Key DECISIONS encoded here (see PART D of the plan):
-  * DECISION 1 (CPT -> arm): 43775 = SG; 43644 / 43846 / 43645 = RYGB. The 43645 handling and the
-    actual CPT -> surgery_idx mapping are UPSTREAM in the loader (dataset.surgery_idx is already
-    built). RYGB_CPTS / SLEEVE_CPTS below are DOCUMENTED constants only; this module does NOT
-    modify the loader and consumes dataset.surgery_idx as-is. 43645 handling MUST be verified in
-    the loader separately.
+  * DECISION 1 (CPT -> arm): 43775 = SG; 43644 / 43846 / 43645 = RYGB. The actual CPT ->
+    surgery_idx mapping is UPSTREAM in the loader (dataset.surgery_idx is already built).
+    RYGB_CPTS / SLEEVE_CPTS below are DOCUMENTED constants only; this module does NOT modify
+    the loader and consumes dataset.surgery_idx as-is. The loader maps all four listed codes.
   * DECISION 3 (race): INCLUDE_RACE_IN_PS = False -> race enters the FAIRNESS audit only, never L.
   * DECISION 4 (censoring vs competing risk): death (DeathInterval) censors the metabolic
     trajectory - you cannot measure BMI/HbA1c post-mortem - so ``censoring_model`` models
@@ -62,8 +61,8 @@ INCLUDE_RACE_IN_PS = False
 
 # DECISION 1: CPT -> surgery arm. These are DOCUMENTED reference constants only. The loader
 # already builds ``dataset.surgery_idx`` (sleeve=0, rnygb=1); this module NEVER re-derives the
-# arm from CptCode and NEVER touches the loader. The 43645 -> RYGB decision and the full
-# CPT -> surgery_idx mapping MUST be verified in the loader separately.
+# arm from CptCode and NEVER touches the loader. The loader's canonical mapping includes
+# 43645 -> RYGB and is covered by an end-to-end CSV-loader regression test.
 RYGB_CPTS = {"43644", "43846", "43645"}
 SLEEVE_CPTS = {"43775"}
 

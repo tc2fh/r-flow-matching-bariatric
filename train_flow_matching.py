@@ -61,7 +61,12 @@ WHERE Sex NOT IN (N'#Masked', N'*Unspecified', N'Unknown', N'other')
 
 DAYS_PER_MONTH = 30.4375
 SURGERY_TO_INDEX = {"sleeve": 0, "rnygb": 1}
-CPT_TO_SURGERY = {"43775": "sleeve", "43644": "rnygb", "43846": "rnygb"}
+CPT_TO_SURGERY = {
+    "43775": "sleeve",
+    "43644": "rnygb",
+    "43846": "rnygb",
+    "43645": "rnygb",
+}
 
 BMI_TARGETS = [
     ("bmi_3m", "bmi", 3.0, "BMI3mPostEvent"),

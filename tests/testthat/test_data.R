@@ -79,6 +79,9 @@ testthat::test_that("event targets are fully observed and do not require interva
 })
 
 testthat::test_that("surgery and sex encodings are deterministic", {
-  testthat::expect_equal(map_surgery_type(c("43775", "43644", "43846")), c("sleeve", "rnygb", "rnygb"))
+  testthat::expect_equal(
+    map_surgery_type(c("43775", "43644", "43846", "43645")),
+    c("sleeve", "rnygb", "rnygb", "rnygb")
+  )
   testthat::expect_equal(encode_sex_male(c("Female", "Male", "F", "M")), c(0, 1, 0, 1))
 })
