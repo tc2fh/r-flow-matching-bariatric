@@ -148,6 +148,10 @@ class TwinConfig:
     # Sampling / evaluation.
     sample_steps: int = 50
     n_samples_per_patient: int = 50
+    # Maximum number of patient-sample trajectories evaluated by the flow at once.
+    # Cohort figures may request millions of trajectories; bounding the flattened
+    # inference batch prevents native allocator crashes while preserving every draw.
+    sample_batch_size: int = 65536
 
 
 # --------------------------------------------------------------------------- #
@@ -318,21 +322,60 @@ def sample_trajectories(
         event = arrays["y_mace"]
     event = np.asarray(event).reshape(-1).astype(np.int64)
     n_samples = cfg.n_samples_per_patient
+    batch_size = cfg.sample_batch_size
+    if n_samples <= 0:
+        raise ValueError(f"n_samples_per_patient must be positive, got {n_samples}.")
+    if cfg.sample_steps <= 0:
+        raise ValueError(f"sample_steps must be positive, got {cfg.sample_steps}.")
+    if batch_size <= 0:
+        raise ValueError(f"sample_batch_size must be positive, got {batch_size}.")
+
     total = n_patients * n_samples
-    tiled = np.repeat(np.arange(n_patients), n_samples)
-    surgery_idx = fm.as_tensor(arrays["surgery_idx"][tiled], device, torch.long)
-    patient_features = fm.as_tensor(arrays["patient_features"][tiled], device)
-    event_idx = fm.as_tensor(event[tiled], device, torch.long)
+    samples = np.empty((total, x_cont_dim), dtype=np.float32)
+    if total > batch_size:
+        n_batches = (total + batch_size - 1) // batch_size
+        print(
+            f"[sampling] {total:,} trajectories in {n_batches} batches "
+            f"(at most {batch_size:,} per batch).",
+            flush=True,
+        )
+
+    was_training = model.training
     model.eval()
-    with torch.no_grad():
-        cond = model.encode(surgery_idx, patient_features, event_idx)
-        x = torch.randn(total, x_cont_dim, device=device)
-        dt = 1.0 / cfg.sample_steps
-        for step in range(cfg.sample_steps):
-            t = torch.full((total,), step * dt, dtype=torch.float32, device=device)
-            x = x + dt * model.velocity(x, t, cond)
-    model.train()
-    return x.detach().cpu().numpy().reshape(n_patients, n_samples, x_cont_dim)
+    try:
+        with torch.no_grad():
+            dt = 1.0 / cfg.sample_steps
+            # Draw noise once with the historical cohort-wide shape. PyTorch's
+            # seeded random stream depends on each requested tensor shape, so
+            # drawing per batch would silently change results when the memory cap
+            # changes. This tensor is small compared with the repeated hidden-layer
+            # activations that batching bounds (about 52 MB for the full VM run).
+            initial_noise = torch.randn(total, x_cont_dim, device=device)
+            for start in range(0, total, batch_size):
+                stop = min(start + batch_size, total)
+                # Flattened output is patient-major, with all draws for patient 0
+                # first. Derive only this batch's patient indices instead of
+                # materializing a cohort-wide repeated index array.
+                patient_idx = np.arange(start, stop, dtype=np.int64) // n_samples
+                surgery_idx = fm.as_tensor(
+                    arrays["surgery_idx"][patient_idx], device, torch.long
+                )
+                patient_features = fm.as_tensor(
+                    arrays["patient_features"][patient_idx], device
+                )
+                event_idx = fm.as_tensor(event[patient_idx], device, torch.long)
+                cond = model.encode(surgery_idx, patient_features, event_idx)
+                x = initial_noise[start:stop]
+                for step in range(cfg.sample_steps):
+                    t = torch.full(
+                        (stop - start,), step * dt, dtype=torch.float32, device=device
+                    )
+                    x = x + dt * model.velocity(x, t, cond)
+                samples[start:stop] = x.detach().cpu().numpy()
+    finally:
+        model.train(was_training)
+
+    return samples.reshape(n_patients, n_samples, x_cont_dim)
 
 
 # --------------------------------------------------------------------------- #
