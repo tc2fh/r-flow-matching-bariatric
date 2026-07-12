@@ -280,11 +280,19 @@ def _run_distributional(ctx) -> dict:
     art: dict[str, str] = {}
     headline: dict[str, float] = {}
 
-    def obs_at(dim):
-        return dataset.x[test_idx, dim].astype(float)
-
     def mask_at(dim):
         return dataset.mask[test_idx, dim].astype(bool)
+
+    def obs_at(dim):
+        """Observed outcome with the loader's zero-filled missing values restored to NaN."""
+        values = dataset.x[test_idx, dim].astype(float)
+        return np.where(mask_at(dim), values, np.nan)
+
+    def obs_block_at(dims):
+        """Observed outcome block with any unobserved cells represented as NaN."""
+        values = dataset.x[test_idx][:, dims].astype(float)
+        observed = dataset.mask[test_idx][:, dims].astype(bool)
+        return np.where(observed, values, np.nan)
 
     def ipcw_at(dim):
         if not with_causal:
@@ -298,7 +306,7 @@ def _run_distributional(ctx) -> dict:
     for group, horizons in (("bmi", ctx["bmi_dist"]), ("hba1c", ctx["hba1c_dist"])):
         dims = [_dim(nm) for nm in horizons]
         block = fac[:, :, dims]                                   # (n, s, k)
-        obs_block = dataset.x[test_idx][:, dims]                  # (n, k)
+        obs_block = obs_block_at(dims)                            # (n, k), NaN if unobserved
         es_naive, _ = dm.energy_score_block(block, obs_block, w=None)
         vs_naive, _ = dm.variogram_score_block(block, obs_block, w=None)
         es_ipcw = vs_ipcw = float("nan")
@@ -460,10 +468,11 @@ def _run_distributional(ctx) -> dict:
     md_rows = []
     for nm in ctx["modec_horizons"]:
         dim = _dim(nm)
-        sim_h = ctx["fac"][:, :, dim].reshape(-1)               # pooled factual samples
-        obs_h = dataset.x[test_idx, dim]
+        observed = mask_at(dim)
+        sim_h = ctx["fac"][observed, :, dim].reshape(-1)        # same observed-patient subset
+        obs_h = obs_at(dim)[observed]
         md = dm.marginal_distance(sim_h, obs_h)
-        md_rows.append({"horizon": nm, "n_obs": int(np.isfinite(obs_h).sum()),
+        md_rows.append({"horizon": nm, "n_obs": int(observed.sum()),
                         "wasserstein1": md["wasserstein1"], "ks_stat": md["ks_stat"],
                         "median_shift": md["median_shift"]})
     art["dist_modeC_marginal_distance"] = _save_csv(

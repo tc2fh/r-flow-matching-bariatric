@@ -274,8 +274,12 @@ def validate_quantile_comparison(output_dir: Path, label: str) -> None:
     required = [
         output_dir / "quantile_comparison_summary.json",
         output_dir / "quantile_comparison_metrics.csv",
+        output_dir / "quantile_comparison_calibration.csv",
         output_dir / "quantile_comparison_paired_tests.csv",
+        output_dir / "quantile_comparison_scorecard.csv",
         output_dir / "quantile_comparison.png",
+        output_dir / "quantile_comparison_transfer.png",
+        output_dir / "quantile_comparison_transfer.jpg",
     ]
     missing = [str(path) for path in required if not path.is_file()]
     if missing:
@@ -357,8 +361,12 @@ def _quantile_outputs_complete(output_dir: Path) -> bool:
     return all((output_dir / name).is_file() for name in (
         "quantile_comparison_summary.json",
         "quantile_comparison_metrics.csv",
+        "quantile_comparison_calibration.csv",
         "quantile_comparison_paired_tests.csv",
+        "quantile_comparison_scorecard.csv",
         "quantile_comparison.png",
+        "quantile_comparison_transfer.png",
+        "quantile_comparison_transfer.jpg",
     ))
 
 
@@ -441,6 +449,8 @@ def run_postprocessing(*, study_dir: Path, csv_path: Path,
             "evaluation": str(internal_frozen / "evaluation"),
             "figures": str(internal_frozen / "figures"),
             "quantile_comparison": str(internal_comparison),
+            "quantile_transfer_figure": str(internal_comparison / "quantile_comparison_transfer.png"),
+            "quantile_transfer_jpg": str(internal_comparison / "quantile_comparison_transfer.jpg"),
         },
         "temporal_validation": {
             "split_strategy": "temporal",
@@ -449,6 +459,8 @@ def run_postprocessing(*, study_dir: Path, csv_path: Path,
             "evaluation": str(temporal_frozen / "evaluation"),
             "figures": str(temporal_frozen / "figures"),
             "quantile_comparison": str(temporal_comparison),
+            "quantile_transfer_figure": str(temporal_comparison / "quantile_comparison_transfer.png"),
+            "quantile_transfer_jpg": str(temporal_comparison / "quantile_comparison_transfer.jpg"),
         },
         "cross_run_comparison": {
             "figures": [str(path) for path in expected_comparison],
@@ -468,11 +480,13 @@ def run_postprocessing(*, study_dir: Path, csv_path: Path,
     Internal evaluation:         {internal_frozen / 'evaluation'}
     Internal journal figures:    {internal_frozen / 'figures'}
     Internal quantile comparison: {internal_comparison}
+    Internal transfer card:      {internal_comparison / 'quantile_comparison_transfer.jpg'}
 
     Temporal run manifest:       {temporal_frozen / 'RUN_MANIFEST.json'}
     Temporal evaluation:         {temporal_frozen / 'evaluation'}
     Temporal journal figures:    {temporal_frozen / 'figures'}
     Temporal quantile comparison: {temporal_comparison}
+    Temporal transfer card:      {temporal_comparison / 'quantile_comparison_transfer.jpg'}
 
     Cross-run drift figures:     {cross_run_figures}
     Shared cohort CSV:           {csv_path}

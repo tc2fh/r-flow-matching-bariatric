@@ -78,15 +78,16 @@ ARM_RIDGE = "ridge"
 ARM_QGBM = "qgbm"    # quantile gradient boosting (pinball-loss XGBoost, all quantiles jointly)
 ARM_QREG = "qreg"    # linear conditional quantile regression (Koenker-Bassett, per quantile)
 
-# Shared quantile grid for both quantile arms. Symmetric and dense enough that the predicted
-# quantiles, treated as an equally-weighted predictive ensemble, give a faithful sample-CRPS
-# and let the coverage curve read its (0.5, 0.8, 0.9, 0.95) nominal bands off exact grid points
-# (0.25/0.75, 0.1/0.9, 0.05/0.95, 0.025/0.975 are all present). Both arms use the SAME grid so
-# they are scored by identical code and compared like-for-like against the flow's draws.
+# Shared fitted-quantile grid for both quantile arms. It is deliberately denser in the tails,
+# so its levels are NOT equally weighted predictive draws. Before sample-based scoring,
+# ``quantile_grid_to_ensemble`` interpolates the fitted quantile function onto uniform
+# probability midpoints. This preserves the intended probability mass while allowing every arm
+# to use the same CRPS, NLL, interval, and calibration implementations.
 DEFAULT_QUANTILES = (
     0.025, 0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45,
     0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9, 0.95, 0.975,
 )
+QUANTILE_ENSEMBLE_SIZE = 100
 
 
 # Physiologic-plausibility bounds for OBSERVED outcomes, applied as data QC before
@@ -214,13 +215,17 @@ def horizon_score(samples_h: np.ndarray, obs_h: np.ndarray, mask_h: np.ndarray, 
     outlier-sensitive companion (SOPHIA note this too). Returns both the scalar
     summaries and the per-patient arrays (over the observed subset, in mask order) so
     callers can pool across horizons for group rows and run paired tests.
+    ``crps_by_patient`` additionally preserves the original patient axis with NaN for an
+    unobserved outcome, allowing pooled inference to average horizons within patient first.
     """
     obs_h = np.asarray(obs_h, dtype=np.float64)
     sel = (np.asarray(mask_h) == 1) & plausible_mask(obs_h, obs_bounds)
     empty = np.array([], dtype=np.float64)
+    empty_full = np.full(obs_h.shape, np.nan, dtype=np.float64)
     if not sel.any():
         return {"n_obs": 0, "mad": float("nan"), "rmse": float("nan"), "crps": float("nan"),
-                "nll": float("nan"), "abs_err": empty, "sq_err": empty, "crps_pp": empty, "nll_pp": empty}
+                "nll": float("nan"), "abs_err": empty, "sq_err": empty, "crps_pp": empty,
+                "nll_pp": empty, "crps_by_patient": empty_full.copy()}
     s = np.asarray(samples_h, dtype=np.float64)[sel]
     y = obs_h[sel]
     point = s.mean(axis=1)
@@ -228,11 +233,14 @@ def horizon_score(samples_h: np.ndarray, obs_h: np.ndarray, mask_h: np.ndarray, 
     abs_err = np.abs(err)
     sq_err = err ** 2
     crps_pp = crps_ensemble(s, y)
+    crps_by_patient = np.full(obs_h.shape, np.nan, dtype=np.float64)
+    crps_by_patient[sel] = crps_pp
     nll_pp = gaussian_predictive_nll(s, y) if has_density else np.full(y.size, np.nan)
     nll = float(np.nanmean(nll_pp)) if np.isfinite(nll_pp).any() else float("nan")
     return {"n_obs": int(sel.sum()), "mad": float(np.median(abs_err)),
             "rmse": float(np.sqrt(np.mean(sq_err))), "crps": float(np.mean(crps_pp)), "nll": nll,
-            "abs_err": abs_err, "sq_err": sq_err, "crps_pp": crps_pp, "nll_pp": nll_pp}
+            "abs_err": abs_err, "sq_err": sq_err, "crps_pp": crps_pp, "nll_pp": nll_pp,
+            "crps_by_patient": crps_by_patient}
 
 
 # --------------------------------------------------------------------------- #
@@ -365,11 +373,11 @@ def baseline_metric_table(dataset: fm.FlowDataset, splits: dict[str, np.ndarray]
 # --------------------------------------------------------------------------- #
 # The xgb/ridge arms above are POINT predictors (one number per horizon), so their CRPS
 # degenerates to MAE and they have no predictive spread (NLL is undefined). The two arms
-# below predict a whole GRID of conditional quantiles per horizon, which - after monotone
-# rearrangement - is a genuine predictive ensemble shaped exactly like the flow's per-patient
-# sample block. That makes them the fair distributional yard-stick for the flow: scored by the
-# same proper-scoring code (real CRPS, coverage, pinball, moment-matched NLL), on the same
-# conditioning information, splits, and observed test rows.
+# below predict a whole GRID of conditional quantiles per horizon. After monotone rearrangement,
+# callers interpolate that quantile function onto uniform-probability nodes. This makes them a
+# fair distributional yard-stick for the flow: scored by the same proper-scoring code (real CRPS,
+# coverage, pinball, moment-matched NLL), on the same conditioning information, splits, and
+# observed test rows.
 def monotone_rearrange(pred: np.ndarray) -> np.ndarray:
     """Chernozhukov-Fernandez-Val-Galichon rearrangement of a quantile block ``[n, n_q]``.
 
@@ -380,6 +388,53 @@ def monotone_rearrange(pred: np.ndarray) -> np.ndarray:
     weak improvement, Chernozhukov et al. 2010).
     """
     return np.sort(np.asarray(pred, dtype=np.float64), axis=1)
+
+
+def quantile_grid_to_ensemble(
+    pred: np.ndarray,
+    quantiles: "tuple[float, ...] | np.ndarray",
+    n_samples: int = QUANTILE_ENSEMBLE_SIZE,
+) -> np.ndarray:
+    """Interpolate a fitted quantile function onto equal-probability midpoint nodes.
+
+    ``pred`` is ``[n, n_quantiles, ...]`` with the fitted quantile level on axis 1. Treating a
+    nonuniform grid as equally weighted samples distorts CRPS, moments, and interval coverage.
+    This function instead evaluates the rearranged, piecewise-linear quantile function at
+    ``(j + 0.5) / n_samples``. Values outside the fitted range are clamped to the endpoint
+    forecasts rather than extrapolated into clinically implausible tails.
+
+    The returned ``[n, n_samples, ...]`` array is an equal-probability quadrature ensemble and
+    can therefore enter the repository's canonical sample-based scoring functions unchanged.
+    """
+    values = np.asarray(pred, dtype=np.float64)
+    q = np.asarray(quantiles, dtype=np.float64)
+    if values.ndim < 2:
+        raise ValueError("pred must have shape [n, n_quantiles, ...]")
+    if q.ndim != 1 or q.size < 2 or values.shape[1] != q.size:
+        raise ValueError("quantiles must be one-dimensional and match pred.shape[1]")
+    if not np.all(np.isfinite(q)) or not np.all(np.diff(q) > 0) or q[0] <= 0 or q[-1] >= 1:
+        raise ValueError("quantiles must be finite, strictly increasing, and inside (0, 1)")
+    if int(n_samples) != n_samples or n_samples < 2:
+        raise ValueError("n_samples must be an integer >= 2")
+
+    n_samples = int(n_samples)
+    probability = (np.arange(n_samples, dtype=np.float64) + 0.5) / n_samples
+    upper = np.searchsorted(q, probability, side="right")
+    upper = np.clip(upper, 1, q.size - 1)
+    lower = upper - 1
+    fraction = (probability - q[lower]) / (q[upper] - q[lower])
+
+    below = probability <= q[0]
+    above = probability >= q[-1]
+    lower[below] = upper[below] = 0
+    lower[above] = upper[above] = q.size - 1
+    fraction[below | above] = 0.0
+
+    left = np.take(values, lower, axis=1)
+    right = np.take(values, upper, axis=1)
+    fraction_shape = (1, n_samples) + (1,) * (values.ndim - 2)
+    weight = fraction.reshape(fraction_shape)
+    return left + weight * (right - left)
 
 
 def make_quantile_gbm(quantiles: np.ndarray, seed: int = 0, params: dict | None = None) -> "xgb.XGBRegressor":
@@ -433,10 +488,9 @@ def fit_quantile_baselines(
     Both arms see the SAME conditioning matrix as the event-conditioned flow and the point
     baselines (``build_feature_matrix``), are fit on the shared TRAIN split only, on the rows
     where each horizon is observed, and regress the ORIGINAL-unit target. Each arm predicts the
-    ``quantiles`` grid which - after monotone rearrangement - IS a predictive ensemble: the
-    returned ``qgbm_pred`` / ``qreg_pred`` are ``[n_test, n_quantiles, n_horizon]`` in
-    ``splits['test']`` order, shaped exactly like ``_sample_twin_arm``'s flow block so they drop
-    straight into ``horizon_score`` and the ``distributional_metrics`` scorers.
+    ``quantiles`` grid. The returned ``qgbm_pred`` / ``qreg_pred`` arrays are fitted quantile
+    functions shaped ``[n_test, n_quantiles, n_horizon]`` in ``splits['test']`` order. Call
+    ``quantile_grid_to_ensemble`` before passing them to sample-based scorers.
 
     A horizon with <2 observed train rows falls back to the empirical marginal quantiles of the
     observed train target (an unconditional quantile forecast - still a valid distribution), or
@@ -504,7 +558,11 @@ def quantile_metric_table(dataset: fm.FlowDataset, splits: dict[str, np.ndarray]
     test_idx = splits["test"]
     obs = x_cont[test_idx]
     mask = mask_cont[test_idx]
-    arm_pred = {ARM_QGBM: quantile_baselines["qgbm_pred"], ARM_QREG: quantile_baselines["qreg_pred"]}
+    quantiles = quantile_baselines["quantiles"]
+    arm_pred = {
+        ARM_QGBM: quantile_grid_to_ensemble(quantile_baselines["qgbm_pred"], quantiles),
+        ARM_QREG: quantile_grid_to_ensemble(quantile_baselines["qreg_pred"], quantiles),
+    }
     rows = []
     for h, name in enumerate(tw.CONT_NAMES):
         for arm, pred in arm_pred.items():

@@ -972,6 +972,17 @@ def _pool(per_patient: dict, arm: str, dims: list[int], key: str) -> np.ndarray:
     return np.concatenate([per_patient[arm][h][key] for h in dims])
 
 
+def _patient_mean_crps(per_patient: dict, arm: str, dims: list[int]) -> np.ndarray:
+    """Mean observed-horizon CRPS per patient for cluster-correct pooled tests."""
+    if not dims:
+        return np.array([], dtype=np.float64)
+    block = np.column_stack([per_patient[arm][h]["crps_by_patient"] for h in dims])
+    observed = np.isfinite(block)
+    count = observed.sum(axis=1)
+    total = np.nansum(block, axis=1)
+    return np.divide(total, count, out=np.full(block.shape[0], np.nan), where=count > 0)
+
+
 def compare_trajectory_models(
     event_twin_run: Path | None,
     csv_path: Path | None,
@@ -1032,17 +1043,19 @@ def compare_trajectory_models(
         dataset, event_cfg, noevent_twin_run, noevent_num_steps, output_dir, device)
     arm_samples["no_event_flow"] = _sample_twin_arm(
         noevent_model, dataset, test_idx, pre, noevent_cfg, n_samples, n_steps, device)
-    # Arms qgbm & qreg: quantile GBM + linear quantile regression -- real predictive ensembles
-    # [n_test, n_q, 15] shaped like the flow block, so they get proper CRPS/NLL (not the point
-    # arms' degenerate CRPS=MAE). Guarded: a quantile-fit failure degrades to the other arms.
+    # Arms qgbm & qreg: fit nonuniform quantile grids, then interpolate the rearranged quantile
+    # functions onto uniform-probability nodes before sample-based CRPS/NLL scoring. Guarded: a
+    # quantile-fit failure degrades to the other arms.
     quantile_baselines = None
     if include_quantile:
         q_grid = bt.DEFAULT_QUANTILES if quantiles is None else tuple(quantiles)
         try:
             quantile_baselines = bt.fit_quantile_baselines(
                 dataset, splits, quantiles=q_grid, use_event=baseline_use_event, seed=seed)
-            arm_samples["qgbm"] = quantile_baselines["qgbm_pred"]
-            arm_samples["qreg"] = quantile_baselines["qreg_pred"]
+            arm_samples["qgbm"] = bt.quantile_grid_to_ensemble(
+                quantile_baselines["qgbm_pred"], quantile_baselines["quantiles"], n_samples=n_samples)
+            arm_samples["qreg"] = bt.quantile_grid_to_ensemble(
+                quantile_baselines["qreg_pred"], quantile_baselines["quantiles"], n_samples=n_samples)
         except Exception as exc:  # noqa: BLE001 - never let a baseline sink the flow comparison
             warnings.warn(f"quantile arms skipped ({type(exc).__name__}: {exc})", stacklevel=2)
     # Arms xgb & ridge: per-horizon point regressors (degenerate one-sample "ensembles").
@@ -1088,12 +1101,19 @@ def compare_trajectory_models(
         for a, b in TRAJECTORY_COMPARISONS:
             if a in present and b in present:
                 pt = bt.paired_test(per_patient[a][h]["crps_pp"], per_patient[b][h]["crps_pp"])
-                paired_rows.append({"horizon": name, "group": cont_groups[h], "comparison": f"{a}_vs_{b}", "metric": "crps", **pt})
+                paired_rows.append({"horizon": name, "group": cont_groups[h],
+                                    "comparison": f"{a}_vs_{b}", "metric": "crps",
+                                    "unit": "patient", **pt})
     for gname, dims in group_dims.items():
         for a, b in TRAJECTORY_COMPARISONS:
             if a in present and b in present:
-                pt = bt.paired_test(_pool(per_patient, a, dims, "crps_pp"), _pool(per_patient, b, dims, "crps_pp"))
-                paired_rows.append({"horizon": f"__{gname}__", "group": gname, "comparison": f"{a}_vs_{b}", "metric": "crps", **pt})
+                pt = bt.paired_test(
+                    _patient_mean_crps(per_patient, a, dims),
+                    _patient_mean_crps(per_patient, b, dims),
+                )
+                paired_rows.append({"horizon": f"__{gname}__", "group": gname,
+                                    "comparison": f"{a}_vs_{b}", "metric": "crps",
+                                    "unit": "patient", **pt})
     paired = pd.DataFrame(paired_rows)
     paired_path = output_dir / "trajectory_comparison_paired_tests.csv"
     paired.to_csv(paired_path, index=False)
@@ -1117,11 +1137,13 @@ def compare_trajectory_models(
         "baseline_feature_names": baselines["feature_names"] if baselines else None,
         "quantile_arms": ["qgbm", "qreg"] if quantile_baselines else [],
         "n_quantiles": int(np.asarray(quantile_baselines["quantiles"]).size) if quantile_baselines else 0,
+        "n_quantile_ensemble_samples": n_samples if quantile_baselines else 0,
         "metrics_csv": str(metrics_path),
         "paired_tests_csv": str(paired_path),
-        "paired_test": "Wilcoxon signed-rank + paired t on per-patient CRPS",
+        "paired_test": "Wilcoxon signed-rank + paired t with patient as the unit; pooled rows average observed horizons within patient",
         "note_mad": "MAD = median absolute deviation (median_i|mean-pred_i - y_i|); Saux et al./SOPHIA definition, robust to outliers",
-        "note_nll": "flow arms only: Gaussian predictive NLL moment-matched from samples (exact CNF NLL deferred to VM)",
+        "note_nll": "density arms: Gaussian predictive NLL moment-matched from flow draws or uniform-probability quantile nodes (exact CNF NLL deferred to VM)",
+        "note_quantile_scoring": "nonuniform fitted quantile levels are interpolated onto equal-probability midpoint nodes before sample-based scoring",
         "note_ridge": "Ridge per-horizon stands in for a linear mixed model (statsmodels not installed here)",
     }
     summary_path = output_dir / "trajectory_comparison_summary.json"

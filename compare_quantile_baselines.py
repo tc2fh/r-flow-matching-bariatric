@@ -13,14 +13,14 @@ runs the harder, fairer test the collaborator asked for: does the flow beat genu
                one linear program per quantile level.
 
 Every arm is scored by IDENTICAL code on the SAME shared split, the SAME conditioning
-information, and the SAME observed test rows. Because the quantile arms' rearranged quantile
-grid is a valid predictive ensemble ``[n_test, n_quantiles, n_horizon]`` - the exact shape of
-the flow's per-patient sample block - they flow through the repo's proper-scoring machinery
+information, and the SAME observed test rows. The quantile arms' rearranged, nonuniform fitted
+grid is interpolated onto uniform-probability midpoint nodes before it enters the repository's
+sample-based proper-scoring machinery
 (``baselines_trajectory.horizon_score`` for MAD/RMSE/CRPS/NLL and ``distributional_metrics``
 for coverage / interval score / pinball / sharpness) with no special-casing. The comparison is
 reported per horizon and pooled by group (BMI, HbA1c, overall), with paired Wilcoxon + t tests
-on per-patient CRPS (flow as the reference arm) and a summary figure of CRPS-over-time and
-coverage calibration.
+on per-patient CRPS (patient-mean CRPS across observed horizons for pooled tests, flow as the
+reference arm) and a summary figure of CRPS-over-time and coverage calibration.
 
 Typical use (after a twin run / pipeline exists)::
 
@@ -70,6 +70,14 @@ ARM_LABELS = {
     bt.ARM_QREG: "quantile regression",
     bt.ARM_XGB: "xgboost (point)",
     bt.ARM_RIDGE: "ridge (point)",
+}
+ARM_SHORT_LABELS = {
+    "event_flow": "flow",
+    "no_event_flow": "flow (no event)",
+    bt.ARM_QGBM: "qGBM",
+    bt.ARM_QREG: "qReg",
+    bt.ARM_XGB: "XGB",
+    bt.ARM_RIDGE: "ridge",
 }
 ARM_ORDER = ["event_flow", "no_event_flow", bt.ARM_QGBM, bt.ARM_QREG, bt.ARM_XGB, bt.ARM_RIDGE]
 ARM_COLORS = {
@@ -137,11 +145,15 @@ def assemble_arms(args) -> dict:
             arm_samples["no_event_flow"] = et._sample_twin_arm(
                 noevent_model, dataset, test_idx, pre, noevent_cfg, args.n_samples, args.n_steps, device)
 
-    # Quantile arms (the point of this script): real predictive ensembles [n_test, n_q, 15].
+    # Quantile arms (the point of this script): fitted quantile functions are interpolated onto
+    # the same number of uniform-probability nodes as the flow has predictive draws. The raw
+    # fitted grid is nonuniform and must not be treated as equal-mass samples.
     q_baselines = bt.fit_quantile_baselines(
         dataset, splits, quantiles=bt.DEFAULT_QUANTILES, use_event=not args.baseline_no_event, seed=args.seed)
-    arm_samples[bt.ARM_QGBM] = q_baselines["qgbm_pred"]
-    arm_samples[bt.ARM_QREG] = q_baselines["qreg_pred"]
+    arm_samples[bt.ARM_QGBM] = bt.quantile_grid_to_ensemble(
+        q_baselines["qgbm_pred"], q_baselines["quantiles"], n_samples=args.n_samples)
+    arm_samples[bt.ARM_QREG] = bt.quantile_grid_to_ensemble(
+        q_baselines["qreg_pred"], q_baselines["quantiles"], n_samples=args.n_samples)
 
     # Optional point arms, so the table can also show the "does the flow beat a point predictor"
     # question next to the harder distributional one. Degenerate one-sample "ensembles".
@@ -156,10 +168,14 @@ def assemble_arms(args) -> dict:
     return {
         "dataset_source": dataset.source_label,
         "event_twin_run": str(event_twin_run) if event_twin_run else None,
+        "split_strategy": cfg.split_strategy,
+        "split_seed": cfg.split_seed,
+        "split_sizes": {name: int(index.size) for name, index in splits.items()},
         "obs": obs, "mask": mask,
         "cont_names": list(tw.CONT_NAMES), "cont_groups": list(tw.CONT_GROUPS),
         "arm_samples": arm_samples, "present": present,
         "quantiles": q_baselines["quantiles"],
+        "n_quantile_ensemble_samples": args.n_samples,
         "baseline_feature_names": q_baselines["feature_names"],
         "n_test": int(test_idx.size),
     }
@@ -268,6 +284,17 @@ def _pool(per_patient: dict, arm: str, dims: list[int], key: str) -> np.ndarray:
     return np.concatenate([per_patient[arm][h][key] for h in dims])
 
 
+def _patient_mean_crps(per_patient: dict, arm: str, dims: list[int]) -> np.ndarray:
+    """Mean observed-horizon CRPS per patient, preserving the patient as the test unit."""
+    if not dims:
+        return np.array([], dtype=np.float64)
+    block = np.column_stack([per_patient[arm][h]["crps_by_patient"] for h in dims])
+    observed = np.isfinite(block)
+    count = observed.sum(axis=1)
+    total = np.nansum(block, axis=1)
+    return np.divide(total, count, out=np.full(block.shape[0], np.nan), where=count > 0)
+
+
 def _pool_samples(arm_samples, arm, dims, obs, mask, cont_groups):
     """Stack an arm's [n, m] blocks and matching observed targets across a group's horizons."""
     if not dims:
@@ -286,7 +313,10 @@ def paired_tests(bundle: dict, per_patient: dict) -> pd.DataFrame:
     """Paired Wilcoxon + t on per-patient CRPS: reference arm vs every other present arm.
 
     Reference is the event-conditioned flow when present, else the first present arm. A negative
-    ``mean_diff`` means the reference (flow) scores LOWER CRPS - i.e. the flow wins."""
+    ``mean_diff`` means the reference (flow) scores LOWER CRPS - i.e. the flow wins. Group and
+    overall rows first average observed horizons within each patient so repeated measurements do
+    not masquerade as independent pairs.
+    """
     present = bundle["present"]
     cont_names, cont_groups = bundle["cont_names"], bundle["cont_groups"]
     ref = "event_flow" if "event_flow" in present else present[0]
@@ -298,13 +328,15 @@ def paired_tests(bundle: dict, per_patient: dict) -> pd.DataFrame:
     for h, name in enumerate(cont_names):
         for other in others:
             pt = bt.paired_test(per_patient[ref][h]["crps_pp"], per_patient[other][h]["crps_pp"])
-            rows.append({"horizon": name, "group": cont_groups[h], "comparison": f"{ref}_vs_{other}", **pt})
+            rows.append({"horizon": name, "group": cont_groups[h],
+                         "comparison": f"{ref}_vs_{other}", "unit": "patient", **pt})
     for gname, dims in group_dims.items():
         for other in others:
-            a = np.concatenate([per_patient[ref][h]["crps_pp"] for h in dims]) if dims else np.array([])
-            b = np.concatenate([per_patient[other][h]["crps_pp"] for h in dims]) if dims else np.array([])
+            a = _patient_mean_crps(per_patient, ref, dims)
+            b = _patient_mean_crps(per_patient, other, dims)
             pt = bt.paired_test(a, b)
-            rows.append({"horizon": f"__{gname}__", "group": gname, "comparison": f"{ref}_vs_{other}", **pt})
+            rows.append({"horizon": f"__{gname}__", "group": gname,
+                         "comparison": f"{ref}_vs_{other}", "unit": "patient", **pt})
     return pd.DataFrame(rows)
 
 
@@ -355,6 +387,192 @@ def _render_scorecard(ax, scorecard: pd.DataFrame) -> None:
         if best[k] >= 0:
             tbl[best[k] + 1, j].set_text_props(weight="bold", color="#0a7d0a")  # +1 for header row
     ax.set_title("Pooled scorecard: CRPS & NLL (bold = best; lower is better)", fontsize=10)
+
+
+def _style_transfer_table(table, *, font_size: float, scale_y: float = 1.45) -> None:
+    """Apply a high-contrast style that remains legible in a VM screenshot."""
+    table.auto_set_font_size(False)
+    table.set_fontsize(font_size)
+    table.scale(1.0, scale_y)
+    for (row, col), cell in table.get_celld().items():
+        cell.set_edgecolor("#c8d0d9")
+        cell.set_linewidth(0.6)
+        if row == 0:
+            cell.set_facecolor("#24445f")
+            cell.set_text_props(color="white", weight="bold")
+        elif col == -1:
+            cell.set_facecolor("#e8eef3")
+            cell.set_text_props(weight="bold", color="#172a3a")
+        else:
+            cell.set_facecolor("#f7f9fb" if row % 2 == 0 else "white")
+
+
+def _format_p(value: float) -> str:
+    if not np.isfinite(value):
+        return "n/a"
+    return "<1e-99" if value < 1e-99 else f"{value:.2e}"
+
+
+def make_transfer_figure(
+    bundle: dict,
+    metrics: pd.DataFrame,
+    calibration: pd.DataFrame,
+    paired: pd.DataFrame,
+    scorecard: pd.DataFrame,
+    out_path: Path,
+) -> None:
+    """Write one screenshot-friendly card containing the values needed off the VM."""
+    fig = plt.figure(figsize=(19, 13), facecolor="white")
+    fig.patch.set_alpha(1.0)
+    grid = fig.add_gridspec(2, 2, height_ratios=(0.85, 1.35), hspace=0.30, wspace=0.16)
+    ax_score = fig.add_subplot(grid[0, 0])
+    ax_pair = fig.add_subplot(grid[0, 1])
+    ax_cov = fig.add_subplot(grid[1, 0])
+    ax_horizon = fig.add_subplot(grid[1, 1])
+
+    # A: exact pooled scorecard.
+    ax_score.axis("off")
+    score_values = [[_fmt_score(row[key]) for key in SCORECARD_KEYS]
+                    for _, row in scorecard.iterrows()]
+    score_table = ax_score.table(
+        cellText=score_values,
+        rowLabels=list(scorecard["label"]),
+        colLabels=["CRPS all", "CRPS BMI", "CRPS A1c", "NLL all", "NLL BMI", "NLL A1c"],
+        loc="center",
+        cellLoc="center",
+    )
+    _style_transfer_table(score_table, font_size=8.5, scale_y=1.55)
+    for col, key in enumerate(SCORECARD_KEYS):
+        values = scorecard[key].to_numpy(dtype=float)
+        if np.isfinite(values).any():
+            best = int(np.nanargmin(values)) + 1
+            score_table[best, col].set_text_props(weight="bold", color="#087830")
+    ax_score.set_title("A. Pooled proper scores (green = best; lower is better)", loc="left", fontsize=11)
+
+    # B: paired CRPS effect sizes and the overall paired-test p-value.
+    ax_pair.axis("off")
+    reference = "event_flow" if "event_flow" in bundle["present"] else bundle["present"][0]
+    competitors = [arm for arm in bundle["present"] if arm != reference]
+    pair_rows = []
+    for arm in competitors:
+        comparison = f"{reference}_vs_{arm}"
+        by_group = paired[
+            paired["comparison"].eq(comparison) & paired["horizon"].str.startswith("__")
+        ].set_index("group")
+        diffs = []
+        for group in ("overall", "bmi", "hba1c"):
+            value = float(by_group.loc[group, "mean_diff"]) if group in by_group.index else np.nan
+            diffs.append(_fmt_score(value))
+        p_value = (float(by_group.loc["overall", "wilcoxon_p"])
+                   if "overall" in by_group.index else np.nan)
+        pair_rows.append([ARM_LABELS.get(arm, arm), *diffs, _format_p(p_value)])
+    pair_table = ax_pair.table(
+        cellText=pair_rows,
+        colLabels=["Comparator", "delta all", "delta BMI", "delta A1c", "Wilcoxon p (all)"],
+        loc="center",
+        cellLoc="center",
+    )
+    _style_transfer_table(pair_table, font_size=8.5, scale_y=1.55)
+    ax_pair.set_title(
+        f"B. Paired CRPS: {ARM_LABELS.get(reference, reference)} minus comparator "
+        "(positive = reference worse)",
+        loc="left",
+        fontsize=11,
+    )
+
+    # C: exact pooled coverage and calibration gaps for every density arm.
+    ax_cov.axis("off")
+    overall_cal = calibration[calibration["horizon"].eq("__overall__")].set_index("arm")
+    cov_rows = []
+    cov_labels = []
+    for arm in bundle["present"]:
+        if arm not in overall_cal.index:
+            continue
+        row = overall_cal.loc[arm]
+        coverages = np.array([row.get(f"cov_{int(level * 100)}", np.nan)
+                              for level in COVERAGE_LEVELS], dtype=float)
+        if not np.isfinite(coverages).any():
+            continue
+        rms_gap = float(np.sqrt(np.nanmean((coverages - np.asarray(COVERAGE_LEVELS)) ** 2)))
+        cov_labels.append(ARM_LABELS.get(arm, arm))
+        cov_rows.append([
+            *[_fmt_score(value) for value in coverages],
+            _fmt_score(rms_gap),
+            _fmt_score(float(row.get("interval_score_90", np.nan))),
+            _fmt_score(float(row.get("mean_sd", np.nan))),
+        ])
+    cov_table = ax_cov.table(
+        cellText=cov_rows,
+        rowLabels=cov_labels,
+        colLabels=["Cov50", "Cov80", "Cov90", "Cov95", "RMS gap", "IS90", "Mean SD"],
+        loc="upper center",
+        cellLoc="center",
+    )
+    _style_transfer_table(cov_table, font_size=8.5, scale_y=1.55)
+    ax_cov.set_title("C. Pooled interval calibration (coverage should equal column target)", loc="left", fontsize=11)
+
+    # D: per-horizon observed counts and CRPS values. This is the minimum table needed to
+    # reconstruct the trajectory panels without transferring CSV files.
+    ax_horizon.axis("off")
+    per_horizon = metrics[~metrics["horizon"].str.startswith("__")]
+    horizon_rows = []
+    crps_arms = [arm for arm in bundle["present"] if arm in per_horizon["arm"].unique()]
+    for horizon in bundle["cont_names"]:
+        block = per_horizon[per_horizon["horizon"].eq(horizon)].set_index("arm")
+        if block.empty:
+            continue
+        n_obs = int(block["n_obs"].max())
+        values = [float(block.loc[arm, "crps"]) if arm in block.index else np.nan for arm in crps_arms]
+        horizon_rows.append([horizon, f"{n_obs:,}", *[_fmt_score(value) for value in values]])
+    horizon_table = ax_horizon.table(
+        cellText=horizon_rows,
+        colLabels=["Horizon", "n observed", *[ARM_SHORT_LABELS.get(arm, arm) for arm in crps_arms]],
+        loc="upper center",
+        cellLoc="center",
+    )
+    _style_transfer_table(horizon_table, font_size=7.2, scale_y=1.20)
+    ax_horizon.set_title("D. Per-horizon CRPS and usable outcome count", loc="left", fontsize=11)
+
+    split_name = _split_display(bundle["split_strategy"]).upper()
+    fig.suptitle(
+        f"RESULT TRANSFER CARD - {split_name} VALIDATION - test n={bundle['n_test']:,}",
+        fontsize=16,
+        weight="bold",
+        y=0.975,
+    )
+    sizes = bundle["split_sizes"]
+    fig.text(
+        0.5,
+        0.945,
+        f"split seed {bundle['split_seed']} | train {sizes.get('train', 0):,} | "
+        f"validation {sizes.get('val', 0):,} | test {sizes.get('test', 0):,} | "
+        f"{len(bundle['quantiles'])} fitted quantiles -> "
+        f"{bundle['n_quantile_ensemble_samples']} equal-probability scoring nodes",
+        ha="center",
+        fontsize=10,
+        color="#354b5e",
+    )
+    fig.text(
+        0.01,
+        0.015,
+        "Transfer this image for exact result review. CRPS/NLL/IS90/RMS gap: lower is better. "
+        "Pooled paired tests average horizons within patient. Quantile tails outside fitted "
+        "0.025-0.975 are endpoint-clamped.",
+        fontsize=8.5,
+        color="#526777",
+    )
+    fig.subplots_adjust(left=0.10, right=0.98, bottom=0.06, top=0.88, hspace=0.32, wspace=0.25)
+    fig.savefig(out_path, dpi=180, facecolor="white", edgecolor="white", transparent=False)
+    fig.savefig(
+        out_path.with_suffix(".jpg"),
+        dpi=180,
+        facecolor="white",
+        edgecolor="white",
+        transparent=False,
+        format="jpeg",
+        pil_kwargs={"quality": 92},
+    )
+    plt.close(fig)
 
 
 # --------------------------------------------------------------------------- #
@@ -416,10 +634,23 @@ def make_figure(bundle: dict, metrics: pd.DataFrame, calibration: pd.DataFrame,
     # Row 2, col 2: the exact pooled CRPS/NLL numbers as a table.
     _render_scorecard(axes[1, 2], scorecard)
 
-    fig.suptitle("Flow matching vs. quantile baselines - BMI / HbA1c trajectory (CRPS & NLL)", fontsize=13)
+    split_name = _split_display(bundle["split_strategy"])
+    fig.suptitle(
+        f"Flow matching vs. quantile baselines - {split_name} validation "
+        f"(test n={bundle['n_test']:,})",
+        fontsize=13,
+    )
     fig.tight_layout(rect=(0, 0, 1, 0.98))
     fig.savefig(out_path, dpi=140)
     plt.close(fig)
+
+
+def _split_display(split_strategy: str) -> str:
+    return {
+        "surgery": "internal",
+        "temporal": "temporal",
+        "outcome": "outcome-stratified",
+    }.get(str(split_strategy), str(split_strategy))
 
 
 def _density_arms(bundle: dict) -> list[str]:
@@ -470,6 +701,8 @@ def run(args) -> dict:
     paired_path = out_dir / "quantile_comparison_paired_tests.csv"
     scorecard_path = out_dir / "quantile_comparison_scorecard.csv"
     fig_path = out_dir / "quantile_comparison.png"
+    transfer_fig_path = out_dir / "quantile_comparison_transfer.png"
+    transfer_fig_jpg_path = out_dir / "quantile_comparison_transfer.jpg"
     summary_path = out_dir / "quantile_comparison_summary.json"
 
     metrics.to_csv(metrics_path, index=False)
@@ -477,17 +710,22 @@ def run(args) -> dict:
     paired.to_csv(paired_path, index=False)
     scorecard.to_csv(scorecard_path, index=False)
     make_figure(bundle, metrics, calibration, scorecard, fig_path)
+    make_transfer_figure(bundle, metrics, calibration, paired, scorecard, transfer_fig_path)
 
     summary = {
         "output_dir": str(out_dir),
         "dataset_source": bundle["dataset_source"],
         "event_twin_run": bundle["event_twin_run"],
+        "split_strategy": bundle["split_strategy"],
+        "split_seed": bundle["split_seed"],
+        "split_sizes": bundle["split_sizes"],
         "arms": bundle["present"],
         "arm_labels": {a: ARM_LABELS.get(a, a) for a in bundle["present"]},
         "n_test": bundle["n_test"],
         "n_quantiles": int(np.asarray(bundle["quantiles"]).size),
         "quantiles": [float(q) for q in np.asarray(bundle["quantiles"])],
         "n_samples_flow": args.n_samples,
+        "n_samples_quantile_ensemble": bundle["n_quantile_ensemble_samples"],
         "n_steps_flow": args.n_steps,
         "baseline_feature_names": bundle["baseline_feature_names"],
         "reference_arm": "event_flow" if "event_flow" in bundle["present"] else bundle["present"][0],
@@ -496,12 +734,15 @@ def run(args) -> dict:
         "paired_tests_csv": str(paired_path),
         "scorecard_csv": str(scorecard_path),
         "figure": str(fig_path),
+        "transfer_figure": str(transfer_fig_path),
+        "transfer_figure_jpg": str(transfer_fig_jpg_path),
         "notes": {
             "crps": "proper score defined for every arm; point arms' CRPS == MAE (degenerate ensemble)",
             "nll": "moment-matched Gaussian predictive NLL; NaN for point arms (no spread)",
             "coverage": "empirical coverage of the central band at each nominal level; NaN if <"
                         f"{dm.MIN_N} observed rows in the (pooled) block",
-            "paired_test": "Wilcoxon signed-rank + paired t on per-patient CRPS; mean_diff<0 => reference (flow) better",
+            "paired_test": "Wilcoxon signed-rank + paired t with patient as the unit; pooled rows use each patient's mean CRPS across observed horizons; mean_diff<0 => reference better",
+            "quantile_scoring": "rearranged fitted quantile function interpolated onto equal-probability midpoint nodes; endpoint-clamped outside the fitted 0.025-0.975 range",
             "qgbm": "quantile gradient boosting (xgboost reg:quantileerror, all quantiles jointly, rearranged)",
             "qreg": "linear conditional quantile regression (Koenker-Bassett; sklearn QuantileRegressor, per level)",
         },
@@ -538,7 +779,7 @@ def _print_summary(bundle, metrics, calibration, paired, out_dir) -> None:
             print(ov_cal[["arm"] + cov_cols + ["interval_score_90"]].round(3).to_string(index=False))
     else:
         print(f"\nCoverage NaN on this split (<{dm.MIN_N} observed rows/group); populated on the real cohort.")
-    print(f"\nPaired CRPS tests vs reference '{ref}' (overall; mean_diff<0 => flow better):")
+    print(f"\nPaired CRPS tests vs reference '{ref}' (overall; mean_diff<0 => reference better):")
     ov = paired[paired["group"] == "overall"][["comparison", "n_pairs", "mean_diff", "wilcoxon_p", "ttest_p"]]
     with pd.option_context("display.max_columns", None, "display.width", 220):
         print(ov.round(4).to_string(index=False))

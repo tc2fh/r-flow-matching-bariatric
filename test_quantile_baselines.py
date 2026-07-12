@@ -2,9 +2,9 @@
 
 Covers the two models the collaborator asked for as a fair distributional yard-stick for the
 flow: quantile gradient boosting (``qgbm``) and linear conditional quantile regression
-(``qreg``). Mixes fast synthetic checks (estimator behaviour, monotone rearrangement, the
-"quantiles-as-ensemble" coverage identity) with fake-cohort integration checks (shapes,
-monotonicity, and that the arms drop into the repo's proper-scoring code with finite CRPS/NLL).
+(``qreg``). Mixes fast synthetic checks (estimator behaviour, monotone rearrangement, uniform-
+probability quadrature of the nonuniform quantile grid) with fake-cohort integration checks
+(shapes, monotonicity, and finite CRPS/NLL through the shared proper-scoring code).
 
 Runnable two ways:
   * pytest:  OMP_NUM_THREADS=1 ../mbsaqip_flow/.venv/bin/python -m pytest test_quantile_baselines.py -q
@@ -24,6 +24,7 @@ from functools import lru_cache
 import numpy as np
 
 import baselines_trajectory as bt
+import compare_quantile_baselines as comparison
 import distributional_metrics as dm
 import train_flow_matching as fm
 import train_flow_matching_twin as tw
@@ -64,6 +65,46 @@ def test_monotone_rearrange_sorts_rows_only():
     assert np.allclose(np.sort(pred, axis=1), out)
 
 
+def test_quantile_grid_is_interpolated_on_uniform_probability_mass():
+    """A nonuniform quantile grid must not assign equal mass to every fitted level."""
+    quantiles = np.array([0.10, 0.20, 0.90])
+    predictions = np.array([[[0.0], [1.0], [10.0]]])
+    n_samples = 200
+
+    ensemble = bt.quantile_grid_to_ensemble(predictions, quantiles, n_samples=n_samples)
+
+    target = (np.arange(n_samples) + 0.5) / n_samples
+    expected = np.interp(target, quantiles, predictions[0, :, 0])
+    assert ensemble.shape == (1, n_samples, 1)
+    assert np.allclose(ensemble[0, :, 0], expected)
+    assert not np.isclose(ensemble.mean(), predictions.mean())
+
+
+def test_horizon_score_preserves_patient_alignment_for_pooled_tests():
+    samples = np.array([[0.0, 1.0], [4.0, 5.0], [9.0, 10.0]])
+    observed = np.array([0.5, 4.5, 9.5])
+    mask = np.array([1, 0, 1])
+
+    score = bt.horizon_score(samples, observed, mask, has_density=True)
+
+    assert score["crps_by_patient"].shape == (3,)
+    assert np.isfinite(score["crps_by_patient"][[0, 2]]).all()
+    assert np.isnan(score["crps_by_patient"][1])
+
+
+def test_pooled_crps_averages_horizons_within_patient():
+    per_patient = {
+        "flow": {
+            0: {"crps_by_patient": np.array([1.0, 3.0, np.nan])},
+            1: {"crps_by_patient": np.array([3.0, np.nan, 5.0])},
+        }
+    }
+
+    pooled = comparison._patient_mean_crps(per_patient, "flow", [0, 1])
+
+    assert np.allclose(pooled, np.array([2.0, 3.0, 5.0]), equal_nan=True)
+
+
 # --------------------------------------------------------------------------- #
 # Estimator builders (synthetic)
 # --------------------------------------------------------------------------- #
@@ -94,20 +135,21 @@ def test_quantile_regressor_pipeline_imputes_and_predicts():
     assert np.isfinite(pred).all()
 
 
-def test_quantiles_as_ensemble_recover_nominal_coverage():
-    """The predicted quantile grid, treated as an ensemble, must yield ~nominal coverage.
+def test_uniformized_quantile_grid_recovers_nominal_coverage():
+    """Uniform-probability quadrature of true quantiles must yield nominal coverage.
 
-    Build a perfectly-specified ensemble: for each patient the "samples" ARE the true quantiles
-    of that patient's outcome distribution. dm.coverage_curve (the same scorer the comparison
-    uses) should then read empirical coverage close to nominal - validating the whole
-    quantiles-as-predictive-ensemble scoring path end to end."""
+    Build a perfectly specified quantile function for each patient, convert its nonuniform
+    fitted levels to equal-probability quadrature nodes, then exercise the same sample scorer
+    used by the comparison.
+    """
     rng = np.random.default_rng(3)
     n = 4000
     mu = rng.normal(size=n)
     sd = 0.5 + rng.uniform(size=n)
     q = np.asarray(bt.DEFAULT_QUANTILES)
     from scipy.stats import norm
-    ens = mu[:, None] + sd[:, None] * norm.ppf(q)[None, :]  # [n, n_q] true per-patient quantiles
+    fitted = mu[:, None] + sd[:, None] * norm.ppf(q)[None, :]
+    ens = bt.quantile_grid_to_ensemble(fitted[:, :, None], q, n_samples=200)[:, :, 0]
     obs = mu + sd * rng.normal(size=n)                      # a genuine draw from each patient
     for row in dm.coverage_curve(ens, obs, levels=(0.5, 0.8, 0.9)):
         assert abs(row["empirical"] - row["nominal"]) < 0.05
@@ -140,16 +182,16 @@ def test_no_event_drops_event_feature():
 
 
 def test_quantile_arms_plug_into_horizon_score_with_density():
-    """A quantile arm's [n_test, n_q] slice must score through horizon_score as a real ensemble:
-    finite CRPS AND finite NLL (has_density=True), unlike the point arms whose NLL is NaN."""
+    """Uniformized quantile predictions must produce finite CRPS and NLL."""
     dataset, splits = _fake_dataset_and_splits()
     out = bt.fit_quantile_baselines(dataset, splits, seed=0)
     x_cont = dataset.x[:, tw.CONT_DIMS].astype(float)
     mask_cont = dataset.mask[:, tw.CONT_DIMS]
     test_idx = splits["test"]
+    ensemble = bt.quantile_grid_to_ensemble(out["qgbm_pred"], out["quantiles"])
     got_density = False
     for h in range(tw.X_CONT_DIM):
-        score = bt.horizon_score(out["qgbm_pred"][:, :, h], x_cont[test_idx, h], mask_cont[test_idx, h],
+        score = bt.horizon_score(ensemble[:, :, h], x_cont[test_idx, h], mask_cont[test_idx, h],
                                  has_density=True, obs_bounds=bt.PHYSIOLOGIC_BOUNDS.get(tw.CONT_GROUPS[h]))
         if score["n_obs"] > 0:
             assert np.isfinite(score["crps"])
