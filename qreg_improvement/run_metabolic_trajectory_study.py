@@ -7,6 +7,11 @@ modeling, calibration, evaluation, and figure-book workflow:
     python qreg_improvement/run_metabolic_trajectory_study.py
 
 This file is intentionally self-contained. It imports no project-local Python code.
+The ``--schema-discovery`` mode opens its own pyodbc connection and inventories only
+SQL Server metadata. It does not read patient rows. The resulting screenshot-friendly
+figures are used to freeze explicit raw-table joins before a production extraction.
+The current wide-cohort compatibility path remains labeled exploratory and is not the
+required final raw-source implementation.
 Human-facing output is restricted to numbered PNG pages and one matching PDF in
 ``FIGURES_TO_EXPORT``. Restart artifacts live in the fingerprinted run directory.
 """
@@ -61,8 +66,10 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
-STUDY_VERSION = "metabolic-trajectory-1.0.0"
-SQL_CONTRACT_VERSION = "metabolic-raw-events-v1.0.0"
+STUDY_VERSION = "metabolic-trajectory-1.2.0"
+SQL_CONTRACT_VERSION = "metabolic-raw-events-v1.1.0"
+LEGACY_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.0.0"
+SCHEMA_DISCOVERY_VERSION = "metabolic-schema-discovery-v1.0.0"
 DEFAULT_CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
     "Server=tcp:PROJECTS;"
@@ -449,13 +456,26 @@ def png_chunk(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", checksum)
 
 
+def failure_report_lines(
+    issues: Sequence[str],
+    details: Sequence[str],
+    width: int,
+) -> list[str]:
+    lines = ["FAILED GATES"]
+    for item in issues:
+        wrapper = textwrap.TextWrapper(width=width, initial_indent="- ", subsequent_indent="  ")
+        lines.extend(wrapper.wrap(str(item)) or ["-"])
+    if details:
+        lines.extend(["", "DETAILS AND CORRECTIVE ACTION"])
+        for item in details:
+            wrapper = textwrap.TextWrapper(width=width, initial_indent="- ", subsequent_indent="  ")
+            lines.extend(wrapper.wrap(str(item)) or ["-"])
+    return lines
+
+
 def write_failure_png(path: Path, title: str, issues: Sequence[str], details: Sequence[str]) -> None:
     width = 2550
-    wrapped: list[str] = []
-    for item in issues:
-        wrapped.extend(textwrap.wrap("- " + str(item), width=106) or ["-"])
-    for item in details:
-        wrapped.extend(textwrap.wrap(str(item), width=106) or [""])
+    wrapped = failure_report_lines(issues, details, width=96)
     lines = [title.upper(), "", *wrapped, "", "THE STUDY STOPPED WITHOUT A SCIENTIFIC FALLBACK."]
     scale = 4
     line_height = 40
@@ -511,11 +531,7 @@ def pdf_escape(value: str) -> str:
 
 
 def write_failure_pdf(path: Path, title: str, issues: Sequence[str], details: Sequence[str]) -> None:
-    lines: list[str] = [title.upper(), ""]
-    for item in issues:
-        lines.extend(textwrap.wrap("- " + str(item), width=88) or ["-"])
-    for item in details:
-        lines.extend(textwrap.wrap(str(item), width=88) or [""])
+    lines: list[str] = [title.upper(), "", *failure_report_lines(issues, details, width=84)]
     lines.extend(["", "The study stopped without a scientific fallback."])
     commands = ["BT", "/F1 10 Tf", "54 738 Td", "14 TL"]
     for index, line in enumerate(lines[:48]):
@@ -567,9 +583,26 @@ def render_preflight_failure(
     run_dir = failure_run_dir(cfg, title, issues)
     export = run_dir / "FIGURES_TO_EXPORT"
     export.mkdir(parents=True, exist_ok=True)
+    generated_names = set(globals().get("PAGE_FILES", ()))
+    generated_names.update(globals().get("SCHEMA_DISCOVERY_PAGE_FILES", ()))
+    generated_names.update(
+        {
+            "00_preflight_failure.png",
+            "metabolic_trajectory_figure_book.pdf",
+            "metabolic_trajectory_figure_book.pdf.tmp",
+            "schema_discovery_figure_book.pdf",
+            "schema_discovery_figure_book.pdf.tmp",
+        }
+    )
     for existing in export.iterdir():
-        if existing.is_file() and existing.name not in {"00_preflight_failure.png", "metabolic_trajectory_figure_book.pdf"}:
-            raise RuntimeError(f"Failure export directory contains an unexpected file: {existing.name}")
+        if not existing.is_file():
+            raise RuntimeError(f"Failure export directory contains an unexpected directory: {existing.name}")
+        original_name = existing.name.removesuffix(".tmp")
+        if existing.name in generated_names or original_name in generated_names:
+            if existing.name not in {"00_preflight_failure.png", "metabolic_trajectory_figure_book.pdf"}:
+                existing.unlink()
+            continue
+        raise RuntimeError(f"Failure export directory contains an unexpected file: {existing.name}")
     png = export / "00_preflight_failure.png"
     pdf = export / "metabolic_trajectory_figure_book.pdf"
     write_failure_png(png, title, issues, details)
@@ -922,11 +955,12 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
     ]
     quality_rows: list[dict[str, Any]] = []
     normalized_rows: list[dict[str, Any]] = []
-    supporting: dict[tuple[str, Any], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
-    source_details: dict[tuple[str, Any, str], list[dict[str, Any]]] = defaultdict(list)
+    supporting: dict[tuple[str, Any, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    source_details: dict[tuple[str, Any, str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in frame.itertuples(index=False):
         patient = str(row.patient_id)
         measurement_date = row.measurement_date
+        source_cohort = str(getattr(row, "source_cohort", "all"))
         kind = row.kind
         value = row.raw_value_numeric
         unit = row.unit
@@ -963,12 +997,19 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
             }
         )
         if normalized_value is not None and reason == "valid":
-            key = (patient, measurement_date)
+            key = (patient, measurement_date, source_cohort)
             supporting[key][kind].append(float(normalized_value))
-            source_details[(patient, measurement_date, kind)].append(
-                {"source_concept": str(row.source_concept), "source_table": str(row.source_table)}
+            source_details[(patient, measurement_date, source_cohort, kind)].append(
+                {
+                    "source_concept": str(row.source_concept),
+                    "source_table": str(row.source_table),
+                    "source_cohort": str(getattr(row, "source_cohort", "all")),
+                    "timing_precision": str(getattr(row, "timing_precision", "exact_day")),
+                }
             )
-    for (patient, measurement_date), kinds in sorted(supporting.items(), key=lambda item: (item[0][0], item[0][1])):
+    for (patient, measurement_date, source_cohort), kinds in sorted(
+        supporting.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])
+    ):
         for kind in ("hba1c", "bmi"):
             values = kinds.get(kind, [])
             method = "observed"
@@ -981,7 +1022,7 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
                     method = "derived_weight_height"
             if not values:
                 continue
-            details = source_details.get((patient, measurement_date, kind), [])
+            details = source_details.get((patient, measurement_date, source_cohort, kind), [])
             normalized_rows.append(
                 {
                     "patient_id": patient,
@@ -993,6 +1034,8 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
                     "duplicate_day": len(values) > 1,
                     "source_concepts": "|".join(sorted({item["source_concept"] for item in details})) or "derived",
                     "source_tables": "|".join(sorted({item["source_table"] for item in details})) or "derived",
+                    "source_cohort": "|".join(sorted({item["source_cohort"] for item in details})) or "all",
+                    "timing_precision": "|".join(sorted({item["timing_precision"] for item in details})) or "exact_day",
                 }
             )
     normalized = pd.DataFrame(normalized_rows)
@@ -1098,7 +1141,7 @@ def suppress_small_cells(frame: Any, count_columns: Sequence[str], threshold: in
 
 
 # ======================================================================================
-# 4. Cosmos schema discovery, hard gates, extraction, fingerprints, and checkpoints
+# 4. Metadata discovery, embedded raw SQL, legacy-wide audit, gates, and checkpoints
 # ======================================================================================
 
 
@@ -1106,77 +1149,629 @@ def normalize_identifier(value: Any) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).lower())
 
 
-ROLE_ALIASES: dict[str, tuple[str, ...]] = {
-    "patient_id": ("PatKey", "PatientKey", "PatientID", "PersonID", "DeidentifiedPatientID"),
+SCHEMA_DISCOVERY_PAGE_FILES = (
+    "01_schema_discovery_overview.png",
+    "02_patient_center_candidates.png",
+    "03_procedure_candidates.png",
+    "04_medication_candidates.png",
+    "05_measurement_candidates.png",
+    "06_encounter_diagnosis_candidates.png",
+    "07_key_dependency_map.png",
+)
+
+DISCOVERY_ROLE_PATTERNS: dict[str, re.Pattern[str]] = {
+    "patient_id": re.compile(r"(?:^patkey$|(?:patient|person|subject|pat)(?:durable)?(?:key|id)$)", re.I),
+    "center_id": re.compile(r"(?:center|site|organization|facility|healthsystem|servicearea|location)(?:key|id)$", re.I),
+    "encounter_id": re.compile(r"(?:encounter|visit|contact)(?:key|id)$", re.I),
+    "procedure_id": re.compile(r"(?:procedure|surgery|operation)(?:key|id)$", re.I),
+    "medication_id": re.compile(r"(?:medication|med|drug|order|dispense|administration|admin|rx)(?:key|id)$", re.I),
+    "measurement_id": re.compile(r"(?:measurement|result|lab|component|observation)(?:key|id)$", re.I),
+    "age": re.compile(r"(?:^age$|ageat|patientage)", re.I),
+    "birth_date": re.compile(r"(?:birthdate|dateofbirth|dob$)", re.I),
+    "birth_year": re.compile(r"(?:birthyear|yearofbirth)", re.I),
+    "sex": re.compile(r"(?:^sex$|administrativesex|gender)", re.I),
+    "race": re.compile(r"(?:^race$|racecategory|firstrace)", re.I),
+    "ethnicity": re.compile(r"ethnicity", re.I),
+    "observation_start_date": re.compile(r"(?:observation|coverage|enrollment|active).*(?:start|begin).*(?:date|time)?$", re.I),
+    "observation_end_date": re.compile(r"(?:observation|coverage|enrollment|active|lastobserved|lastcontact).*(?:end|stop|date|time)$", re.I),
+    "administrative_end_date": re.compile(r"(?:administrativeend|datathrough|studyend|extractthrough)", re.I),
+    "procedure_date": re.compile(r"(?:procedure|proc|surgery|operation).*(?:date|time)$", re.I),
+    "procedure_code": re.compile(r"(?:procedure|proc|cpt|hcpcs).*(?:code|concept|id)?$|^cptcode$", re.I),
+    "ingredient": re.compile(r"(?:ingredient|generic|brand|product|medicationname|drugname|glp1name)", re.I),
+    "medication_concept": re.compile(r"(?:rxnorm|rxcui|ndc|gpi|atc|medicationconcept|drugconcept)", re.I),
+    "order_date": re.compile(r"(?:medication|drug|rx|order).*(?:order|ordered).*(?:date|time)$|^orderdate$", re.I),
+    "fill_date": re.compile(r"(?:fill|dispense|sold|claim).*(?:date|time)$", re.I),
+    "administration_date": re.compile(r"(?:administration|admin).*(?:date|time)$", re.I),
+    "medication_start_date": re.compile(r"(?:medication|drug|rx|episode|therapy|treatment).*(?:start|begin).*(?:date|time)$", re.I),
+    "medication_end_date": re.compile(r"(?:medication|drug|rx|episode|therapy|treatment).*(?:end|stop|discontinu).*(?:date|time)$", re.I),
+    "days_supply": re.compile(r"days?(?:supply|supplied)", re.I),
+    "quantity": re.compile(r"(?:dispense)?quantity|qty", re.I),
+    "refills": re.compile(r"refill", re.I),
+    "dose": re.compile(r"(?:dose|strength)(?:value|amount)?$", re.I),
+    "dose_unit": re.compile(r"(?:dose|strength).*unit$", re.I),
+    "route": re.compile(r"(?:route|formulation|doseform)", re.I),
+    "frequency": re.compile(r"(?:frequency|sig|schedule)", re.I),
+    "measurement_date": re.compile(r"(?:measurement|result|specimen|collection|observed|recorded).*(?:date|time)$", re.I),
+    "raw_value": re.compile(r"(?:raw|result|numeric|measurement|valueas).*(?:value|number)$|^value$", re.I),
+    "unit": re.compile(r"(?:result|measurement|source|value)?unit(?:name|code|value)?$", re.I),
+    "source_concept": re.compile(r"(?:loinc|component|measurementconcept|resultconcept|labconcept)", re.I),
+    "measurement_type": re.compile(r"(?:measurement|result|component|lab).*(?:type|name)$", re.I),
+    "encounter_date": re.compile(r"(?:encounter|visit|contact).*(?:date|time)$", re.I),
+    "diagnosis_date": re.compile(r"(?:diagnosis|condition).*(?:date|time|start)$", re.I),
+    "diagnosis_code": re.compile(r"(?:diagnosis|condition|icd).*(?:code|concept|id)$|^icd10$", re.I),
+}
+
+DISCOVERY_DOMAIN_RULES: dict[str, dict[str, Any]] = {
+    "patients": {
+        "table_pattern": re.compile(r"patient|person|demograph|member", re.I),
+        "roles": {
+            "patient_id", "center_id", "age", "birth_date", "birth_year", "sex", "race",
+            "ethnicity", "observation_start_date", "observation_end_date", "administrative_end_date",
+        },
+        "core": {"patient_id"},
+        "signals": {
+            "age", "birth_date", "birth_year", "sex", "race", "ethnicity",
+            "observation_start_date", "observation_end_date", "administrative_end_date",
+        },
+    },
+    "centers": {
+        "table_pattern": re.compile(r"center|site|organization|facility|location|servicearea", re.I),
+        "roles": {"patient_id", "center_id", "encounter_id"},
+        "core": {"center_id"},
+        "signals": {"center_id"},
+    },
+    "procedures": {
+        "table_pattern": re.compile(r"procedure|surgery|operation|cpt|hcpcs", re.I),
+        "roles": {"patient_id", "encounter_id", "procedure_id", "procedure_date", "procedure_code", "center_id"},
+        "core": {"patient_id", "procedure_date", "procedure_code"},
+        "signals": {"procedure_id", "procedure_date", "procedure_code"},
+    },
+    "medications": {
+        "table_pattern": re.compile(r"med|drug|pharm|rx|order|dispens|admin|exposure|therapy", re.I),
+        "roles": {
+            "patient_id", "encounter_id", "medication_id", "ingredient", "medication_concept",
+            "order_date", "fill_date", "administration_date", "medication_start_date",
+            "medication_end_date", "days_supply", "quantity", "refills", "dose", "dose_unit",
+            "route", "frequency", "center_id",
+        },
+        "core": {"patient_id", "ingredient", "medication_concept"},
+        "signals": {
+            "medication_id", "ingredient", "medication_concept", "order_date", "fill_date",
+            "administration_date", "medication_start_date", "medication_end_date", "days_supply",
+            "quantity", "refills", "dose", "dose_unit", "route", "frequency",
+        },
+    },
+    "measurements": {
+        "table_pattern": re.compile(r"measurement|lab|result|vital|observation|component", re.I),
+        "roles": {
+            "patient_id", "encounter_id", "measurement_id", "measurement_date", "raw_value",
+            "unit", "source_concept", "measurement_type", "center_id",
+        },
+        "core": {"patient_id", "measurement_date", "raw_value", "unit", "source_concept"},
+        "signals": {
+            "measurement_id", "measurement_date", "raw_value", "unit", "source_concept",
+            "measurement_type",
+        },
+    },
+    "encounters": {
+        "table_pattern": re.compile(r"encounter|visit|contact", re.I),
+        "roles": {"patient_id", "encounter_id", "encounter_date", "center_id"},
+        "core": {"patient_id", "encounter_date"},
+        "signals": {"encounter_id", "encounter_date"},
+    },
+    "diagnoses": {
+        "table_pattern": re.compile(r"diagnos|condition|problem|icd", re.I),
+        "roles": {"patient_id", "encounter_id", "diagnosis_date", "diagnosis_code", "center_id"},
+        "core": {"patient_id", "diagnosis_date", "diagnosis_code"},
+        "signals": {"diagnosis_date", "diagnosis_code"},
+    },
+}
+
+SCHEMA_DISCOVERY_SQL: dict[str, str] = {
+    "database": """
+/* metabolic-schema-discovery: database */
+SELECT DB_NAME() AS DATABASE_NAME
+""",
+    "columns": """
+/* metabolic-schema-discovery: columns */
+SELECT c.TABLE_CATALOG, c.TABLE_SCHEMA, c.TABLE_NAME,
+       COALESCE(t.TABLE_TYPE, 'UNKNOWN') AS TABLE_TYPE,
+       c.COLUMN_NAME, c.ORDINAL_POSITION, c.DATA_TYPE,
+       c.CHARACTER_MAXIMUM_LENGTH, c.NUMERIC_PRECISION,
+       c.NUMERIC_SCALE, c.IS_NULLABLE
+FROM INFORMATION_SCHEMA.COLUMNS AS c
+LEFT JOIN INFORMATION_SCHEMA.TABLES AS t
+  ON t.TABLE_CATALOG = c.TABLE_CATALOG
+ AND t.TABLE_SCHEMA = c.TABLE_SCHEMA
+ AND t.TABLE_NAME = c.TABLE_NAME
+WHERE c.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys')
+ORDER BY c.TABLE_SCHEMA, c.TABLE_NAME, c.ORDINAL_POSITION
+""",
+    "keys": """
+/* metabolic-schema-discovery: keys */
+SELECT k.TABLE_SCHEMA, k.TABLE_NAME, k.COLUMN_NAME,
+       tc.CONSTRAINT_TYPE, k.CONSTRAINT_NAME, k.ORDINAL_POSITION
+FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE AS k
+JOIN INFORMATION_SCHEMA.TABLE_CONSTRAINTS AS tc
+  ON tc.CONSTRAINT_CATALOG = k.CONSTRAINT_CATALOG
+ AND tc.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA
+ AND tc.CONSTRAINT_NAME = k.CONSTRAINT_NAME
+WHERE tc.CONSTRAINT_TYPE IN ('PRIMARY KEY', 'UNIQUE')
+ORDER BY k.TABLE_SCHEMA, k.TABLE_NAME, tc.CONSTRAINT_TYPE, k.ORDINAL_POSITION
+""",
+    "foreign_keys": """
+/* metabolic-schema-discovery: foreign-keys */
+SELECT OBJECT_SCHEMA_NAME(fkc.parent_object_id) AS CHILD_SCHEMA,
+       OBJECT_NAME(fkc.parent_object_id) AS CHILD_TABLE,
+       pc.name AS CHILD_COLUMN,
+       OBJECT_SCHEMA_NAME(fkc.referenced_object_id) AS PARENT_SCHEMA,
+       OBJECT_NAME(fkc.referenced_object_id) AS PARENT_TABLE,
+       rc.name AS PARENT_COLUMN,
+       fk.name AS FOREIGN_KEY_NAME
+FROM sys.foreign_key_columns AS fkc
+JOIN sys.foreign_keys AS fk
+  ON fk.object_id = fkc.constraint_object_id
+JOIN sys.columns AS pc
+  ON pc.object_id = fkc.parent_object_id
+ AND pc.column_id = fkc.parent_column_id
+JOIN sys.columns AS rc
+  ON rc.object_id = fkc.referenced_object_id
+ AND rc.column_id = fkc.referenced_column_id
+ORDER BY CHILD_SCHEMA, CHILD_TABLE, FOREIGN_KEY_NAME, fkc.constraint_column_id
+""",
+    "synonyms": """
+/* metabolic-schema-discovery: synonyms */
+SELECT SCHEMA_NAME(schema_id) AS SYNONYM_SCHEMA,
+       name AS SYNONYM_NAME,
+       base_object_name AS BASE_OBJECT_NAME
+FROM sys.synonyms
+ORDER BY SYNONYM_SCHEMA, SYNONYM_NAME
+""",
+    "cohort_modules": """
+/* metabolic-schema-discovery: cohort-modules */
+SELECT OBJECT_SCHEMA_NAME(m.object_id) AS MODULE_SCHEMA,
+       OBJECT_NAME(m.object_id) AS MODULE_NAME,
+       o.type_desc AS MODULE_TYPE,
+       CASE WHEN LOWER(m.definition) LIKE '%mbscohort%' THEN 1 ELSE 0 END AS REFERENCES_MBSCOHORT,
+       CASE WHEN LOWER(m.definition) LIKE '%glp1cohort%' THEN 1 ELSE 0 END AS REFERENCES_GLP1COHORT
+FROM sys.sql_modules AS m
+JOIN sys.objects AS o ON o.object_id = m.object_id
+WHERE LOWER(m.definition) LIKE '%mbscohort%'
+   OR LOWER(m.definition) LIKE '%glp1cohort%'
+ORDER BY MODULE_SCHEMA, MODULE_NAME
+""",
+    "object_dependencies": """
+/* metabolic-schema-discovery: object-dependencies */
+SELECT OBJECT_SCHEMA_NAME(d.referencing_id) AS REFERENCING_SCHEMA,
+       OBJECT_NAME(d.referencing_id) AS REFERENCING_OBJECT,
+       o.type_desc AS REFERENCING_TYPE,
+       d.referenced_server_name AS REFERENCED_SERVER,
+       d.referenced_database_name AS REFERENCED_DATABASE,
+       COALESCE(d.referenced_schema_name, OBJECT_SCHEMA_NAME(d.referenced_id)) AS REFERENCED_SCHEMA,
+       COALESCE(d.referenced_entity_name, OBJECT_NAME(d.referenced_id)) AS REFERENCED_OBJECT,
+       d.is_schema_bound_reference AS IS_SCHEMA_BOUND,
+       d.is_ambiguous AS IS_AMBIGUOUS
+FROM sys.sql_expression_dependencies AS d
+LEFT JOIN sys.objects AS o
+  ON o.object_id = d.referencing_id
+WHERE d.referenced_entity_name IS NOT NULL
+ORDER BY REFERENCING_SCHEMA, REFERENCING_OBJECT, REFERENCED_SCHEMA, REFERENCED_OBJECT
+""",
+}
+
+
+def discovery_roles(column_name: Any, table_name: Any) -> list[str]:
+    column = normalize_identifier(column_name)
+    table = normalize_identifier(table_name)
+    roles = [role for role, pattern in DISCOVERY_ROLE_PATTERNS.items() if pattern.search(column)]
+    contextual = {
+        "procedures": ("procedure_id", "procedure_date", "procedure_code"),
+        "medications": ("medication_id", "medication_start_date", "medication_concept"),
+        "measurements": ("measurement_id", "measurement_date", "raw_value"),
+        "encounters": ("encounter_id", "encounter_date", "encounter_id"),
+        "diagnoses": ("diagnosis_code", "diagnosis_date", "diagnosis_code"),
+    }
+    for domain, (identifier_role, date_role, code_or_value_role) in contextual.items():
+        if not DISCOVERY_DOMAIN_RULES[domain]["table_pattern"].search(table):
+            continue
+        if column in {"id", "key"}:
+            roles.append(identifier_role)
+        if column in {"date", "servicedate", "eventdate", "recordeddate"}:
+            roles.append(date_role)
+        if column in {"code", "conceptid", "name"}:
+            roles.append(code_or_value_role)
+    return sorted(set(roles))
+
+
+def _metadata_object_name(schema_name: Any, table_name: Any) -> str:
+    return f"{schema_name}.{table_name}"
+
+
+def build_schema_discovery_candidates(columns: Any, keys: Any) -> tuple[Any, Any]:
+    key_lookup: dict[tuple[str, str, str], str] = {}
+    if keys is not None and not keys.empty:
+        for row in keys.itertuples(index=False):
+            key_lookup[(str(row.TABLE_SCHEMA), str(row.TABLE_NAME), str(row.COLUMN_NAME))] = str(row.CONSTRAINT_TYPE)
+    candidate_rows: list[dict[str, Any]] = []
+    detail_rows: list[dict[str, Any]] = []
+    for (schema_name, table_name), group in columns.groupby(["TABLE_SCHEMA", "TABLE_NAME"], sort=True):
+        object_name = _metadata_object_name(schema_name, table_name)
+        table_type = str(group["TABLE_TYPE"].iloc[0]) if "TABLE_TYPE" in group else "UNKNOWN"
+        role_columns: dict[str, list[str]] = defaultdict(list)
+        column_roles: dict[str, list[str]] = {}
+        for row in group.itertuples(index=False):
+            roles = discovery_roles(row.COLUMN_NAME, table_name)
+            column_roles[str(row.COLUMN_NAME)] = roles
+            for role in roles:
+                role_columns[role].append(str(row.COLUMN_NAME))
+        for domain, rule in DISCOVERY_DOMAIN_RULES.items():
+            allowed_roles = set(rule["roles"])
+            matched_roles = sorted(allowed_roles.intersection(role_columns))
+            name_match = bool(rule["table_pattern"].search(str(table_name)))
+            signal_roles = set(rule["signals"])
+            matched_signals = signal_roles.intersection(matched_roles)
+            if not matched_signals and not name_match:
+                continue
+            core_roles = set(rule["core"])
+            core_matched = core_roles.intersection(matched_roles)
+            patient_bonus = 4 if "patient_id" in matched_roles else 0
+            score = (
+                3 * len(matched_roles)
+                + 5 * len(core_matched)
+                + 4 * len(matched_signals)
+                + patient_bonus
+                + (4 if name_match else 0)
+            )
+            relevant_columns = sorted(
+                {
+                    column
+                    for role in matched_roles
+                    for column in role_columns.get(role, [])
+                }
+            )
+            key_columns = sorted(
+                {
+                    column
+                    for column in group["COLUMN_NAME"].astype(str)
+                    if (str(schema_name), str(table_name), column) in key_lookup
+                    or re.search(r"(?:key|id)$", normalize_identifier(column), re.I)
+                }
+            )
+            candidate_rows.append(
+                {
+                    "domain": domain,
+                    "object": object_name,
+                    "object_type": table_type,
+                    "score": score,
+                    "core_coverage": f"{len(core_matched)}/{len(core_roles)}",
+                    "matched_roles": " | ".join(matched_roles),
+                    "key_columns": " | ".join(key_columns[:8]),
+                    "relevant_columns": " | ".join(relevant_columns[:16]),
+                }
+            )
+            for row in group.itertuples(index=False):
+                roles = sorted(allowed_roles.intersection(column_roles.get(str(row.COLUMN_NAME), [])))
+                if not roles:
+                    continue
+                detail_rows.append(
+                    {
+                        "domain": domain,
+                        "object": object_name,
+                        "column": str(row.COLUMN_NAME),
+                        "role": " | ".join(roles),
+                        "data_type": str(row.DATA_TYPE),
+                        "nullable": str(row.IS_NULLABLE),
+                        "key_type": key_lookup.get((str(schema_name), str(table_name), str(row.COLUMN_NAME)), ""),
+                    }
+                )
+    candidates = pd.DataFrame(candidate_rows)
+    details = pd.DataFrame(detail_rows)
+    if not candidates.empty:
+        candidates = candidates.sort_values(
+            ["domain", "score", "object"], ascending=[True, False, True], ignore_index=True
+        )
+    if not details.empty:
+        details = details.sort_values(["domain", "object", "role", "column"], ignore_index=True)
+    return candidates, details
+
+
+def build_shared_key_hints(columns: Any) -> Any:
+    rows: list[dict[str, Any]] = []
+    working = columns.copy()
+    working["normalized_column"] = working["COLUMN_NAME"].map(normalize_identifier)
+    working = working.loc[working["normalized_column"].str.contains(r"(?:key|id)$", regex=True)]
+    for normalized, group in working.groupby("normalized_column", sort=True):
+        objects = sorted(
+            {
+                _metadata_object_name(row.TABLE_SCHEMA, row.TABLE_NAME)
+                for row in group.itertuples(index=False)
+            }
+        )
+        if 2 <= len(objects) <= 40:
+            rows.append(
+                {
+                    "normalized_column": normalized,
+                    "object_count": len(objects),
+                    "objects": " | ".join(objects[:8]),
+                }
+            )
+    frame = pd.DataFrame(rows)
+    if not frame.empty:
+        frame = frame.sort_values(["object_count", "normalized_column"], ascending=[False, True], ignore_index=True)
+    return frame
+
+
+def _read_metadata_query(
+    connection: Any,
+    query_name: str,
+    reader: Callable[[str, Any], Any],
+    warnings_out: list[str],
+    required: bool = False,
+) -> Any:
+    try:
+        return reader(SCHEMA_DISCOVERY_SQL[query_name], connection)
+    except Exception as exc:
+        if required:
+            raise PreflightError(
+                "Cosmos schema discovery failed",
+                [f"{query_name}: {type(exc).__name__}: {sanitize_exception_text(exc)}"],
+                ["Grant read access to INFORMATION_SCHEMA metadata; no patient rows are requested."],
+            ) from exc
+        warnings_out.append(f"{query_name} metadata unavailable: {type(exc).__name__}: {sanitize_exception_text(exc)}")
+        return pd.DataFrame()
+
+
+def discover_cosmos_schema(
+    connection: Any,
+    read_sql: Callable[[str, Any], Any] | None = None,
+) -> dict[str, Any]:
+    reader = read_sql or pd.read_sql_query
+    discovery_warnings: list[str] = []
+    database = _read_metadata_query(connection, "database", reader, discovery_warnings)
+    columns = _read_metadata_query(connection, "columns", reader, discovery_warnings, required=True)
+    if columns.empty:
+        raise PreflightError(
+            "Cosmos schema discovery returned no objects",
+            ["INFORMATION_SCHEMA.COLUMNS returned zero accessible application columns"],
+            ["Confirm the connection database and metadata permissions."],
+        )
+    keys = _read_metadata_query(connection, "keys", reader, discovery_warnings)
+    foreign_keys = _read_metadata_query(connection, "foreign_keys", reader, discovery_warnings)
+    synonyms = _read_metadata_query(connection, "synonyms", reader, discovery_warnings)
+    cohort_modules = _read_metadata_query(connection, "cohort_modules", reader, discovery_warnings)
+    object_dependencies = _read_metadata_query(connection, "object_dependencies", reader, discovery_warnings)
+    candidates, candidate_columns = build_schema_discovery_candidates(columns, keys)
+    shared_keys = build_shared_key_hints(columns)
+    return {
+        "version": SCHEMA_DISCOVERY_VERSION,
+        "database": database,
+        "columns": columns,
+        "keys": keys,
+        "foreign_keys": foreign_keys,
+        "synonyms": synonyms,
+        "cohort_modules": cohort_modules,
+        "object_dependencies": object_dependencies,
+        "candidates": candidates,
+        "candidate_columns": candidate_columns,
+        "shared_keys": shared_keys,
+        "warnings": discovery_warnings,
+    }
+
+
+# These queries are intentionally frozen in the production file after reviewing the
+# metadata-only discovery packet. Each query may use multiple raw tables and CTEs, but
+# must return the canonical columns documented below. An empty mapping is a deliberate
+# hard gate: production cannot silently substitute a wide, preconstructed cohort.
+EMBEDDED_RAW_SOURCE_SQL: dict[str, str] = {}
+RAW_SQL_TOP_TOKEN = "/*METABOLIC_TOP*/"
+RAW_REQUIRED_SOURCES = ("patients", "procedures", "medications", "measurements")
+RAW_OPTIONAL_SOURCES = ("encounters", "diagnoses")
+RAW_REQUIRED_COLUMNS: dict[str, set[str]] = {
+    "patients": {"patient_id", "center_id", "observation_start_date", "observation_end_date"},
+    "procedures": {"patient_id", "procedure_date", "procedure_code"},
+    "medications": {"patient_id"},
+    "measurements": {"patient_id", "measurement_date", "raw_value", "unit", "source_concept"},
+    "encounters": {"patient_id", "encounter_date"},
+    "diagnoses": {"patient_id", "diagnosis_date", "diagnosis_code"},
+}
+RAW_DATE_COLUMNS = (
+    "observation_start_date", "observation_end_date", "administrative_end_date", "procedure_date",
+    "fill_date", "administration_date", "medication_start_date", "medication_end_date",
+    "measurement_date", "encounter_date", "diagnosis_date",
+)
+
+
+def validate_embedded_raw_sql(sql_contract: Mapping[str, str]) -> None:
+    missing_queries = sorted(set(RAW_REQUIRED_SOURCES).difference(sql_contract))
+    if missing_queries:
+        raise PreflightError(
+            "Reviewed raw-source SQL is not yet embedded",
+            ["Missing canonical query: " + name for name in missing_queries],
+            [
+                "Run --schema-discovery on the Cosmos VM and return the seven metadata PNG pages.",
+                "After the raw joins and index-event rules are reviewed, freeze their CTEs in "
+                "EMBEDDED_RAW_SOURCE_SQL. No premade cohort table is required.",
+            ],
+        )
+    unexpected = sorted(set(sql_contract).difference(set(RAW_REQUIRED_SOURCES) | set(RAW_OPTIONAL_SOURCES)))
+    if unexpected:
+        raise PreflightError("Embedded raw-source SQL contains unknown domains", unexpected)
+    issues: list[str] = []
+    for logical_name, query in sql_contract.items():
+        normalized = normalize_sql(str(query))
+        if not normalized:
+            issues.append(f"{logical_name}: query is empty")
+        if RAW_SQL_TOP_TOKEN not in str(query):
+            issues.append(f"{logical_name}: missing bounded-run token {RAW_SQL_TOP_TOKEN}")
+        if re.search(r"\b(?:dbo\s*\.\s*)?(?:mbscohort|glp1cohort)\b", normalized, re.I):
+            issues.append(f"{logical_name}: references a forbidden premade cohort object")
+    if issues:
+        raise PreflightError(
+            "Embedded raw-source SQL contract is invalid",
+            issues,
+            ["Every production query must be an explicit raw-table query with a bounded-run TOP token."],
+        )
+
+
+def materialize_raw_sql(query: str, limit: int | None) -> str:
+    top_clause = f"TOP ({int(limit)}) " if limit is not None else ""
+    return str(query).replace(RAW_SQL_TOP_TOKEN, top_clause)
+
+
+def canonicalize_raw_source_frame(frame: Any, logical_name: str) -> Any:
+    result = frame.copy()
+    result.columns = [str(column).lower() for column in result.columns]
+    duplicate_columns = sorted({column for column in result.columns if list(result.columns).count(column) > 1})
+    if duplicate_columns:
+        raise PreflightError(
+            f"{logical_name.title()} raw query returned duplicate canonical columns",
+            duplicate_columns,
+        )
+    missing = sorted(RAW_REQUIRED_COLUMNS[logical_name].difference(result.columns))
+    if logical_name == "patients" and not ({"age", "birth_year", "birth_date"}.intersection(result.columns)):
+        missing.append("one of age, birth_year, or birth_date")
+    if logical_name == "medications":
+        if not ({"ingredient", "medication_concept"}.intersection(result.columns)):
+            missing.append("one of ingredient or medication_concept")
+        coverage_shapes = (
+            {"fill_date", "days_supply"},
+            {"administration_date"},
+            {"medication_start_date", "medication_end_date"},
+        )
+        if not any(shape.issubset(result.columns) for shape in coverage_shapes):
+            missing.append(
+                "auditable coverage: fill_date+days_supply, administration_date, or medication_start_date+medication_end_date"
+            )
+    if missing:
+        raise PreflightError(
+            f"{logical_name.title()} raw query lacks canonical columns",
+            ["Missing: " + name for name in missing],
+            ["Correct the embedded SQL alias list. Do not infer missing timing fields in Python."],
+        )
+    if result.empty:
+        raise PreflightError(f"{logical_name.title()} raw query returned zero rows")
+    result["patient_id"] = result["patient_id"].astype("string")
+    for column in RAW_DATE_COLUMNS:
+        if column in result:
+            result[column] = pd.to_datetime(result[column], errors="coerce").dt.normalize()
+    if "source_table" not in result:
+        result["source_table"] = f"embedded_raw_sql:{logical_name}"
+    return result
+
+
+def empty_optional_raw_source(logical_name: str) -> Any:
+    return pd.DataFrame(columns=sorted(RAW_REQUIRED_COLUMNS[logical_name] | {"source_table"}))
+
+
+def load_embedded_raw_bundle(
+    connection: Any,
+    cfg: RunConfig,
+    sql_contract: Mapping[str, str] | None = None,
+    read_sql: Callable[[str, Any], Any] | None = None,
+    preflight_only: bool = False,
+) -> "DataBundle":
+    contract = dict(EMBEDDED_RAW_SOURCE_SQL if sql_contract is None else sql_contract)
+    validate_embedded_raw_sql(contract)
+    reader = read_sql or pd.read_sql_query
+    limit = cfg.smoke_query_limit if cfg.smoke else (2000 if preflight_only or cfg.mode == "preflight-only" else None)
+    frames: dict[str, Any] = {}
+    executed_sql: dict[str, str] = {}
+    for logical_name in (*RAW_REQUIRED_SOURCES, *RAW_OPTIONAL_SOURCES):
+        if logical_name not in contract:
+            frames[logical_name] = empty_optional_raw_source(logical_name)
+            continue
+        query = materialize_raw_sql(contract[logical_name], limit)
+        try:
+            raw_frame = reader(query, connection)
+        except Exception as exc:
+            raise PreflightError(
+                f"{logical_name.title()} raw Cosmos query failed",
+                [f"{type(exc).__name__}: {sanitize_exception_text(exc)}"],
+                ["Review the embedded CTE and the metadata-only dependency map."],
+            ) from exc
+        frames[logical_name] = canonicalize_raw_source_frame(raw_frame, logical_name)
+        executed_sql[logical_name] = query
+    bundle = DataBundle(
+        patients=frames["patients"],
+        procedures=frames["procedures"],
+        medications=frames["medications"],
+        measurements=frames["measurements"],
+        encounters=frames["encounters"],
+        diagnoses=frames["diagnoses"],
+        metadata={
+            "source_mode": "cosmos_embedded_raw_sql",
+            "sql_contract_version": SQL_CONTRACT_VERSION,
+            "sql": executed_sql,
+            "query_fingerprint": digest({key: normalize_sql(value) for key, value in executed_sql.items()}),
+            "schema_fingerprint": digest({key: frame_schema(value) for key, value in frames.items()}),
+            "source_row_counts": {key: len(value) for key, value in frames.items()},
+            "strict_raw_event_contract": True,
+        },
+    )
+    bundle.metadata["preflight"] = validate_data_bundle(bundle, preflight_only=preflight_only)
+    return bundle
+
+
+DIRECT_SOURCE_SCHEMA = "dbo"
+DIRECT_MBS_TABLE = "MBSCohort"
+DIRECT_GLP1_TABLE = "GLP1Cohort"
+CENTER_UNAVAILABLE = "CENTER_UNAVAILABLE"
+
+WIDE_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "patient_id": ("PatKey", "PatientKey", "PatientID"),
     "center_id": (
-        "CenterID", "CenterKey", "OrganizationID", "OrganizationKey", "SiteID", "SiteKey",
-        "FacilityID", "FacilityKey", "ContributingOrganizationID", "HealthSystemID",
+        "CenterID", "CenterKey", "SiteID", "SiteKey", "OrganizationID",
+        "OrganizationKey", "FacilityID", "FacilityKey", "HealthSystemID",
     ),
-    "age": ("AgeAtEvent", "AgeAtIndex", "Age", "PatientAge"),
-    "birth_year": ("BirthYear", "YearOfBirth"),
-    "sex": ("Sex", "Gender", "AdministrativeSex"),
-    "race": ("FirstRace", "Race", "RaceCategory"),
-    "ethnicity": ("Ethnicity", "EthnicityCategory"),
-    "coverage": ("CoverageClass", "PayerClass", "InsuranceClass"),
-    "observation_start_date": ("ObservationStartDate", "CoverageStartDate", "FirstEncounterDate"),
-    "observation_end_date": ("ObservationEndDate", "LastObservedDate", "LastEncounterDate", "CoverageEndDate"),
-    "administrative_end_date": ("AdministrativeEndDate", "DataThroughDate", "StudyEndDate", "ExtractThroughDate"),
-    "procedure_date": ("ProcDateValue", "ProcedureDateValue", "ProcedureDate", "ServiceDate", "IndexProcedureDate"),
-    "procedure_code": ("CptCode", "CPTCode", "ProcedureCode", "ProcedureConceptCode", "CPT"),
-    "procedure_concept_id": ("ProcedureConceptID", "ProcedureID", "ProcedureCodeID"),
-    "ingredient": ("Ingredient", "IngredientName", "GenericName", "MedicationIngredient", "GLP1Name"),
-    "medication_concept": ("RxNorm", "RxCUI", "RxNormConceptID", "MedicationConceptID", "NDC", "DrugConceptID"),
-    "route": ("Route", "MedicationRoute", "GLP1Route"),
-    "formulation": ("Formulation", "DoseForm", "MedicationForm"),
-    "fill_date": ("FillDate", "DispenseDate", "SoldDate", "ClaimDate"),
-    "administration_date": ("AdministrationDate", "AdminDate", "MedicationAdministrationDate"),
-    "medication_start_date": ("MedicationStartDate", "EpisodeStartDate", "GLP1StartDate", "StartDate"),
-    "medication_end_date": ("MedicationEndDate", "EpisodeEndDate", "GLP1EndDate", "StopDate", "DiscontinueDate"),
-    "days_supply": ("DaysSupply", "DaysSupplied", "DaySupply"),
-    "administration_interval_days": ("AdministrationIntervalDays", "ExpectedCoverageDays", "DoseIntervalDays"),
-    "source_type": ("SourceType", "MedicationSourceType", "RecordType", "ExposureEvidenceType"),
-    "source_id": ("MedicationRecordID", "OrderID", "DispenseID", "AdministrationID", "RecordID"),
-    "dose": ("Dose", "AdministeredDose", "OrderedDose", "StrengthValue"),
-    "dose_unit": ("DoseUnit", "StrengthUnit", "MostRecentDoseUnit"),
-    "quantity": ("Quantity", "DispenseQuantity"),
-    "refills": ("Refills", "RefillCount", "AuthorizedRefills"),
-    "measurement_date": ("MeasurementDate", "ResultDate", "SpecimenDate", "ObservedDate", "RecordedDate"),
-    "raw_value": ("RawValue", "ResultValue", "NumericValue", "MeasurementValue", "ValueAsNumber"),
-    "unit": ("Unit", "ResultUnit", "MeasurementUnit", "UnitSourceValue"),
-    "source_concept": ("LOINC", "LoincCode", "MeasurementConcept", "MeasurementConceptID", "ComponentName"),
-    "measurement_type": ("MeasurementType", "ResultType", "ComponentType"),
-    "encounter_date": ("EncounterDate", "ContactDate", "VisitDate", "ServiceDate"),
-    "diagnosis_date": ("DiagnosisDate", "ConditionStartDate", "RecordedDate"),
-    "diagnosis_code": ("DiagnosisCode", "ICD10", "ConditionConceptID", "DiagnosisConceptID"),
-    "postop_incretin_flag": ("PostOpGLP1", "PostoperativeGLP1", "PostopIncretinFlag"),
-    "prior_mbs_flag": ("PMH_PriorMBS", "PriorMBS"),
-    "dialysis_transplant_flag": ("PMH_dialysis_transplant", "PriorDialysisTransplant"),
-    "diabetes_flag": ("PMH_DM2", "T2D", "Type2Diabetes"),
-    "smoking": ("SmokingStatus", "TobaccoStatus"),
+    "procedure_date": ("ProcDateValue", "ProcedureDateValue", "IndexProcedureDate"),
+    "procedure_code": ("CptCode", "CPTCode", "ProcedureCode"),
+    "age": ("AgeAtEvent", "AgeAtIndex"),
+    "sex": ("Sex", "Gender"),
+    "race": ("FirstRace", "Race"),
+    "ethnicity": ("Ethnicity",),
+    "coverage": ("CoverageClass", "PayerClass"),
+    "prior_glp1": ("PriorGLP1", "PreOpGLP1"),
+    "postop_glp1": ("PostOpGLP1", "PostoperativeGLP1"),
+    "glp1_start": ("GLP1StartDate", "IncretinStartDate", "MedicationStartDate"),
+    "glp1_end": ("GLP1EndDate", "IncretinEndDate", "MedicationEndDate"),
+    "glp1_duration": ("GLP1Duration", "GLP1DurationDays", "MedicationDurationDays"),
+    "glp1_name": ("GLP1Name", "IncretinName", "MedicationName", "IngredientName"),
+    "glp1_route": ("GLP1Route", "MedicationRoute", "Route"),
+    "dose": ("MostRecentDose", "MaxGLP1Dose", "MaximumGLP1Dose"),
+    "dose_unit": ("MostRecentDoseUnit", "GLP1DoseUnit", "DoseUnit"),
+    "prior_mbs": ("PMH_PriorMBS", "PriorMBS"),
+    "mbs_during_glp1": ("MBSduringGLP1", "MBSDuringGLP1"),
+    "dialysis_transplant": ("PMH_dialysis_transplant", "PriorDialysisTransplant"),
+    "diabetes": ("PMH_DM2", "T2D", "Type2Diabetes"),
     "hypertension": ("PMH_hypertension", "Hypertension"),
-    "dyslipidemia": ("PMH_dyslipidemia", "Dyslipidemia"),
     "osa": ("PMH_OSA", "OSA"),
+    "dyslipidemia": ("PMH_dyslipidemia", "Dyslipidemia"),
     "insulin": ("InsulinStatus", "BaselineInsulin"),
     "biguanide": ("BiguanideStatus", "MetforminStatus"),
     "sglt2": ("SGLT2Status",),
     "svi": ("SviOverall", "SVIOverall"),
     "ruca": ("RUCA",),
     "state": ("StateOrProvince", "State"),
+    "active_end_days": ("ActiveEndInterval", "ObservableFollowupDays", "FollowupDays"),
+    "administrative_end_date": ("AdministrativeEndDate", "DataThroughDate", "StudyEndDate"),
 }
 
-
-@dataclass(frozen=True)
-class SourceSelection:
-    logical_name: str
-    schema_name: str
-    table_name: str
-    roles: dict[str, str]
-    score: int
-    evidence: str = ""
-
-    @property
-    def qualified_name(self) -> str:
-        return f"{self.schema_name}.{self.table_name}"
+WIDE_TARGET_FIELDS: tuple[tuple[str, int, tuple[str, ...], str], ...] = (
+    ("bmi", 0, ("BMIatEvent", "BMIAtIndex", "BaselineBMI"), "kg/m2"),
+    ("bmi", 3, ("BMI3mPostEvent",), "kg/m2"),
+    ("bmi", 6, ("BMI6mPostEvent",), "kg/m2"),
+    ("bmi", 12, ("BMI12mPostEvent",), "kg/m2"),
+    ("bmi", 24, ("BMI2yPostEvent", "BMI24mPostEvent"), "kg/m2"),
+    ("bmi", 36, ("BMI3yPostEvent", "BMI36mPostEvent"), "kg/m2"),
+    ("bmi", 48, ("BMI4yPostEvent", "BMI48mPostEvent"), "kg/m2"),
+    ("bmi", 60, ("BMI5yPostEvent", "BMI60mPostEvent"), "kg/m2"),
+    ("hba1c", 0, ("HbA1cAtEvent", "HbA1cAtIndex", "BaselineHbA1c"), "%"),
+    ("hba1c", 12, ("HbA1c12mPostEvent",), "%"),
+    ("hba1c", 24, ("HbA1c2yPostEvent", "HbA1c24mPostEvent"), "%"),
+    ("hba1c", 36, ("HbA1c3yPostEvent", "HbA1c36mPostEvent"), "%"),
+    ("hba1c", 48, ("HbA1c4yPostEvent", "HbA1c48mPostEvent"), "%"),
+    ("hba1c", 60, ("HbA1c5yPostEvent", "HbA1c60mPostEvent"), "%"),
+)
 
 
 @dataclass
@@ -1200,202 +1795,370 @@ class DataBundle:
         }
 
 
-def role_matches(columns: Sequence[str]) -> dict[str, str]:
+def resolve_wide_fields(frame: Any, logical_name: str) -> dict[str, str]:
     normalized: dict[str, list[str]] = defaultdict(list)
-    for column in columns:
+    for column in frame.columns:
         normalized[normalize_identifier(column)].append(str(column))
     resolved: dict[str, str] = {}
-    for role, aliases in ROLE_ALIASES.items():
-        matches: list[str] = []
+    ambiguities: list[str] = []
+    for canonical, aliases in WIDE_FIELD_ALIASES.items():
         for alias in aliases:
-            matches.extend(normalized.get(normalize_identifier(alias), []))
-        matches = sorted(set(matches))
-        if len(matches) == 1:
-            resolved[role] = matches[0]
+            matches = sorted(set(normalized.get(normalize_identifier(alias), [])))
+            if len(matches) == 1:
+                resolved[canonical] = matches[0]
+                break
+            if len(matches) > 1:
+                ambiguities.append(f"{canonical}: {matches}")
+                break
+    target_columns: dict[str, str] = {}
+    for outcome, month, aliases, _ in WIDE_TARGET_FIELDS:
+        canonical = f"target_{outcome}_{month}"
+        for alias in aliases:
+            matches = sorted(set(normalized.get(normalize_identifier(alias), [])))
+            if len(matches) == 1:
+                target_columns[canonical] = matches[0]
+                break
+            if len(matches) > 1:
+                ambiguities.append(f"{canonical}: {matches}")
+                break
+    if ambiguities:
+        raise PreflightError(
+            f"{logical_name} wide-column mapping is ambiguous",
+            ambiguities,
+            ["Keep only one reviewed alias for each listed field in the direct cohort query."],
+        )
+    resolved.update(target_columns)
+    required = {
+        "MBSCohort": {"patient_id", "procedure_date", "procedure_code", "age", "active_end_days", "target_bmi_0"},
+        "GLP1Cohort": {"patient_id", "glp1_start", "glp1_name", "age", "active_end_days", "target_bmi_0"},
+    }[logical_name]
+    missing = sorted(required.difference(resolved))
+    if logical_name == "GLP1Cohort" and not ({"glp1_end", "glp1_duration"}.intersection(resolved)):
+        missing.append("one of glp1_end or glp1_duration")
+    if missing:
+        raise PreflightError(
+            f"{logical_name} direct query lacks required columns",
+            ["Missing wide field: " + item for item in missing],
+            [f"The script queried {logical_name} itself, but the returned schema cannot construct that cohort."],
+        )
+    patient_values = frame[resolved["patient_id"]].dropna().astype(str)
+    duplicate_patients = patient_values.loc[patient_values.duplicated(keep=False)].unique()
+    if len(duplicate_patients):
+        raise PreflightError(
+            f"{logical_name} direct query is not one row per patient",
+            [f"{len(duplicate_patients)} patient identifiers occur on multiple wide rows"],
+            [
+                "The wide-column interpretation requires one reviewed index row per patient and source. "
+                "Deduplicate the source query with an explicit, clinically reviewed index-event rule."
+            ],
+        )
     return resolved
 
 
-def discover_database_schema(connection: Any) -> Any:
-    query = """
-SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, ORDINAL_POSITION, DATA_TYPE,
-       CHARACTER_MAXIMUM_LENGTH, IS_NULLABLE
-FROM INFORMATION_SCHEMA.COLUMNS
-ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION
-"""
-    return pd.read_sql_query(query, connection)
+def direct_source_names() -> tuple[str, str, str]:
+    schema = os.environ.get("METABOLIC_SOURCE_SCHEMA", DIRECT_SOURCE_SCHEMA)
+    mbs_table = os.environ.get("METABOLIC_MBS_TABLE", DIRECT_MBS_TABLE)
+    glp1_table = os.environ.get("METABOLIC_GLP1_TABLE", DIRECT_GLP1_TABLE)
+    for value in (schema, mbs_table, glp1_table):
+        quote_identifier(value)
+    return schema, mbs_table, glp1_table
 
 
-def split_qualified_table(value: str, default_schema: str = "dbo") -> tuple[str, str]:
-    parts = str(value).split(".")
-    if len(parts) == 1:
-        return default_schema, parts[0]
-    if len(parts) == 2:
-        return parts[0], parts[1]
-    raise ValueError(f"Invalid table name: {value!r}")
-
-
-def metadata_table_roles(metadata: Any) -> list[dict[str, Any]]:
-    summaries: list[dict[str, Any]] = []
-    for (schema_name, table_name), group in metadata.groupby(["TABLE_SCHEMA", "TABLE_NAME"], sort=True):
-        columns = [str(item) for item in group["COLUMN_NAME"]]
-        roles = role_matches(columns)
-        summaries.append(
-            {
-                "schema_name": str(schema_name),
-                "table_name": str(table_name),
-                "roles": roles,
-                "columns": columns,
-            }
-        )
-    return summaries
-
-
-def selection_requirements(logical_name: str) -> tuple[set[str], tuple[set[str], ...]]:
-    if logical_name == "patients":
-        return {"patient_id", "center_id", "observation_start_date", "observation_end_date"}, (
-            {"age"}, {"birth_year"},
-        )
-    if logical_name == "procedures":
-        return {"patient_id", "procedure_date", "procedure_code"}, ()
-    if logical_name == "measurements":
-        return {"patient_id", "measurement_date", "raw_value", "unit", "source_concept"}, ()
-    if logical_name == "encounters":
-        return {"patient_id", "encounter_date"}, ()
-    if logical_name == "diagnoses":
-        return {"patient_id", "diagnosis_date", "diagnosis_code"}, ()
-    if logical_name == "medications":
-        return {"patient_id"}, (
-            {"ingredient"}, {"medication_concept"},
-        )
-    raise ValueError(f"Unknown source contract: {logical_name}")
-
-
-def medication_evidence(roles: Mapping[str, str], table_name: str) -> str | None:
-    lowered = table_name.lower()
-    if {"fill_date", "days_supply"}.issubset(roles):
-        return "fill_plus_days_supply"
-    if "administration_date" in roles and (
-        "administration_interval_days" in roles or re.search(r"admin|mar", lowered)
-    ):
-        return "administration_plus_interval"
-    if {"medication_start_date", "medication_end_date"}.issubset(roles) and (
-        "source_type" in roles or re.search(r"validated|exposure|episode", lowered)
-    ):
-        return "validated_explicit_interval"
-    return None
-
-
-def select_source_table(
-    metadata: Any,
-    logical_name: str,
-    environment_variable: str,
-    required: bool = True,
-) -> SourceSelection | None:
-    summaries = metadata_table_roles(metadata)
-    override = os.environ.get(environment_variable)
-    if override:
-        requested_schema, requested_table = split_qualified_table(override)
-        summaries = [
-            item for item in summaries
-            if item["schema_name"].lower() == requested_schema.lower()
-            and item["table_name"].lower() == requested_table.lower()
-        ]
-        if not summaries:
-            raise PreflightError(
-                f"{logical_name.title()} source table was not found",
-                [f"{environment_variable} names {override}, but it is absent from INFORMATION_SCHEMA.COLUMNS"],
-            )
-    required_roles, alternative_roles = selection_requirements(logical_name)
-    candidates: list[SourceSelection] = []
-    for item in summaries:
-        roles = item["roles"]
-        if not required_roles.issubset(roles):
-            continue
-        if alternative_roles and not any(group.issubset(roles) for group in alternative_roles):
-            continue
-        evidence = ""
-        if logical_name == "medications":
-            medication_mode = medication_evidence(roles, item["table_name"])
-            if medication_mode is None:
-                continue
-            evidence = medication_mode
-        score = len(roles)
-        name = item["table_name"].lower()
-        preferred_tokens = {
-            "patients": ("patient", "person", "demographic"),
-            "procedures": ("procedure", "surgery"),
-            "medications": ("med", "drug", "pharm", "dispens", "admin", "exposure"),
-            "measurements": ("measurement", "lab", "vital", "result"),
-            "encounters": ("encounter", "visit"),
-            "diagnoses": ("diagnosis", "condition"),
-        }[logical_name]
-        score += 4 * sum(token in name for token in preferred_tokens)
-        candidates.append(
-            SourceSelection(
-                logical_name=logical_name,
-                schema_name=item["schema_name"],
-                table_name=item["table_name"],
-                roles=dict(roles),
-                score=score,
-                evidence=evidence,
-            )
-        )
-    if not candidates:
-        if required:
-            field_text = ", ".join(sorted(required_roles))
-            extra = " and audited coverage evidence" if logical_name == "medications" else ""
-            raise PreflightError(
-                f"{logical_name.title()} source contract is unavailable",
-                [f"No single source table resolves required roles: {field_text}{extra}"],
-                [f"Set {environment_variable} only after a source table satisfying the contract has been audited."],
-            )
-        return None
-    candidates.sort(key=lambda item: (-item.score, item.qualified_name.lower()))
-    if len(candidates) > 1 and candidates[0].score == candidates[1].score and not override:
-        tied = ", ".join(item.qualified_name for item in candidates if item.score == candidates[0].score)
-        raise PreflightError(
-            f"{logical_name.title()} source selection is ambiguous",
-            ["Equally supported source tables: " + tied],
-            [f"Set {environment_variable} to the reviewed source table."],
-        )
-    return candidates[0]
-
-
-def build_source_sql(selection: SourceSelection, limit: int | None = None) -> str:
-    selected = [
-        f"    {quote_identifier(source)} AS {quote_identifier(role)}"
-        for role, source in sorted(selection.roles.items())
-    ]
+def build_direct_source_sql(schema: str, table: str, limit: int | None = None) -> str:
     top = f"TOP ({int(limit)}) " if limit is not None else ""
+    order = "\nORDER BY [PatKey]" if limit is not None else ""
     return (
-        f"/* {SQL_CONTRACT_VERSION}: {selection.logical_name} */\n"
-        f"SELECT {top}\n" + ",\n".join(selected) + "\n"
-        f"FROM {quote_identifier(selection.schema_name)}.{quote_identifier(selection.table_name)}"
+        f"/* {LEGACY_WIDE_CONTRACT_VERSION}: direct wide cohort input */\n"
+        f"SELECT {top}*\n"
+        f"FROM {quote_identifier(schema)}.{quote_identifier(table)}{order}"
     )
 
 
-def canonicalize_source_frame(frame: Any, selection: SourceSelection) -> Any:
-    result = frame.copy()
-    result["source_table"] = selection.qualified_name
-    if "patient_id" in result:
-        result["patient_id"] = result["patient_id"].astype("string")
+def load_direct_wide_tables(
+    connection: Any,
+    cfg: RunConfig,
+    read_sql: Callable[[str, Any], Any] | None = None,
+    preflight_only: bool = False,
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+    reader = read_sql or pd.read_sql_query
+    schema, mbs_table, glp1_table = direct_source_names()
+    limit = cfg.smoke_query_limit if cfg.smoke else (2000 if preflight_only or cfg.mode == "preflight-only" else None)
+    sources = {
+        "MBSCohort": (mbs_table, build_direct_source_sql(schema, mbs_table, limit)),
+        "GLP1Cohort": (glp1_table, build_direct_source_sql(schema, glp1_table, limit)),
+    }
+    frames: dict[str, Any] = {}
+    sql: dict[str, str] = {}
+    qualified: dict[str, str] = {}
+    failures: list[str] = []
+    for logical_name, (table_name, query) in sources.items():
+        try:
+            frame = reader(query, connection)
+        except Exception as exc:
+            failures.append(f"{logical_name}: {type(exc).__name__}: {sanitize_exception_text(exc)}")
+            continue
+        if frame.empty:
+            failures.append(f"{logical_name}: the direct query returned zero rows")
+            continue
+        frames[logical_name] = frame.drop_duplicates().reset_index(drop=True)
+        sql[logical_name] = query
+        qualified[logical_name] = f"{schema}.{table_name}"
+    if failures:
+        raise PreflightError(
+            "Cosmos direct cohort query failed",
+            failures,
+            [
+                "The quarantined feasibility helper queried dbo.MBSCohort and dbo.GLP1Cohort through pyodbc.",
+                "Production query_cosmos does not call this helper or depend on either premade cohort.",
+            ],
+        )
+    return frames, sql, qualified
+
+
+def wide_value(row: Any, resolved: Mapping[str, str], canonical: str, default: Any = math.nan) -> Any:
+    column = resolved.get(canonical)
+    return row[column] if column is not None and column in row else default
+
+
+def wide_numeric(value: Any, default: float = math.nan) -> float:
+    try:
+        numeric = float(value)
+        return numeric if math.isfinite(numeric) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def wide_date(value: Any) -> Any:
+    parsed = pd.to_datetime(value, errors="coerce")
+    return pd.Timestamp(parsed).normalize() if pd.notna(parsed) else pd.NaT
+
+
+def reported_medication_end(start: Any, end: Any, duration: Any) -> Any:
+    start_date = wide_date(start)
+    end_date = wide_date(end)
+    if pd.notna(end_date):
+        return end_date
+    duration_days = wide_numeric(duration)
+    if pd.notna(start_date) and math.isfinite(duration_days) and duration_days >= 1:
+        return start_date + pd.Timedelta(days=int(round(duration_days)) - 1)
+    return pd.NaT
+
+
+def merge_patient_payload(existing: dict[str, Any], candidate: Mapping[str, Any]) -> None:
+    for column in ("observation_start_date",):
+        values = [wide_date(existing.get(column)), wide_date(candidate.get(column))]
+        valid = [value for value in values if pd.notna(value)]
+        existing[column] = min(valid) if valid else pd.NaT
+    for column in ("observation_end_date", "administrative_end_date"):
+        values = [wide_date(existing.get(column)), wide_date(candidate.get(column))]
+        valid = [value for value in values if pd.notna(value)]
+        existing[column] = max(valid) if valid else pd.NaT
     for column in (
-        "observation_start_date", "observation_end_date", "administrative_end_date", "procedure_date",
-        "fill_date", "administration_date", "medication_start_date", "medication_end_date",
-        "measurement_date", "encounter_date", "diagnosis_date",
+        "postop_incretin_flag", "prior_mbs_flag", "dialysis_transplant_flag", "diabetes_flag",
+        "mbs_during_incretin_flag", "hypertension", "dyslipidemia", "osa", "insulin", "biguanide", "sglt2",
     ):
-        if column in result:
-            result[column] = pd.to_datetime(result[column], errors="coerce").dt.normalize()
-    return result
+        existing[column] = max(wide_numeric(existing.get(column), 0.0), wide_numeric(candidate.get(column), 0.0))
+    if existing.get("center_id") == CENTER_UNAVAILABLE and candidate.get("center_id") != CENTER_UNAVAILABLE:
+        existing["center_id"] = candidate.get("center_id")
+    for column in ("birth_year", "sex", "race", "ethnicity", "coverage", "svi", "ruca", "state"):
+        current = existing.get(column)
+        replacement = candidate.get(column)
+        if current is None or pd.isna(current) or str(current).lower() in {"", "nan", "unknown"}:
+            existing[column] = replacement
+    sources = sorted(set(str(existing.get("source_table", "")).split("|") + str(candidate.get("source_table", "")).split("|")))
+    existing["source_table"] = "|".join(item for item in sources if item)
 
 
-def source_schema_signature(metadata: Any, selections: Mapping[str, SourceSelection | None]) -> str:
-    selected_names = {item.qualified_name for item in selections.values() if item is not None}
-    rows = metadata.loc[
-        metadata.apply(lambda row: f"{row['TABLE_SCHEMA']}.{row['TABLE_NAME']}" in selected_names, axis=1)
-    ].copy()
-    fields = ["TABLE_SCHEMA", "TABLE_NAME", "COLUMN_NAME", "ORDINAL_POSITION", "DATA_TYPE", "IS_NULLABLE"]
-    return digest(rows[fields].astype(str).to_dict(orient="records"))
+def wide_tables_to_data_bundle(
+    frames: Mapping[str, Any],
+    sql: Mapping[str, str],
+    qualified_names: Mapping[str, str],
+) -> DataBundle:
+    mbs = frames["MBSCohort"].copy()
+    glp1 = frames["GLP1Cohort"].copy()
+    resolved_by_source = {
+        "MBSCohort": resolve_wide_fields(mbs, "MBSCohort"),
+        "GLP1Cohort": resolve_wide_fields(glp1, "GLP1Cohort"),
+    }
+    patients_by_id: dict[str, dict[str, Any]] = {}
+    procedure_rows: list[dict[str, Any]] = []
+    medication_rows: list[dict[str, Any]] = []
+    measurement_rows: list[dict[str, Any]] = []
+    center_values: list[str] = []
+
+    for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1)):
+        resolved = resolved_by_source[logical_name]
+        source_table = qualified_names[logical_name]
+        index_field = "procedure_date" if logical_name == "MBSCohort" else "glp1_start"
+        for row_number, (_, row) in enumerate(frame.iterrows()):
+            patient_raw = wide_value(row, resolved, "patient_id", "")
+            if pd.isna(patient_raw) or not str(patient_raw).strip():
+                continue
+            patient_id = str(patient_raw)
+            index_date = wide_date(wide_value(row, resolved, index_field))
+            active_end_days = wide_numeric(wide_value(row, resolved, "active_end_days"))
+            if pd.isna(index_date) or not math.isfinite(active_end_days) or active_end_days < 0:
+                continue
+            observation_end = index_date + pd.Timedelta(days=int(active_end_days))
+            supplied_admin_end = wide_date(wide_value(row, resolved, "administrative_end_date"))
+            administrative_end = supplied_admin_end if pd.notna(supplied_admin_end) else observation_end
+            prior_glp1 = wide_numeric(wide_value(row, resolved, "prior_glp1"), 0.0)
+            observation_start = index_date - pd.Timedelta(days=365) if prior_glp1 == 0 else index_date
+            age = wide_numeric(wide_value(row, resolved, "age"))
+            birth_year = int(index_date.year - age) if math.isfinite(age) else np.nan
+            center_raw = wide_value(row, resolved, "center_id", CENTER_UNAVAILABLE)
+            center_id = CENTER_UNAVAILABLE if pd.isna(center_raw) or not str(center_raw).strip() else str(center_raw)
+            if center_id != CENTER_UNAVAILABLE:
+                center_values.append(center_id)
+            candidate_patient = {
+                "patient_id": patient_id,
+                "center_id": center_id,
+                "age": np.nan,
+                "birth_year": birth_year,
+                "sex": str(wide_value(row, resolved, "sex", "Unknown")),
+                "race": str(wide_value(row, resolved, "race", "Unknown")),
+                "ethnicity": str(wide_value(row, resolved, "ethnicity", "Unknown")),
+                "coverage": str(wide_value(row, resolved, "coverage", "Unknown")),
+                "observation_start_date": observation_start,
+                "observation_end_date": observation_end,
+                "administrative_end_date": administrative_end,
+                "postop_incretin_flag": wide_numeric(wide_value(row, resolved, "postop_glp1"), 0.0),
+                "prior_mbs_flag": wide_numeric(wide_value(row, resolved, "prior_mbs"), 0.0),
+                "dialysis_transplant_flag": wide_numeric(wide_value(row, resolved, "dialysis_transplant"), 0.0),
+                "diabetes_flag": wide_numeric(wide_value(row, resolved, "diabetes"), 0.0),
+                "mbs_during_incretin_flag": wide_numeric(wide_value(row, resolved, "mbs_during_glp1"), 0.0),
+                "smoking": "Unknown",
+                "hypertension": wide_numeric(wide_value(row, resolved, "hypertension"), 0.0),
+                "dyslipidemia": wide_numeric(wide_value(row, resolved, "dyslipidemia"), 0.0),
+                "osa": wide_numeric(wide_value(row, resolved, "osa"), 0.0),
+                "insulin": wide_numeric(wide_value(row, resolved, "insulin"), 0.0),
+                "biguanide": wide_numeric(wide_value(row, resolved, "biguanide"), 0.0),
+                "sglt2": wide_numeric(wide_value(row, resolved, "sglt2"), 0.0),
+                "svi": wide_numeric(wide_value(row, resolved, "svi")),
+                "ruca": str(wide_value(row, resolved, "ruca", "Unknown")),
+                "state": str(wide_value(row, resolved, "state", "Unknown")),
+                "source_table": source_table,
+            }
+            source_prefix = "mbs" if logical_name == "MBSCohort" else "glp1"
+            source_specific = {
+                f"{source_prefix}__{key}": value
+                for key, value in candidate_patient.items()
+                if key != "patient_id"
+            }
+            if patient_id in patients_by_id:
+                merge_patient_payload(patients_by_id[patient_id], candidate_patient)
+                patients_by_id[patient_id].update(source_specific)
+            else:
+                patients_by_id[patient_id] = {**candidate_patient, **source_specific}
+
+            if logical_name == "MBSCohort":
+                procedure_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "procedure_date": index_date,
+                        "procedure_code": wide_value(row, resolved, "procedure_code", ""),
+                        "procedure_concept_id": wide_value(row, resolved, "procedure_code", ""),
+                        "source_table": source_table,
+                    }
+                )
+
+            medication_start = wide_date(wide_value(row, resolved, "glp1_start"))
+            medication_end = reported_medication_end(
+                medication_start,
+                wide_value(row, resolved, "glp1_end"),
+                wide_value(row, resolved, "glp1_duration"),
+            )
+            reported_exposure = logical_name == "GLP1Cohort" or any(
+                wide_numeric(wide_value(row, resolved, flag), 0.0) == 1
+                for flag in ("prior_glp1", "postop_glp1")
+            )
+            if reported_exposure and pd.notna(medication_start) and pd.notna(medication_end):
+                ingredient = wide_value(row, resolved, "glp1_name", "")
+                medication_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "ingredient": ingredient,
+                        "medication_concept": ingredient,
+                        "route": wide_value(row, resolved, "glp1_route", "unknown"),
+                        "formulation": "unknown",
+                        "medication_start_date": medication_start,
+                        "medication_end_date": medication_end,
+                        "source_type": "reported_wide_episode",
+                        "source_id": f"{logical_name}-{row_number}",
+                        "dose": wide_numeric(wide_value(row, resolved, "dose")),
+                        "dose_unit": wide_value(row, resolved, "dose_unit", ""),
+                        "source_table": source_table,
+                        "source_cohort": "surgery" if logical_name == "MBSCohort" else "incretin",
+                    }
+                )
+
+            for outcome, month, _, unit in WIDE_TARGET_FIELDS:
+                canonical = f"target_{outcome}_{month}"
+                source_column = resolved.get(canonical)
+                if source_column is None:
+                    continue
+                value = wide_numeric(row[source_column])
+                if not math.isfinite(value):
+                    continue
+                measurement_day = 0 if month == 0 else month_to_nominal_day(month)
+                if measurement_day > active_end_days:
+                    continue
+                measurement_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "measurement_date": index_date + pd.Timedelta(days=measurement_day),
+                        "measurement_type": outcome,
+                        "raw_value": value,
+                        "unit": unit,
+                        "source_concept": source_column + " (wide nominal horizon)",
+                        "source_table": source_table,
+                        "source_cohort": "surgery" if logical_name == "MBSCohort" else "incretin",
+                        "timing_precision": "nominal_horizon_from_wide_column" if month else "index_event_date",
+                    }
+                )
+
+    patients = pd.DataFrame(patients_by_id.values())
+    procedures = pd.DataFrame(procedure_rows).drop_duplicates()
+    medications = pd.DataFrame(medication_rows).drop_duplicates()
+    measurements = pd.DataFrame(measurement_rows).drop_duplicates()
+    encounters = pd.DataFrame(columns=["patient_id", "encounter_date", "source_table"])
+    diagnoses = pd.DataFrame(columns=["patient_id", "diagnosis_date", "diagnosis_code", "source_table"])
+    center_complete = bool(len(patients) and patients["center_id"].ne(CENTER_UNAVAILABLE).all())
+    center_validation_available = center_complete and len(set(center_values)) >= 3
+    limitations = [
+        "Outcome values come from fixed wide horizon columns; exact measurement timestamps and within-window counts are unavailable.",
+        "GLP1StartDate and GLP1EndDate are treated as one reported exposure interval; fill-level gaps and stockpiling cannot be audited.",
+        "Observation start is operationalized as 365 days before index when PriorGLP1 is zero; the wide tables do not expose exact enrollment start.",
+    ]
+    if not all("administrative_end_date" in resolved for resolved in resolved_by_source.values()):
+        limitations.append(
+            "ActiveEndInterval is treated as patient-specific observation and administrative opportunity when no explicit data-through date exists."
+        )
+    if not center_validation_available:
+        limitations.append("A usable center identifier is unavailable, so geographic holdout validation is not performed.")
+    bundle = DataBundle(
+        patients=patients,
+        procedures=procedures,
+        medications=medications,
+        measurements=measurements,
+        encounters=encounters,
+        diagnoses=diagnoses,
+        metadata={
+            "source_mode": "cosmos_direct_wide_cohorts",
+            "sql_contract_version": LEGACY_WIDE_CONTRACT_VERSION,
+            "sql": dict(sql),
+            "query_fingerprint": digest({key: normalize_sql(value) for key, value in sql.items()}),
+            "schema_fingerprint": digest({key: frame_schema(value) for key, value in frames.items()}),
+            "source_tables": dict(qualified_names),
+            "source_row_counts": {key: len(value) for key, value in frames.items()},
+            "measurement_timing": "nominal_horizon_from_wide_columns",
+            "medication_coverage_semantics": "single_reported_start_end_interval",
+            "center_validation_available": center_validation_available,
+            "limitations": limitations,
+        },
+    )
+    bundle.metadata["preflight"] = validate_data_bundle(bundle)
+    return bundle
 
 
 def medication_frame_to_coverage(medications: Any, index_dates: Mapping[str, Any] | None = None) -> tuple[list[CoverageRecord], Any]:
@@ -1420,7 +2183,7 @@ def medication_frame_to_coverage(medications: Any, index_dates: Mapping[str, Any
         elif pd.notna(payload.get("medication_start_date")) and pd.notna(payload.get("medication_end_date")):
             start_date = pd.Timestamp(payload["medication_start_date"])
             end_date = pd.Timestamp(payload["medication_end_date"])
-            source_type = "validated_episode" if "episode" in source_type_value or "valid" in source_type_value else "explicit_treatment"
+            source_type = "validated_episode" if "validated" in source_type_value else "explicit_treatment"
         else:
             start_date = end_date = pd.NaT
             source_type = "unknown"
@@ -1480,7 +2243,7 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
         ("measurement", bundle.measurements, "measurement_date"),
     ):
         if frame.empty or date_column not in frame or frame[date_column].isna().any():
-            issues.append(f"Exact {name} dates are unavailable or invalid")
+            issues.append(f"{name.title()} dates are unavailable or invalid")
     for field_name in ("raw_value", "unit", "source_concept", "source_table"):
         if field_name not in bundle.measurements:
             issues.append(f"Raw measurements lack required field {field_name}")
@@ -1508,13 +2271,28 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
             details.append("Every flagged postoperative exposure requires an exact accepted start date; no proxy date is permitted")
     if issues:
         raise PreflightError("Production data preflight failed", issues, details)
-    return {
-        "status": "passed",
+    wide_source = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
+    limitations = list(bundle.metadata.get("limitations", [])) if wide_source else []
+    details.extend(limitations)
+    result = {
+        "status": "passed_with_wide_source_limitations" if wide_source else "passed",
         "row_counts": bundle.row_counts(),
         "accepted_medication_records": accepted,
         "medication_rejection_counts": medication_audit.loc[~medication_audit["accepted"], "reason"].value_counts().to_dict(),
         "details": details,
+        "strict_raw_event_contract": not wide_source,
     }
+    if wide_source:
+        result.update(
+            {
+                "source_row_counts": dict(bundle.metadata.get("source_row_counts", {})),
+                "measurement_timing": bundle.metadata.get("measurement_timing"),
+                "medication_coverage_semantics": bundle.metadata.get("medication_coverage_semantics"),
+                "center_validation_available": bool(bundle.metadata.get("center_validation_available")),
+                "limitations": limitations,
+            }
+        )
+    return result
 
 
 def connect_cosmos() -> Any:
@@ -1532,52 +2310,16 @@ def connect_cosmos() -> Any:
     except Exception as exc:
         raise PreflightError(
             "Cosmos connection failed",
-            [f"{type(exc).__name__}: {exc}"],
+            [f"{type(exc).__name__}: {sanitize_exception_text(exc)}"],
             ["Confirm PROJECTS access, ProjectD332AFD, trusted authentication, and ODBC Driver 17."],
         ) from exc
 
 
 def query_cosmos(cfg: RunConfig, preflight_only: bool = False) -> DataBundle:
+    validate_embedded_raw_sql(EMBEDDED_RAW_SOURCE_SQL)
     connection = connect_cosmos()
     try:
-        metadata = discover_database_schema(connection)
-        selections: dict[str, SourceSelection | None] = {
-            "patients": select_source_table(metadata, "patients", "METABOLIC_PATIENT_TABLE"),
-            "procedures": select_source_table(metadata, "procedures", "METABOLIC_PROCEDURE_TABLE"),
-            "medications": select_source_table(metadata, "medications", "METABOLIC_MEDICATION_TABLE"),
-            "measurements": select_source_table(metadata, "measurements", "METABOLIC_MEASUREMENT_TABLE"),
-            "encounters": select_source_table(metadata, "encounters", "METABOLIC_ENCOUNTER_TABLE", required=False),
-            "diagnoses": select_source_table(metadata, "diagnoses", "METABOLIC_DIAGNOSIS_TABLE", required=False),
-        }
-        limit = cfg.smoke_query_limit if cfg.smoke else (2000 if preflight_only else None)
-        frames: dict[str, Any] = {}
-        sql_text: dict[str, str] = {}
-        for logical_name, selection in selections.items():
-            if selection is None:
-                frames[logical_name] = pd.DataFrame()
-                continue
-            sql = build_source_sql(selection, limit)
-            sql_text[logical_name] = sql
-            frames[logical_name] = canonicalize_source_frame(pd.read_sql_query(sql, connection), selection)
-        bundle = DataBundle(
-            patients=frames["patients"],
-            procedures=frames["procedures"],
-            medications=frames["medications"],
-            measurements=frames["measurements"],
-            encounters=frames["encounters"],
-            diagnoses=frames["diagnoses"],
-            metadata={
-                "source_mode": "cosmos",
-                "sql_contract_version": SQL_CONTRACT_VERSION,
-                "sql": sql_text,
-                "query_fingerprint": digest({key: normalize_sql(value) for key, value in sql_text.items()}),
-                "schema_fingerprint": source_schema_signature(metadata, selections),
-                "selections": {key: asdict(value) if value is not None else None for key, value in selections.items()},
-                "available_tables": int(metadata[["TABLE_SCHEMA", "TABLE_NAME"]].drop_duplicates().shape[0]),
-            },
-        )
-        bundle.metadata["preflight"] = validate_data_bundle(bundle, preflight_only=preflight_only)
-        return bundle
+        return load_embedded_raw_bundle(connection, cfg, preflight_only=preflight_only)
     finally:
         connection.close()
 
@@ -2120,6 +2862,16 @@ def age_at_index(patient: Mapping[str, Any], index_date: Any) -> float:
     return float("nan")
 
 
+def patient_for_source(patient: Mapping[str, Any], source_prefix: str) -> dict[str, Any]:
+    """Overlay source-specific wide fields without changing the stable person identifier."""
+    result = dict(patient)
+    prefix = source_prefix + "__"
+    for key, value in patient.items():
+        if str(key).startswith(prefix):
+            result[str(key)[len(prefix):]] = value
+    return result
+
+
 def procedure_category(value: Any) -> str | None:
     match = re.search(r"(\d{5})", str(value))
     return PROCEDURE_CODES.get(match.group(1)) if match else None
@@ -2146,9 +2898,20 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
     procedures["patient_id"] = procedures["patient_id"].astype(str)
     procedures["procedure_date"] = pd.to_datetime(procedures["procedure_date"], errors="coerce").dt.normalize()
     normalized_measurements, measurement_quality = normalize_measurements(bundle.measurements)
-    absolute_records, medication_audit = medication_frame_to_coverage(bundle.medications)
+    direct_wide = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
+    if direct_wide and "source_cohort" in bundle.medications:
+        surgery_medications = bundle.medications.loc[bundle.medications["source_cohort"].eq("surgery")]
+        incretin_medications = bundle.medications.loc[bundle.medications["source_cohort"].eq("incretin")]
+        surgery_records, surgery_audit = medication_frame_to_coverage(surgery_medications)
+        incretin_records, incretin_audit = medication_frame_to_coverage(incretin_medications)
+        surgery_audit["source_cohort"] = "surgery"
+        incretin_audit["source_cohort"] = "incretin"
+        medication_audit = pd.concat([surgery_audit, incretin_audit], ignore_index=True)
+    else:
+        surgery_records, medication_audit = medication_frame_to_coverage(bundle.medications)
+        incretin_records = surgery_records
     records_by_patient: dict[str, list[CoverageRecord]] = defaultdict(list)
-    for record in absolute_records:
+    for record in surgery_records:
         records_by_patient[record.patient_id].append(record)
     epoch = pd.Timestamp("1970-01-01")
     cohort_rows: list[dict[str, Any]] = []
@@ -2165,6 +2928,8 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         candidate = group.iloc[0]
         index_date = pd.Timestamp(candidate["procedure_date"])
         patient = patient_lookup.get(str(patient_id))
+        if patient is not None and direct_wide:
+            patient = patient_for_source(patient, "mbs")
         exclusion = ""
         if patient is None:
             exclusion = "missing_patient_record"
@@ -2177,6 +2942,8 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         elif numeric_or_default(patient, "dialysis_transplant_flag") == 1:
             exclusion = "dialysis_or_transplant"
         patient_measurements = normalized_measurements.loc[normalized_measurements["patient_id"].eq(str(patient_id))]
+        if direct_wide and "source_cohort" in patient_measurements:
+            patient_measurements = patient_measurements.loc[patient_measurements["source_cohort"].eq("surgery")]
         baseline_bmi = select_baseline_measurement(patient_measurements, "bmi", index_date)
         if not exclusion and baseline_bmi is None:
             exclusion = "missing_baseline_bmi"
@@ -2257,7 +3024,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
     funnel_rows.append({"cohort": "surgery", "stage": "primary eligible", "n_patients": sum(item["cohort"] == "surgery" for item in cohort_rows), "status": "included"})
 
     # Medication cohort is built from the same coverage algorithm on absolute day numbers.
-    all_episodes, rejected_records = reconstruct_coverage_episodes(absolute_records)
+    all_episodes, rejected_records = reconstruct_coverage_episodes(incretin_records)
     episodes_by_patient: dict[str, list[CoverageEpisode]] = defaultdict(list)
     for episode in all_episodes:
         episodes_by_patient[episode.patient_id].append(episode)
@@ -2265,6 +3032,8 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
     medication_exclusions: dict[str, int] = defaultdict(int)
     for patient_id in sorted(episodes_by_patient):
         patient = patient_lookup.get(str(patient_id))
+        if patient is not None and direct_wide:
+            patient = patient_for_source(patient, "glp1")
         exclusion = ""
         selected_episode: CoverageEpisode | None = None
         for episode in sorted(episodes_by_patient[patient_id], key=lambda item: item.start_day):
@@ -2295,9 +3064,17 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         first_surgery_day = first_later_bariatric_day(procedures, str(patient_id), index_date)
         if not exclusion and prior_surgery:
             exclusion = "prior_bariatric_surgery"
+        if (
+            not exclusion
+            and numeric_or_default(patient or {}, "mbs_during_incretin_flag") == 1
+            and first_surgery_day is None
+        ):
+            exclusion = "bariatric_surgery_timing_unresolved"
         if not exclusion and first_surgery_day is not None and first_surgery_day <= 182:
             exclusion = "bariatric_surgery_during_first_183_days"
         patient_measurements = normalized_measurements.loc[normalized_measurements["patient_id"].eq(str(patient_id))]
+        if direct_wide and "source_cohort" in patient_measurements:
+            patient_measurements = patient_measurements.loc[patient_measurements["source_cohort"].eq("incretin")]
         baseline_bmi = select_baseline_measurement(patient_measurements, "bmi", index_date)
         if not exclusion and baseline_bmi is None:
             exclusion = "missing_baseline_bmi"
@@ -2383,7 +3160,13 @@ def stable_hash_fraction(value: str, seed: int) -> float:
 
 def assign_global_splits(cohorts: Any, seed: int = SEED) -> tuple[Any, dict[str, Any]]:
     canonical = cohorts.sort_values(["patient_id", "index_date"]).drop_duplicates("patient_id", keep="first").copy()
-    center_values = sorted(str(item) for item in canonical["center_id"].dropna().unique())
+    canonical_centers = canonical["center_id"].astype(str)
+    unavailable_center = canonical_centers.str.strip().str.lower().isin(
+        {"", "nan", "none", "unknown", CENTER_UNAVAILABLE.lower()}
+    )
+    usable_centers = sorted(canonical_centers.loc[~unavailable_center].unique())
+    center_validation_available = not bool(unavailable_center.any()) and len(usable_centers) >= 3
+    center_values = usable_centers if center_validation_available else []
     center_order = sorted(center_values, key=lambda value: stable_hash_fraction("center|" + value, seed), reverse=True)
     holdout_count = max(1, int(round(len(center_order) * HELDOUT_CENTER_FRACTION))) if len(center_order) >= 3 else 0
     heldout_centers = set(center_order[:holdout_count])
@@ -2420,7 +3203,13 @@ def assign_global_splits(cohorts: Any, seed: int = SEED) -> tuple[Any, dict[str,
         "temporal_cutoff": temporal_cutoff.date().isoformat(),
         "split_counts": manifest.drop_duplicates("patient_id")["split"].value_counts().to_dict(),
         "patient_overlap_passed": True,
-        "center_holdout_passed": True,
+        "center_validation_available": center_validation_available,
+        "center_holdout_passed": True if center_validation_available else None,
+        "center_validation_status": (
+            "geographic holdout completed"
+            if center_validation_available
+            else "not estimable because complete identifiers for at least three centers are unavailable"
+        ),
     }
     return manifest, metadata
 
@@ -2568,7 +3357,18 @@ def leakage_audit(rows: Any, split_metadata: Mapping[str, Any]) -> Any:
     record("Patient IDs never overlap splits", bool(patient_split.max() == 1), f"max split count per patient = {int(patient_split.max())}")
     heldout = set(split_metadata.get("heldout_centers", []))
     development_centers = set(rows.loc[rows["split"].isin(["train", "validation", "calibration"]), "center_id"])
-    record("Held-out centers absent from development", not bool(heldout.intersection(development_centers)), f"overlap count = {len(heldout.intersection(development_centers))}")
+    if split_metadata.get("center_validation_available", True):
+        record(
+            "Held-out centers absent from development",
+            not bool(heldout.intersection(development_centers)),
+            f"overlap count = {len(heldout.intersection(development_centers))}",
+        )
+    else:
+        record(
+            "Geographic validation is explicitly unavailable",
+            not bool(rows["split"].eq("geographic_test").any()),
+            "no usable center identifiers and no geographic-test rows",
+        )
     feature_ok = bool(rows["feature_max_day"].le(rows["origin_day"]).all())
     record("Every feature timestamp is at or before origin", feature_ok, f"violations = {int((rows['feature_max_day'] > rows['origin_day']).sum())}")
     target_ok = bool(rows["target_day"].gt(rows["origin_day"]).all())
@@ -3492,6 +4292,11 @@ def ode_suitability_gates(cohorts: Any, measurements: Any, dependencies: Mapping
             task_cohorts = cohorts.loc[cohorts["cohort"].eq(cohort_name) & cohorts["patient_id"].astype(str).isin(cohort_patients)]
             strata_counts = task_cohorts.groupby("treatment")["patient_id"].nunique()
             exact_dates = "measurement_date" in subset and subset["measurement_date"].notna().all()
+            if exact_dates and "timing_precision" in subset:
+                exact_labels = {"exact", "exact_day", "index_event_date"}
+                exact_dates = bool(
+                    subset["timing_precision"].astype(str).str.lower().isin(exact_labels).all()
+                )
             early_late = False
             if not subset.empty and exact_dates:
                 index_map = task_cohorts.drop_duplicates("patient_id").set_index("patient_id")["index_date"]
@@ -4295,6 +5100,19 @@ def apply_success_gates(metrics: Any, selected: Any, iqr_table: Any) -> Any:
     return pd.DataFrame(rows)
 
 
+def apply_source_claim_limit(gates: Any, metadata: Mapping[str, Any]) -> Any:
+    if metadata.get("source_mode") != "cosmos_direct_wide_cohorts" or gates.empty:
+        return gates
+    limited = gates.copy()
+    estimable = limited["claim_status"].ne("Not estimable")
+    limited.loc[estimable, "claim_status"] = "Exploratory"
+    suffix = "source limit: nominal wide-horizon timing and no fill-level coverage audit"
+    limited["gate_detail"] = limited["gate_detail"].astype(str).map(
+        lambda value: value + " | " + suffix if value else suffix
+    )
+    return limited
+
+
 def row_crps(y_true: Any, matrix: Any) -> Any:
     y = np.asarray(y_true, dtype=float)[:, None]
     predictions = np.asarray(matrix, dtype=float)
@@ -4454,7 +5272,10 @@ def weight_sensitivity_table(predictions: Any, selected: Any) -> Any:
 
 
 def gap_rule_sensitivity(bundle: DataBundle) -> Any:
-    absolute_records, _ = medication_frame_to_coverage(bundle.medications)
+    medications = bundle.medications
+    if bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts" and "source_cohort" in medications:
+        medications = medications.loc[medications["source_cohort"].eq("incretin")]
+    absolute_records, _ = medication_frame_to_coverage(medications)
     patient_sets: dict[int, set[str]] = {}
     rows: list[dict[str, Any]] = []
     for gap in GAP_SENSITIVITIES:
@@ -4630,6 +5451,23 @@ def display_count(value: Any, threshold: int = MIN_CELL_SIZE) -> str:
     return "<11" if 0 < numeric < threshold else f"{numeric:,}"
 
 
+def mask_small_cell_metrics(
+    frame: Any,
+    metric_columns: Sequence[str],
+    count_column: str = "n",
+) -> Any:
+    """Blank plotted or summarized metrics when their patient denominator is under 11."""
+    masked = frame.copy()
+    if masked.empty or count_column not in masked:
+        return masked
+    counts = pd.to_numeric(masked[count_column], errors="coerce")
+    small = counts.gt(0) & counts.lt(MIN_CELL_SIZE)
+    available_metrics = [column for column in metric_columns if column in masked]
+    if available_metrics:
+        masked.loc[small, available_metrics] = np.nan
+    return masked
+
+
 def baseline_composition_table(cohorts: Any) -> Any:
     rows: list[dict[str, Any]] = []
     for keys, group in cohorts.groupby(["cohort", "treatment"], sort=True):
@@ -4773,7 +5611,10 @@ def subgroup_performance(predictions: Any, selected: Any) -> Any:
 def blind_center_summary(cohorts: Any, split_metadata: Mapping[str, Any], fingerprint: str) -> Any:
     centers = sorted(str(item) for item in cohorts["center_id"].unique())
     order = sorted(centers, key=lambda value: digest({"fingerprint": fingerprint, "center": value}))
-    mapping = {center: f"Center {index + 1:02d}" for index, center in enumerate(order)}
+    if not split_metadata.get("center_validation_available", True):
+        mapping = {center: "Center unavailable" for center in order}
+    else:
+        mapping = {center: f"Center {index + 1:02d}" for index, center in enumerate(order)}
     table = cohorts.drop_duplicates(["patient_id", "center_id"]).copy()
     table["center_blind"] = table["center_id"].astype(str).map(mapping)
     table["heldout"] = table["center_id"].astype(str).isin(split_metadata.get("heldout_centers", []))
@@ -4812,6 +5653,9 @@ def build_figure_data(
         cohorts["index_date"].min().date().isoformat(),
         cohorts["index_date"].max().date().isoformat(),
     )
+    baseline_table = baseline_composition_table(cohorts)
+    if not split_metadata.get("center_validation_available", True):
+        baseline_table["centers"] = "Not available"
     return {
         "identity": {
             "study_version": STUDY_VERSION,
@@ -4825,10 +5669,18 @@ def build_figure_data(
             "status": "completed",
             "dependencies": dict(dependencies),
             "preflight": bundle.metadata.get("preflight", {}),
+            "measurement_timing": bundle.metadata.get("measurement_timing", "exact_day"),
+            "medication_coverage_semantics": bundle.metadata.get(
+                "medication_coverage_semantics", "audited_raw_events"
+            ),
+            "center_validation_available": bool(
+                bundle.metadata.get("center_validation_available", True)
+            ),
+            "source_limitations": list(bundle.metadata.get("limitations", [])),
         },
         "funnel": cohort_artifacts["funnel"],
         "exposure": exposure_summary(cohort_artifacts["exposure"], cohort_artifacts["medication_audit"]),
-        "baseline": baseline_composition_table(cohorts),
+        "baseline": baseline_table,
         "support": target_support_table(weighted_rows),
         "measurement_quality": measurement_quality_table(cohort_artifacts["measurement_quality"], cohort_artifacts["measurements"]),
         "split": {
@@ -4903,8 +5755,42 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
     if frame is None or frame.empty:
         axis.text(0.5, 0.5, "Not estimable", ha="center", va="center", color=PALETTE["muted"])
         return
-    display = frame.loc[:, [column for column in columns if column in frame]].head(max_rows).copy()
-    count_columns = {
+    source_display = frame.head(max_rows).copy()
+    display = source_display.loc[:, [column for column in columns if column in source_display]].copy()
+    small_cell_mask = pd.Series(False, index=source_display.index)
+    denominator_columns = ("n", "n_calibration", "eligible", "qualifying_patients", "development_patients")
+    small_count_masks: dict[str, Any] = {}
+    for count_column in denominator_columns:
+        if count_column in source_display:
+            patient_counts = pd.to_numeric(source_display[count_column], errors="coerce")
+            small_count_masks[count_column] = patient_counts.gt(0) & patient_counts.lt(MIN_CELL_SIZE)
+            small_cell_mask |= small_count_masks[count_column]
+    if "small_cell_suppressed" in source_display:
+        small_cell_mask |= source_display["small_cell_suppressed"].fillna(False).astype(bool)
+    structural_numeric_columns = {"coverage", "gap_rule_days", "origin_month", "target_month"}
+    if small_cell_mask.any():
+        for column in display.columns:
+            if column in denominator_columns:
+                display[column] = display[column].astype(object)
+                display.loc[small_cell_mask, column] = np.nan
+                own_small_count = small_count_masks.get(column, pd.Series(False, index=source_display.index))
+                display.loc[own_small_count, column] = "<11"
+                if column == "n" and "small_cell_suppressed" in source_display:
+                    display.loc[source_display["small_cell_suppressed"].fillna(False).astype(bool), column] = "<11"
+            elif column == "suppressed":
+                display[column] = display[column].astype(object)
+                display.loc[small_cell_mask, column] = True
+            elif pd.api.types.is_bool_dtype(display[column]):
+                display[column] = display[column].astype(object)
+                display.loc[small_cell_mask, column] = np.nan
+            elif (
+                column not in structural_numeric_columns
+                and pd.api.types.is_numeric_dtype(display[column])
+            ):
+                display.loc[small_cell_mask, column] = np.nan
+        if "estimability" in display:
+            display.loc[small_cell_mask, "estimability"] = "Suppressed"
+    integer_columns = {
         "n",
         "accepted_medication_records",
         "administratively_immature",
@@ -4922,9 +5808,10 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
         "reclassified_vs_primary",
         "valid_measurements",
     }
+    disclosure_count_columns = integer_columns.difference({"centers", "median_censor_day"})
     pass_fail_columns = {"appropriate", "passed"}
     value_aliases = {
-        "alternate_0.5_99.5": "Alternate 0.5%-99.5%",
+        "alternate_0.5_99.5": "Alt. 0.5%-99.5%",
         "catboost_multiquantile": "CatBoost",
         "catboost_multi_quantile": "CatBoost",
         "geographic_test": "Geographic test",
@@ -4949,11 +5836,13 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
                 if column in pass_fail_columns:
                     return "PASS" if bool(value) else "FAIL"
                 return "Yes" if bool(value) else "No"
-            if column in count_columns and isinstance(value, (int, float, np.integer, np.floating)):
+            if column in disclosure_count_columns and isinstance(value, (int, float, np.integer, np.floating)):
+                return display_count(value)
+            if column in integer_columns and isinstance(value, (int, float, np.integer, np.floating)):
                 return f"{int(round(float(value))):,}"
             if isinstance(value, (float, np.floating)):
                 return f"{float(value):.3f}"
-            prose_columns = {"assertion", "detail", "estimability", "failed_gates", "gate_detail", "reason", "scheme", "split", "status", "subgroup"}
+            prose_columns = {"assertion", "candidate", "detail", "estimability", "failed_gates", "gate_detail", "reason", "scheme", "split", "status", "subgroup"}
             rendered = value_aliases.get(str(value), str(value).replace("_", " ") if column in prose_columns else str(value))
             if column == "failed_gates":
                 rendered = (
@@ -4980,11 +5869,15 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
 
     header_aliases = {
         "accepted": "Accepted",
+        "administratively_immature": "Admin.\nimmature",
+        "administratively_mature": "Admin.\nmature",
         "appropriate": "Gate\nresult",
         "age_mean": "Age\nmean",
         "baseline_bmi_mean": "Baseline BMI\nmean",
         "baseline_hba1c_mean": "Baseline HbA1c\nmean",
         "claim_status": "Claim\nstatus",
+        "correction": "Conformal\nadjust.",
+        "coverage": "Interval\nlevel",
         "coverage_80": "80%\ncoverage",
         "coverage_90": "90%\ncoverage",
         "development_patients": "Develop.\nn",
@@ -4994,7 +5887,9 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
         "female_pct": "Female\n%",
         "implausible_prediction_rate": "Implausible\nrate",
         "median_censor_day": "Median censor\nday",
-        "n_calibration": "Calibration\nn",
+        "mature_with_target": "Mature with\ntarget",
+        "mature_without_target": "Mature without\ntarget",
+        "n_calibration": "Calib.\nn",
         "origin_month": "Origin\nmonth",
         "qualifying_patients": "Qualifying\npatients",
         "reclassified_vs_primary": "Reclassified\nvs primary",
@@ -5013,12 +5908,24 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
     if labels:
         column_labels = list(labels)
     else:
-        column_labels = [header_aliases.get(column, textwrap.fill(column.replace("_", " ").title(), width=12)) for column in display_columns]
+        column_labels = [
+            header_aliases.get(
+                column,
+                textwrap.fill(
+                    column.replace("_", " ").title(),
+                    width=12,
+                    break_long_words=False,
+                    break_on_hyphens=False,
+                ),
+            )
+            for column in display_columns
+        ]
 
     wide_columns = {
         "assertion": 1.55,
         "candidate": 1.55,
         "claim_status": 1.45,
+        "correction": 1.10,
         "detail": 1.55,
         "failed_gates": 2.10,
         "gate_detail": 1.75,
@@ -5101,18 +6008,36 @@ def render_page_01(data: Mapping[str, Any]) -> Any:
     panel_label(bottom, "C", "Preflight gates")
     bottom.axis("off")
     preflight = identity.get("preflight", {})
-    counts = preflight.get("row_counts", {})
-    text = (
-        "All hard gates passed. Exact surgery, medication, and measurement dates were verified; "
-        "medication coverage used audited interval evidence; units and source lineage were present; "
-        "administrative opportunity and blinded center identity were resolved.\n\n"
-        + "Source rows: "
-        + " | ".join(f"{key} {value:,}" for key, value in counts.items())
-        + "\nAccepted medication records: "
-        + (f"{int(preflight['accepted_medication_records']):,}" if isinstance(preflight.get("accepted_medication_records"), (int, float)) else str(preflight.get("accepted_medication_records", "not reported")))
-    )
-    bottom.text(0.02, 0.84, text, va="top", fontsize=10, color=PALETTE["ink"], linespacing=1.5, wrap=True)
-    bottom.text(0.02, 0.19, "RESULT: COMPLETED", fontsize=18, fontweight="bold", color=PALETTE["green"])
+    wide_limited = preflight.get("strict_raw_event_contract") is False
+    counts = preflight.get("source_row_counts", preflight.get("row_counts", {}))
+    accepted_value = preflight.get("accepted_medication_records", "not reported")
+    accepted_text = f"{int(accepted_value):,}" if isinstance(accepted_value, (int, float)) else str(accepted_value)
+    if wide_limited:
+        limitations = preflight.get("limitations", identity.get("source_limitations", []))
+        limitation_text = " ".join(str(item) for item in limitations[:3])
+        text = (
+            "The standalone direct SQL preflight completed against MBSCohort and GLP1Cohort. Required wide columns, "
+            "units, index dates, and reported medication intervals were usable. This is not an exact raw-event contract.\n\n"
+            + "Direct query rows: "
+            + " | ".join(f"{key} {value:,}" for key, value in counts.items())
+            + f"\nAccepted reported medication intervals: {accepted_text}\n"
+            + limitation_text
+        )
+        result_text = "RESULT: COMPLETED WITH SOURCE LIMITATIONS"
+        result_color = PALETTE["orange"]
+    else:
+        text = (
+            "All hard gates passed. Exact surgery, medication, and measurement dates were verified; "
+            "medication coverage used audited interval evidence; units and source lineage were present; "
+            "administrative opportunity and blinded center identity were resolved.\n\n"
+            + "Source rows: "
+            + " | ".join(f"{key} {value:,}" for key, value in counts.items())
+            + f"\nAccepted medication records: {accepted_text}"
+        )
+        result_text = "RESULT: COMPLETED"
+        result_color = PALETTE["green"]
+    bottom.text(0.02, 0.88, text, va="top", fontsize=9.2, color=PALETTE["ink"], linespacing=1.35, wrap=True)
+    bottom.text(0.02, 0.10, result_text, fontsize=15, fontweight="bold", color=result_color)
     return figure
 
 
@@ -5128,21 +6053,29 @@ def render_page_02(data: Mapping[str, Any]) -> Any:
             continue
         colors = [PALETTE["green"] if value == "included" else PALETTE["orange"] for value in subset["status"]]
         y = np.arange(len(subset))
-        axis.barh(y, subset["n_patients"], color=colors, alpha=0.88)
+        counts = pd.to_numeric(subset["n_patients"], errors="coerce").fillna(0)
+        plotted_counts = counts.mask(counts.gt(0) & counts.lt(MIN_CELL_SIZE), 0)
+        axis.barh(y, plotted_counts, color=colors, alpha=0.88)
         axis.set_yticks(y, [textwrap.fill(str(item).replace("_", " "), width=21) for item in subset["stage"]], fontsize=7.1)
         axis.invert_yaxis()
         axis.set_xlabel("Patients")
         axis.grid(axis="x")
         axis.grid(axis="y", visible=False)
-        maximum = max(float(subset["n_patients"].max()), 1)
-        for position, count in zip(y, subset["n_patients"], strict=False):
-            axis.text(float(count) + maximum * 0.015, position, display_count(count), va="center", fontsize=7.5, color=PALETTE["ink"])
+        maximum = max(float(plotted_counts.max()), 1)
+        for position, count, plotted_count in zip(y, counts, plotted_counts, strict=False):
+            axis.text(float(plotted_count) + maximum * 0.015, position, display_count(count), va="center", fontsize=7.5, color=PALETTE["ink"])
         axis.set_xlim(0, maximum * 1.25)
     return figure
 
 
 def render_page_03(data: Mapping[str, Any]) -> Any:
-    figure = new_page(3, "Exposure continuity and censoring", "Coverage evidence, 183-day persistence, switches, prior-exposure strata, and exact censor timing")
+    wide_limited = data["identity"].get("preflight", {}).get("strict_raw_event_contract") is False
+    subtitle = (
+        "Reported start-end intervals, operational 183-day continuation, prior exposure, and censor timing"
+        if wide_limited
+        else "Coverage evidence, 183-day persistence, switches, prior-exposure strata, and exact censor timing"
+    )
+    figure = new_page(3, "Exposure continuity and censoring", subtitle)
     axes = [
         figure.add_axes([0.13, 0.52, 0.35, 0.32]),
         figure.add_axes([0.55, 0.52, 0.39, 0.32]),
@@ -5162,15 +6095,25 @@ def render_page_03(data: Mapping[str, Any]) -> Any:
         axes[0].set_xlabel("Patients")
     panel_label(axes[1], "B", "Censoring counts")
     draw_compact_table(axes[1], exposure["censoring"], ["cohort", "n", "censored", "day_zero", "median_censor_day"])
-    panel_label(axes[2], "C", "Coverage source audit")
+    panel_label(axes[2], "C", "Reported interval source audit" if wide_limited else "Coverage source audit")
     draw_compact_table(axes[2], exposure["sources"], ["source_type", "accepted", "reason", "n"], max_rows=9)
-    panel_label(axes[3], "D", "Six-month continuity distribution")
+    panel_label(
+        axes[3],
+        "D",
+        "Continuity under full reported-interval assumption" if wide_limited else "Six-month continuity distribution",
+    )
     draw_compact_table(axes[3], exposure["continuity"], list(exposure["continuity"].columns), max_rows=9)
     return figure
 
 
 def render_page_04(data: Mapping[str, Any]) -> Any:
-    figure = new_page(4, "Baseline composition", "Treatment-specific cohort composition, calendar support, and center contribution")
+    center_available = bool(data["split"]["metadata"].get("center_validation_available", True))
+    subtitle = (
+        "Treatment-specific cohort composition, calendar support, and center contribution"
+        if center_available
+        else "Treatment-specific cohort composition, calendar support, and center-identifier availability"
+    )
+    figure = new_page(4, "Baseline composition", subtitle)
     top = figure.add_axes([0.06, 0.48, 0.88, 0.36])
     bottom_left = figure.add_axes([0.12, 0.10, 0.36, 0.28])
     bottom_right = figure.add_axes([0.54, 0.10, 0.40, 0.28])
@@ -5190,7 +6133,7 @@ def render_page_04(data: Mapping[str, Any]) -> Any:
         bottom_left.set_yticks(np.arange(len(labels)), labels, fontsize=7.2)
         bottom_left.invert_yaxis()
         bottom_left.set_xlabel("Patients")
-    panel_label(bottom_right, "C", "Blinded center contribution")
+    panel_label(bottom_right, "C", "Blinded center contribution" if center_available else "Center identifier availability")
     centers = data["split"]["centers"]
     draw_compact_table(bottom_right, centers, ["center_blind", "heldout", "n"], max_rows=10)
     return figure
@@ -5200,8 +6143,21 @@ def heatmap_table(axis: Any, frame: Any, row_column: str, column_column: str, va
     if frame.empty:
         empty_panel(axis)
         return
-    pivot = frame.pivot_table(index=row_column, columns=column_column, values=value_column, aggfunc="first")
-    image = axis.imshow(pivot.to_numpy(float), aspect="auto", cmap="viridis", vmin=np.nanmin(pivot.to_numpy(float)), vmax=np.nanmax(pivot.to_numpy(float)))
+    row_values = sorted(frame[row_column].dropna().unique())
+    column_values = sorted(frame[column_column].dropna().unique())
+    pivot = frame.pivot_table(index=row_column, columns=column_column, values=value_column, aggfunc="first", dropna=False)
+    pivot = pivot.reindex(index=row_values, columns=column_values)
+    matrix = pivot.to_numpy(float)
+    finite = np.isfinite(matrix)
+    if not finite.any():
+        empty_panel(axis, "Not estimable after disclosure control")
+        return
+    vmin = float(np.nanmin(matrix))
+    vmax = float(np.nanmax(matrix))
+    if math.isclose(vmin, vmax):
+        vmin -= 0.5
+        vmax += 0.5
+    image = axis.imshow(matrix, aspect="auto", cmap="viridis", vmin=vmin, vmax=vmax)
     axis.set_yticks(np.arange(len(pivot.index)), [str(item) for item in pivot.index], fontsize=7.5)
     axis.set_xticks(np.arange(len(pivot.columns)), [str(item) for item in pivot.columns], fontsize=7.5)
     for row_index, row_value in enumerate(pivot.index):
@@ -5213,7 +6169,7 @@ def heatmap_table(axis: Any, frame: Any, row_column: str, column_column: str, va
                     match = frame.loc[frame[row_column].eq(row_value) & frame[column_column].eq(column_value)]
                     if not match.empty:
                         annotation += f"\nn={display_count(match.iloc[0][annotation_column])}"
-                axis.text(column_index, row_index, annotation, ha="center", va="center", color="white" if value < np.nanmean(pivot.to_numpy(float)) else "black", fontsize=6.8)
+                axis.text(column_index, row_index, annotation, ha="center", va="center", color="white" if value < np.nanmean(matrix) else "black", fontsize=6.8)
     plt.colorbar(image, ax=axis, fraction=0.04, pad=0.03)
 
 
@@ -5221,6 +6177,7 @@ def render_page_05(data: Mapping[str, Any]) -> Any:
     figure = new_page(5, "Follow-up and target support", "Administrative maturity is separated from missing measurement and treatment or surgery censoring")
     support = data["support"].copy()
     support = support.loc[support["origin_month"].eq(0)].copy()
+    support = mask_small_cell_metrics(support, ["target_availability_pct"], count_column="eligible")
     support["task"] = support["cohort"].str.title() + " | " + support["outcome"].str.upper()
     top = figure.add_axes([0.12, 0.48, 0.80, 0.36])
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.27])
@@ -5233,7 +6190,13 @@ def render_page_05(data: Mapping[str, Any]) -> Any:
 
 
 def render_page_06(data: Mapping[str, Any]) -> Any:
-    figure = new_page(6, "Measurement quality", "Raw units, source concepts, invalid values, derived BMI, duplicate-day handling, and exact timing")
+    wide_limited = data["identity"].get("preflight", {}).get("strict_raw_event_contract") is False
+    subtitle = (
+        "Wide-column units, source provenance, validity, and nominal horizon timing"
+        if wide_limited
+        else "Raw units, source concepts, invalid values, derived BMI, duplicate-day handling, and exact timing"
+    )
+    figure = new_page(6, "Measurement quality", subtitle)
     left = figure.add_axes([0.06, 0.47, 0.55, 0.37])
     right = figure.add_axes([0.66, 0.47, 0.28, 0.37])
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.27])
@@ -5244,19 +6207,33 @@ def render_page_06(data: Mapping[str, Any]) -> Any:
     draw_compact_table(right, quality["duplicates"], list(quality["duplicates"].columns), max_rows=8)
     panel_label(bottom, "C", "Frozen primary rules")
     bottom.axis("off")
-    bottom.text(
-        0.01, 0.88,
-        "BMI: normalize weight and height before derivation; accept 10 to 100 kg/m2. HbA1c: normalize NGSP percent; "
-        "convert IFCC mmol/mol with NGSP = IFCC / 10.929 + 2.15; accept 3 to 20 percent. Values outside these "
-        "ranges are invalid and never clipped. Duplicate valid values on the same patient-day are summarized by the median. "
-        "The primary window target is closest to the nominal day, with equal-distance ties resolved to the earlier date.",
-        va="top", fontsize=10, color=PALETTE["ink"], wrap=True, linespacing=1.5,
-    )
+    if wide_limited:
+        rules = (
+            "BMI wide columns are interpreted as kg/m2 and HbA1c wide columns as NGSP percent; values outside 10 to 100 "
+            "kg/m2 or 3 to 20 percent remain invalid. Baseline values use the exact cohort index date. Fixed follow-up "
+            "columns are assigned their named nominal horizon only so the common modeling pipeline can operate. They are "
+            "not evidence of an exact measurement timestamp, visit window, or within-window count. Continuous-time model "
+            "eligibility therefore fails the exact-timestamp gate."
+        )
+    else:
+        rules = (
+            "BMI: normalize weight and height before derivation; accept 10 to 100 kg/m2. HbA1c: normalize NGSP percent; "
+            "convert IFCC mmol/mol with NGSP = IFCC / 10.929 + 2.15; accept 3 to 20 percent. Values outside these "
+            "ranges are invalid and never clipped. Duplicate valid values on the same patient-day are summarized by the median. "
+            "The primary window target is closest to the nominal day, with equal-distance ties resolved to the earlier date."
+        )
+    bottom.text(0.01, 0.88, rules, va="top", fontsize=9.5, color=PALETTE["ink"], wrap=True, linespacing=1.45)
     return figure
 
 
 def render_page_07(data: Mapping[str, Any]) -> Any:
-    figure = new_page(7, "Split and leakage audit", "Global patient assignment, temporal testing, geographic holdout, and timestamp-level invariants")
+    center_available = bool(data["split"]["metadata"].get("center_validation_available", True))
+    split_subtitle = (
+        "Global patient assignment, temporal testing, geographic holdout, and timestamp-level invariants"
+        if center_available
+        else "Global patient assignment, temporal testing, and explicit geographic-validation unavailability"
+    )
+    figure = new_page(7, "Split and leakage audit", split_subtitle)
     left = figure.add_axes([0.06, 0.50, 0.36, 0.34])
     right = figure.add_axes([0.48, 0.50, 0.46, 0.34])
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.30])
@@ -5269,14 +6246,21 @@ def render_page_07(data: Mapping[str, Any]) -> Any:
     panel_label(right, "B", "Transportability design")
     right.axis("off")
     metadata = split["metadata"]
-    right.text(
-        0.02, 0.90,
-        f"Temporal cutoff: {metadata.get('temporal_cutoff')}\n"
-        f"Completely held-out centers: {len(metadata.get('heldout_centers', []))}\n"
-        "Center identities are blinded in every export. Raw center identity is never a primary predictor.\n"
-        "Calendar and center assignments were fixed before task and horizon expansion.",
-        va="top", fontsize=10, linespacing=1.6, color=PALETTE["ink"], wrap=True,
-    )
+    if center_available:
+        design_text = (
+            f"Temporal cutoff: {metadata.get('temporal_cutoff')}\n"
+            f"Completely held-out centers: {len(metadata.get('heldout_centers', []))}\n"
+            "Center identities are blinded in every export. Raw center identity is never a primary predictor.\n"
+            "Calendar and center assignments were fixed before task and horizon expansion."
+        )
+    else:
+        design_text = (
+            f"Temporal cutoff: {metadata.get('temporal_cutoff')}\n"
+            "Completely held-out centers: not estimable\n"
+            "The direct wide sources do not provide a complete usable center identifier. Geographic validation is disabled, "
+            "and no sentinel center is treated as a real site. Patient-global assignment and protected temporal testing remain active."
+        )
+    right.text(0.02, 0.90, design_text, va="top", fontsize=9.7, linespacing=1.55, color=PALETTE["ink"], wrap=True)
     panel_label(bottom, "C", "Leakage assertions")
     draw_compact_table(bottom, split["leakage"], ["assertion", "passed", "detail"], max_rows=10)
     return figure
@@ -5361,8 +6345,31 @@ def selected_metric_frame(data: Mapping[str, Any], cohort: str, outcome: str) ->
     return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
 
 
+def selected_only_metric_frame(data: Mapping[str, Any]) -> Any:
+    """Return metrics for the candidate selected for each exact task and origin."""
+    metrics = data["metrics"]
+    selected = data["selected"]
+    if metrics.empty or selected.empty:
+        return metrics.iloc[0:0].copy()
+    selection_keys = selected.loc[:, ["cohort", "outcome", "origin_month", "selected_candidate"]].rename(
+        columns={"selected_candidate": "candidate"}
+    )
+    return metrics.merge(
+        selection_keys,
+        on=["cohort", "outcome", "origin_month", "candidate"],
+        how="inner",
+        validate="many_to_one",
+    )
+
+
 def performance_page(data: Mapping[str, Any], number: int, cohort: str, outcome: str, title: str) -> Any:
-    figure = new_page(number, title, "Factual probabilistic performance on protected temporal and held-out-center tests")
+    center_available = bool(data["split"]["metadata"].get("center_validation_available", True))
+    subtitle = (
+        "Factual probabilistic performance on protected temporal and held-out-center tests"
+        if center_available
+        else "Factual probabilistic performance on protected temporal tests; geographic validation unavailable"
+    )
+    figure = new_page(number, title, subtitle)
     metrics = selected_metric_frame(data, cohort, outcome)
     axes = [
         figure.add_axes([0.06, 0.51, 0.42, 0.32]),
@@ -5377,21 +6384,39 @@ def performance_page(data: Mapping[str, Any], number: int, cohort: str, outcome:
         for axis in axes:
             empty_panel(axis)
         return figure
-    origin_zero = metrics.loc[metrics["origin_month"].eq(0) & metrics["split"].eq("temporal_test")]
+    origin_zero = metrics.loc[metrics["origin_month"].eq(0) & metrics["split"].eq("temporal_test")].copy()
+    origin_zero = mask_small_cell_metrics(origin_zero, ["crps", "rmse", "coverage_80"])
     colors = {"population_change": PALETTE["orange"], "persistence": PALETTE["muted"]}
-    selected_candidates = set(data["selected"].loc[(data["selected"]["cohort"] == cohort) & (data["selected"]["outcome"] == outcome), "selected_candidate"])
-    for candidate, group in origin_zero.groupby("candidate", sort=True):
-        color = colors.get(candidate, PALETTE["blue"] if candidate in selected_candidates else PALETTE["green"])
-        label = "Selected" if candidate in selected_candidates else candidate.replace("_", " ")
-        axes[0].plot(group["target_month"], group["crps"], marker="o", label=label, color=color)
-        axes[1].plot(group["target_month"], group["rmse"], marker="o", label=label, color=color)
-        axes[2].plot(group["target_month"], group["coverage_80"], marker="o", label=label, color=color)
-    axes[2].axhline(0.80, color=PALETTE["ink"], ls="--", lw=1)
-    axes[2].axhspan(0.75, 0.85, color=PALETTE["green"], alpha=0.10)
-    for axis in axes[:3]:
+    origin_selection = data["selected"].loc[
+        data["selected"]["cohort"].eq(cohort)
+        & data["selected"]["outcome"].eq(outcome)
+        & data["selected"]["origin_month"].eq(0),
+        "selected_candidate",
+    ]
+    selected_candidate = str(origin_selection.iloc[0]) if not origin_selection.empty else None
+    for axis, metric_column in zip(axes[:3], ("crps", "rmse", "coverage_80"), strict=False):
+        plotted = False
+        for candidate, group in origin_zero.groupby("candidate", sort=True):
+            group = group.sort_values("target_month")
+            if not pd.to_numeric(group[metric_column], errors="coerce").notna().any():
+                continue
+            color = colors.get(candidate, PALETTE["blue"] if candidate == selected_candidate else PALETTE["green"])
+            label = "Selected" if candidate == selected_candidate else candidate.replace("_", " ")
+            axis.plot(group["target_month"], group[metric_column], marker="o", label=label, color=color)
+            plotted = True
+        if not plotted:
+            empty_panel(axis, "Not estimable after disclosure control")
+            continue
+        if metric_column == "coverage_80":
+            axis.axhline(0.80, color=PALETTE["ink"], ls="--", lw=1)
+            axis.axhspan(0.75, 0.85, color=PALETTE["green"], alpha=0.10)
         axis.set_xlabel("Target month")
         axis.legend(fontsize=6.5, frameon=False)
-    count_table = metrics.loc[metrics["candidate"].isin(selected_candidates), ["origin_month", "target_month", "split", "n", "effective_sample_size", "estimability"]]
+    selected_metrics = selected_only_metric_frame(data)
+    count_table = selected_metrics.loc[
+        selected_metrics["cohort"].eq(cohort) & selected_metrics["outcome"].eq(outcome),
+        ["origin_month", "target_month", "split", "n", "effective_sample_size", "estimability"],
+    ].sort_values(["origin_month", "target_month", "split"])
     draw_compact_table(axes[3], count_table, list(count_table.columns), max_rows=10)
     return figure
 
@@ -5406,13 +6431,18 @@ def render_page_14(data: Mapping[str, Any]) -> Any:
     ]
     for axis, label, title in zip(axes, "ABCD", ("80% coverage", "PIT histograms", "Conformal corrections", "Tail and plausibility audit"), strict=False):
         panel_label(axis, label, title)
-    selected_candidates = set(data["selected"]["selected_candidate"])
-    metrics = data["metrics"].loc[data["metrics"]["candidate"].isin(selected_candidates) & data["metrics"]["origin_month"].eq(0)]
+    metrics = selected_only_metric_frame(data)
+    metrics = metrics.loc[metrics["origin_month"].eq(0)].copy()
+    metrics = mask_small_cell_metrics(
+        metrics,
+        ["coverage_80", "width_80", "width_90", "implausible_prediction_rate"],
+    )
     if metrics.empty:
         empty_panel(axes[0])
     else:
         for keys, group in metrics.groupby(["cohort", "outcome", "split"]):
             cohort, outcome, split = keys
+            group = group.sort_values("target_month")
             label = f"{str(cohort).title()} | {str(outcome).upper()} | {str(split).replace('_', ' ').title()}"
             axes[0].plot(group["target_month"], group["coverage_80"], marker="o", label=label)
         axes[0].axhline(0.80, color=PALETTE["ink"], ls="--")
@@ -5429,61 +6459,110 @@ def render_page_14(data: Mapping[str, Any]) -> Any:
         axes[1].axhline(0.10, color=PALETTE["ink"], ls="--")
         axes[1].set_xlabel("Probability integral transform")
         axes[1].set_ylabel("Proportion")
-    draw_compact_table(axes[2], data["calibration"], ["cohort", "outcome", "origin_month", "target_month", "coverage", "correction", "n_calibration", "status"], max_rows=10)
-    audit = metrics[["cohort", "outcome", "target_month", "split", "width_80", "width_90", "implausible_prediction_rate"]] if not metrics.empty else pd.DataFrame()
+    calibration = data["calibration"]
+    if calibration.empty or data["selected"].empty:
+        selected_calibration = calibration
+    else:
+        selection_keys = data["selected"].loc[:, ["cohort", "outcome", "origin_month", "selected_candidate"]].rename(
+            columns={"selected_candidate": "candidate"}
+        )
+        selected_calibration = calibration.merge(
+            selection_keys,
+            on=["cohort", "outcome", "origin_month", "candidate"],
+            how="inner",
+            validate="many_to_one",
+        )
+    draw_compact_table(
+        axes[2],
+        selected_calibration,
+        ["cohort", "outcome", "target_month", "candidate", "coverage", "correction", "n_calibration", "status"],
+        max_rows=10,
+    )
+    audit = metrics[["cohort", "outcome", "target_month", "split", "n", "width_80", "width_90", "implausible_prediction_rate"]] if not metrics.empty else pd.DataFrame()
     draw_compact_table(axes[3], audit, list(audit.columns), max_rows=10)
     return figure
 
 
 def render_page_15(data: Mapping[str, Any]) -> Any:
-    figure = new_page(15, "Transportability and subgroup audit", "Held-out-center and prespecified subgroup performance auditing, not biological effect modification")
+    center_available = bool(data["split"]["metadata"].get("center_validation_available", True))
+    subtitle = (
+        "Held-out-center and prespecified subgroup performance auditing, not biological effect modification"
+        if center_available
+        else "Temporal and prespecified subgroup auditing; geographic transportability is not estimable"
+    )
+    figure = new_page(15, "Transportability and subgroup audit", subtitle)
     top = figure.add_axes([0.06, 0.49, 0.88, 0.35])
     bottom_left = figure.add_axes([0.06, 0.10, 0.42, 0.28])
     bottom_right = figure.add_axes([0.54, 0.10, 0.40, 0.28])
     panel_label(top, "A", "Disclosure-controlled subgroup cells")
     draw_compact_table(top, data["subgroups"], ["cohort", "outcome", "target_month", "split", "subgroup", "value", "n", "crps", "coverage_80", "suppressed"], max_rows=12)
-    panel_label(bottom_left, "B", "Temporal versus geographic CRPS")
-    selected_candidates = set(data["selected"]["selected_candidate"])
-    metrics = data["metrics"].loc[data["metrics"]["candidate"].isin(selected_candidates) & data["metrics"]["origin_month"].eq(0)]
+    panel_label(bottom_left, "B", "Temporal versus geographic CRPS" if center_available else "Protected temporal CRPS")
+    metrics = selected_only_metric_frame(data)
+    metrics = metrics.loc[metrics["origin_month"].eq(0)].copy()
+    metrics = mask_small_cell_metrics(metrics, ["crps"])
     if metrics.empty:
         empty_panel(bottom_left)
     else:
-        summary = metrics.groupby("split")["crps"].mean()
-        bottom_left.bar(summary.index, summary.values, color=[PALETTE["blue"], PALETTE["purple"]][:len(summary)])
-        bottom_left.set_xticks(np.arange(len(summary)), [str(item).replace("_", "\n").title() for item in summary.index], fontsize=8)
-        bottom_left.set_ylabel("Mean CRPS")
+        summary = metrics.groupby("split")["crps"].mean().dropna()
+        if summary.empty:
+            empty_panel(bottom_left, "Not estimable after disclosure control")
+        else:
+            positions = np.arange(len(summary))
+            bottom_left.bar(positions, summary.values, color=[PALETTE["blue"], PALETTE["purple"]][:len(summary)])
+            bottom_left.set_xticks(positions, [str(item).replace("_", "\n").title() for item in summary.index], fontsize=8)
+            bottom_left.set_ylabel("Mean CRPS")
     panel_label(bottom_right, "C", "Interpretation")
     bottom_right.axis("off")
-    bottom_right.text(
-        0.02, 0.9,
-        "Raw center identity is not a model feature. Geographic performance uses completely held-out centers. "
-        "Subgroup cells with fewer than 11 patients are suppressed. These panels audit error and calibration; "
-        "they do not establish biological effect modification or rank patient groups.",
-        va="top", fontsize=9.5, wrap=True, linespacing=1.5, color=PALETTE["ink"],
-    )
+    if center_available:
+        interpretation = (
+            "Raw center identity is not a model feature. Geographic performance uses completely held-out centers. "
+            "Subgroup cells with fewer than 11 patients are suppressed. These panels audit error and calibration; "
+            "they do not establish biological effect modification or rank patient groups."
+        )
+    else:
+        interpretation = (
+            "Center identity is unavailable in the direct wide sources, so geographic transportability is not estimated. "
+            "Subgroup cells with fewer than 11 patients are suppressed. Temporal and subgroup panels audit error and "
+            "calibration only; they do not establish biological effect modification or rank patient groups."
+        )
+    bottom_right.text(0.02, 0.9, interpretation, va="top", fontsize=9.5, wrap=True, linespacing=1.5, color=PALETTE["ink"])
     return figure
 
 
 def render_page_16(data: Mapping[str, Any]) -> Any:
-    figure = new_page(16, "Censoring and persistence sensitivities", "Weighted and unweighted performance, effective sample size, gap rules, and estimand labeling")
+    wide_limited = data["identity"].get("preflight", {}).get("strict_raw_event_contract") is False
+    subtitle = (
+        "Weighted performance and reported-interval sensitivity limits"
+        if wide_limited
+        else "Weighted and unweighted performance, effective sample size, gap rules, and estimand labeling"
+    )
+    figure = new_page(16, "Censoring and persistence sensitivities", subtitle)
     left = figure.add_axes([0.06, 0.48, 0.55, 0.36])
     right = figure.add_axes([0.66, 0.48, 0.28, 0.36])
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.27])
     panel_label(left, "A", "Weighting sensitivity")
     draw_compact_table(left, data["sensitivity"], ["cohort", "outcome", "target_month", "split", "scheme", "effective_sample_size", "crps", "coverage_80", "coverage_90"], max_rows=12)
-    panel_label(right, "B", "Allowable-gap reclassification")
+    panel_label(right, "B", "Gap rule under reported intervals" if wide_limited else "Allowable-gap reclassification")
     draw_compact_table(right, data["gap_sensitivity"], list(data["gap_sensitivity"].columns), max_rows=6)
     panel_label(bottom, "C", "Estimand sensitivities")
     bottom.axis("off")
-    bottom.text(
-        0.01, 0.88,
-        "Primary surgery results use cross-fitted inverse-probability-of-remaining-incretin-free and observation weights. "
-        "Primary incretin results are on-treatment among confirmed six-month continuers and censor at the first supported "
-        "coverage end before an excessive gap, plus bariatric surgery. Unweighted complete-case results and alternate weight "
-        "truncation are shown above. Gap-rule sensitivity reconstructs episodes and censor dates at 0, 30, and 60 days. "
-        "Observed-care results, when produced in a full run, retain outcomes after medication discontinuation but still censor surgery and are labeled separately.",
-        va="top", fontsize=9.7, wrap=True, linespacing=1.5, color=PALETTE["ink"],
-    )
+    if wide_limited:
+        estimand_text = (
+            "Primary surgery results use cross-fitted inverse-probability-of-remaining-incretin-free and observation weights. "
+            "Primary incretin results condition on at least 183 days inside one reported GLP1StartDate-to-GLP1EndDate interval "
+            "and censor at that reported end or a known bariatric procedure. Unweighted and alternate weight truncation results "
+            "remain available. Because dispense-level records are absent, internal gaps, stockpiling, and switches cannot be "
+            "reconstructed; identical 0-, 30-, and 60-day rows reflect that source limitation, not demonstrated persistence."
+        )
+    else:
+        estimand_text = (
+            "Primary surgery results use cross-fitted inverse-probability-of-remaining-incretin-free and observation weights. "
+            "Primary incretin results are on-treatment among confirmed six-month continuers and censor at the first supported "
+            "coverage end before an excessive gap, plus bariatric surgery. Unweighted complete-case results and alternate weight "
+            "truncation are shown above. Gap-rule sensitivity reconstructs episodes and censor dates at 0, 30, and 60 days. "
+            "Observed-care results, when produced in a full run, retain outcomes after medication discontinuation but still censor surgery and are labeled separately."
+        )
+    bottom.text(0.01, 0.88, estimand_text, va="top", fontsize=9.4, wrap=True, linespacing=1.45, color=PALETTE["ink"])
     return figure
 
 
@@ -5530,10 +6609,17 @@ def render_page_18(data: Mapping[str, Any]) -> Any:
         "short calendar support, so unsupported horizons are not estimable. Conditional sleeve and RYGB projections are model-based, "
         "overlap-restricted, baseline-origin projections and must not be used to recommend a procedure."
     )
+    source_limitations = data["identity"].get("source_limitations", [])
+    if source_limitations:
+        limitations += (
+            " Direct wide-source limits: follow-up values have nominal rather than exact timestamps; each reported GLP1 "
+            "start-end pair is treated as one uninterrupted interval; enrollment and administrative opportunity are "
+            "operationalized; and unavailable center identity prevents geographic validation."
+        )
     bottom_left.text(
         0.01, 0.91,
         textwrap.fill(limitations, width=78),
-        va="top", fontsize=8.7, linespacing=1.40, color=PALETTE["ink"], clip_on=True,
+        va="top", fontsize=8.4, linespacing=1.34, color=PALETTE["ink"], clip_on=True,
     )
     panel_label(bottom_right, "C", "Publication conclusion")
     bottom_right.axis("off")
@@ -5550,6 +6636,8 @@ def render_page_18(data: Mapping[str, Any]) -> Any:
         linespacing=1.10,
     )
     conclusion = "Claims remain prognostic, horizon-specific, treatment-policy explicit, and noncausal."
+    if source_limitations:
+        conclusion += " Direct wide-source results remain exploratory."
     bottom_right.text(0.02, 0.28, textwrap.fill(conclusion, width=40), fontsize=9.5, color=PALETTE["ink"], va="top")
     return figure
 
@@ -5605,6 +6693,421 @@ def render_figure_book(data: Mapping[str, Any], export: Path) -> list[Path]:
     written.append(pdf_final)
     validate_export_directory(export)
     return written
+
+
+def new_schema_discovery_page(number: int, title: str, subtitle: str) -> Any:
+    figure = plt.figure(figsize=(11, 8.5), constrained_layout=False)
+    figure.patch.set_facecolor(PALETTE["paper"])
+    figure.text(0.055, 0.947, f"{number:02d}", fontsize=22, fontweight="bold", color=PALETTE["blue"], va="top")
+    figure.text(0.115, 0.947, title, fontsize=17, fontweight="bold", color=PALETTE["ink"], va="top")
+    figure.text(0.115, 0.915, subtitle, fontsize=9.5, color=PALETTE["muted"], va="top")
+    figure.lines.append(
+        plt.Line2D([0.055, 0.945], [0.893, 0.893], transform=figure.transFigure, color=PALETTE["grid"], lw=1.0)
+    )
+    figure.text(
+        0.055,
+        0.025,
+        "Read-only SQL Server metadata | No patient rows or values queried | Review before freezing joins",
+        fontsize=7.5,
+        color=PALETTE["muted"],
+    )
+    return figure
+
+
+def _wrapped_metadata_lines(lines: Sequence[str], width: int) -> list[str]:
+    wrapped: list[str] = []
+    for original in lines:
+        line = str(original)
+        if not line:
+            wrapped.append("")
+            continue
+        leading = line[: len(line) - len(line.lstrip())]
+        pieces = textwrap.wrap(
+            line.strip(),
+            width=max(20, width - len(leading)),
+            initial_indent=leading,
+            subsequent_indent=leading + "  ",
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+        wrapped.extend(pieces or [leading])
+    return wrapped
+
+
+def _metadata_text_panel(
+    axis: Any,
+    lines: Sequence[str],
+    title: str,
+    fontsize: float = 6.8,
+    wrap_width: int | None = None,
+) -> None:
+    axis.axis("off")
+    axis.set_title(title, loc="left", fontsize=10.5, fontweight="bold", color=PALETTE["ink"], pad=7)
+    panel_lines = list(lines) if lines else ["No accessible metadata matched this section."]
+    if wrap_width is not None:
+        panel_lines = _wrapped_metadata_lines(panel_lines, wrap_width)
+    rendered = "\n".join(str(line) for line in panel_lines)
+    axis.text(
+        0.0,
+        0.98,
+        rendered,
+        transform=axis.transAxes,
+        va="top",
+        ha="left",
+        family="DejaVu Sans Mono",
+        fontsize=fontsize,
+        color=PALETTE["ink"],
+        linespacing=1.28,
+        clip_on=True,
+    )
+
+
+def _candidate_metadata_blocks(
+    report: Mapping[str, Any],
+    domains: Sequence[str],
+    max_objects: int,
+    wrap_width: int = 66,
+) -> list[list[str]]:
+    candidates = report["candidates"]
+    details = report["candidate_columns"]
+    if candidates.empty:
+        return []
+    blocks: list[list[str]] = []
+    for domain in domains:
+        domain_candidates = candidates.loc[candidates["domain"].eq(domain)]
+        chosen = domain_candidates.head(max_objects)
+        for item in chosen.itertuples(index=False):
+            block = [
+                f"{str(item.domain).upper()}  {item.object} [{item.object_type}] "
+                f"score={int(item.score)} core={item.core_coverage}"
+            ]
+            object_details = details.loc[
+                details["domain"].eq(item.domain) & details["object"].eq(item.object)
+            ] if not details.empty else pd.DataFrame()
+            if object_details.empty:
+                block.append("  table-name match only; no recognized role columns")
+            else:
+                for detail in object_details.head(10).itertuples(index=False):
+                    key = f"; {detail.key_type}" if str(detail.key_type) else ""
+                    block.append(f"  {detail.role:22} -> {detail.column} [{detail.data_type}{key}]")
+                remaining = len(object_details) - min(len(object_details), 10)
+                if remaining > 0:
+                    block.append(f"  ... {remaining} more mapped columns in INTERNAL metadata")
+            blocks.append(_wrapped_metadata_lines(block, wrap_width) + [""])
+        omitted = len(domain_candidates) - len(chosen)
+        if omitted > 0:
+            blocks.append(
+                _wrapped_metadata_lines(
+                    [f"... {omitted} lower-ranked {domain} candidates are listed in INTERNAL/candidates.csv"],
+                    wrap_width,
+                )
+                + [""]
+            )
+    return blocks
+
+
+def _split_metadata_blocks(blocks: Sequence[Sequence[str]]) -> tuple[list[str], list[str]]:
+    total_lines = sum(len(block) for block in blocks)
+    target = (total_lines + 1) // 2
+    left: list[str] = []
+    right: list[str] = []
+    for block in blocks:
+        destination = left if not right and (len(left) + len(block) <= target or not left) else right
+        destination.extend(block)
+    return left, right
+
+
+def render_schema_discovery_overview(report: Mapping[str, Any]) -> Any:
+    database_frame = report["database"]
+    database_name = (
+        str(database_frame["DATABASE_NAME"].iloc[0])
+        if not database_frame.empty and "DATABASE_NAME" in database_frame
+        else "unavailable"
+    )
+    columns = report["columns"]
+    objects = columns[["TABLE_SCHEMA", "TABLE_NAME", "TABLE_TYPE"]].drop_duplicates()
+    schemas = sorted(objects["TABLE_SCHEMA"].astype(str).unique())
+    candidates = report["candidates"]
+    summary_lines = [
+        f"Discovery contract : {SCHEMA_DISCOVERY_VERSION}",
+        f"Database           : {database_name}",
+        f"Accessible schemas : {len(schemas)} ({', '.join(schemas[:12])})",
+        f"Tables/views       : {len(objects):,}",
+        f"Columns            : {len(columns):,}",
+        f"Declared keys      : {len(report['keys']):,}",
+        f"Declared FKs       : {len(report['foreign_keys']):,}",
+        f"Synonyms           : {len(report['synonyms']):,}",
+        f"SQL dependency edges: {len(report['object_dependencies']):,}",
+        f"Modules naming old cohorts: {len(report['cohort_modules']):,}",
+        "",
+        "This report ranks metadata candidates only. It never auto-selects a join or cohort index.",
+    ]
+    domain_lines = []
+    for domain in DISCOVERY_DOMAIN_RULES:
+        group = candidates.loc[candidates["domain"].eq(domain)] if not candidates.empty else pd.DataFrame()
+        if group.empty:
+            domain_lines.append(f"{domain:12} no candidate objects")
+            continue
+        best = group.iloc[0]
+        domain_lines.append(
+            f"{domain:12} {len(group):3d} candidates | best {best['object']} | core {best['core_coverage']}"
+        )
+    warning_lines = list(report.get("warnings", [])) or ["All optional metadata queries completed."]
+    if not report["cohort_modules"].empty:
+        warning_lines.extend(["", "Modules referencing old cohorts:"])
+        for row in report["cohort_modules"].head(12).itertuples(index=False):
+            warning_lines.append(f"  {row.MODULE_SCHEMA}.{row.MODULE_NAME} [{row.MODULE_TYPE}]")
+    figure = new_schema_discovery_page(
+        1,
+        "Cosmos raw-source schema discovery",
+        "Connection and metadata coverage, candidate domains, and recoverable cohort-building dependencies",
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.06, 0.53, 0.42, 0.31]),
+        summary_lines,
+        "A  Metadata scope",
+        fontsize=7.5,
+        wrap_width=64,
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.53, 0.53, 0.41, 0.31]),
+        domain_lines,
+        "B  Candidate domains",
+        fontsize=7.3,
+        wrap_width=62,
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.06, 0.09, 0.88, 0.33]),
+        warning_lines,
+        "C  Permissions and dependency clues",
+        fontsize=7.3,
+        wrap_width=130,
+    )
+    return figure
+
+
+def render_schema_candidate_page(
+    report: Mapping[str, Any],
+    number: int,
+    title: str,
+    subtitle: str,
+    domains: Sequence[str],
+) -> Any:
+    max_objects = 4 if len(domains) > 1 else 8
+    blocks = _candidate_metadata_blocks(report, domains, max_objects=max_objects)
+    left_lines, right_lines = _split_metadata_blocks(blocks)
+    right_title = "Continued" if right_lines else "Additional candidates"
+    if not right_lines:
+        right_lines = ["No additional ranked candidate objects."]
+    figure = new_schema_discovery_page(number, title, subtitle)
+    _metadata_text_panel(
+        figure.add_axes([0.055, 0.08, 0.43, 0.74]),
+        left_lines,
+        "Candidate objects and mapped columns",
+        fontsize=6.5,
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.52, 0.08, 0.43, 0.74]),
+        right_lines,
+        right_title,
+        fontsize=6.5,
+    )
+    return figure
+
+
+def render_schema_key_page(report: Mapping[str, Any]) -> Any:
+    relation_lines: list[str] = []
+    foreign_keys = report["foreign_keys"]
+    if not foreign_keys.empty:
+        relation_lines.append("DECLARED FOREIGN KEYS")
+        for row in foreign_keys.head(32).itertuples(index=False):
+            relation_lines.append(
+                f"{row.CHILD_SCHEMA}.{row.CHILD_TABLE}.{row.CHILD_COLUMN} -> "
+                f"{row.PARENT_SCHEMA}.{row.PARENT_TABLE}.{row.PARENT_COLUMN}"
+            )
+    else:
+        relation_lines.append("No declared foreign keys were visible. Shared column names below are hints only.")
+    shared_lines = ["SHARED KEY-LIKE COLUMN NAMES"]
+    for row in report["shared_keys"].head(36).itertuples(index=False):
+        shared_lines.append(f"{row.normalized_column} ({int(row.object_count)} objects): {row.objects}")
+    dependency_lines: list[str] = []
+    object_dependencies = report["object_dependencies"]
+    if not object_dependencies.empty:
+        dependency_lines.append("SQL OBJECT DEPENDENCIES")
+        dependency_working = object_dependencies.copy()
+        names = (
+            dependency_working["REFERENCING_OBJECT"].astype(str)
+            + " "
+            + dependency_working["REFERENCED_OBJECT"].astype(str)
+        )
+        dependency_working["_cohort_priority"] = names.str.contains(
+            r"mbscohort|glp1cohort", case=False, regex=True, na=False
+        )
+        dependency_working = dependency_working.sort_values(
+            ["_cohort_priority", "REFERENCING_SCHEMA", "REFERENCING_OBJECT"],
+            ascending=[False, True, True],
+        )
+        for row in dependency_working.head(20).itertuples(index=False):
+            referenced_parts = [
+                str(value)
+                for value in (row.REFERENCED_DATABASE, row.REFERENCED_SCHEMA, row.REFERENCED_OBJECT)
+                if value is not None and str(value).lower() not in {"", "nan", "none"}
+            ]
+            dependency_lines.append(
+                f"{row.REFERENCING_SCHEMA}.{row.REFERENCING_OBJECT} [{row.REFERENCING_TYPE}] -> "
+                + ".".join(referenced_parts)
+            )
+    synonyms = report["synonyms"]
+    if not synonyms.empty:
+        dependency_lines.extend(["", "SYNONYMS"])
+        for row in synonyms.head(24).itertuples(index=False):
+            dependency_lines.append(f"{row.SYNONYM_SCHEMA}.{row.SYNONYM_NAME} -> {row.BASE_OBJECT_NAME}")
+    modules = report["cohort_modules"]
+    if not modules.empty:
+        dependency_lines.extend(["", "MODULES THAT NAME THE OLD COHORTS"])
+        for row in modules.head(24).itertuples(index=False):
+            dependency_lines.append(f"{row.MODULE_SCHEMA}.{row.MODULE_NAME} [{row.MODULE_TYPE}]")
+    if not dependency_lines:
+        dependency_lines.append("No SQL dependencies, synonyms, or cohort-referencing modules were visible.")
+    figure = new_schema_discovery_page(
+        7,
+        "Key and dependency map",
+        "Declared relationships are authoritative; shared-name matches are review prompts, never automatic joins",
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.055, 0.49, 0.89, 0.35]),
+        relation_lines,
+        "A  Declared relationships",
+        fontsize=6.6,
+        wrap_width=132,
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.055, 0.08, 0.43, 0.33]),
+        shared_lines,
+        "B  Shared key hints",
+        fontsize=6.3,
+        wrap_width=64,
+    )
+    _metadata_text_panel(
+        figure.add_axes([0.52, 0.08, 0.43, 0.33]),
+        dependency_lines,
+        "C  Synonyms and modules",
+        fontsize=6.3,
+        wrap_width=64,
+    )
+    return figure
+
+
+def schema_discovery_renderers(report: Mapping[str, Any]) -> list[Callable[[], Any]]:
+    return [
+        lambda: render_schema_discovery_overview(report),
+        lambda: render_schema_candidate_page(
+            report, 2, "Patient and center candidates", "Demographics, observability, organization identity, and patient keys", ("patients", "centers")
+        ),
+        lambda: render_schema_candidate_page(
+            report, 3, "Procedure candidates", "Qualifying bariatric concepts, exact dates, patient keys, and organization lineage", ("procedures",)
+        ),
+        lambda: render_schema_candidate_page(
+            report, 4, "Medication candidates", "Ingredient or coded product, dated orders/fills/administrations, and coverage evidence", ("medications",)
+        ),
+        lambda: render_schema_candidate_page(
+            report, 5, "Measurement candidates", "BMI, weight, height, and HbA1c values with exact dates, units, and concepts", ("measurements",)
+        ),
+        lambda: render_schema_candidate_page(
+            report, 6, "Encounter and diagnosis candidates", "Observation history, center attribution, comorbidity definitions, and event dates", ("encounters", "diagnoses")
+        ),
+        lambda: render_schema_key_page(report),
+    ]
+
+
+def render_schema_discovery_book(report: Mapping[str, Any], export: Path) -> list[Path]:
+    configure_figure_style()
+    export.mkdir(parents=True, exist_ok=True)
+    expected = set(SCHEMA_DISCOVERY_PAGE_FILES) | {"schema_discovery_figure_book.pdf"}
+    present = {item.name for item in export.iterdir() if item.is_file()}
+    unexpected = present.difference(expected)
+    if unexpected:
+        raise RuntimeError("Schema discovery export contains unexpected files: " + ", ".join(sorted(unexpected)))
+    temporary_pdf = export / "schema_discovery_figure_book.pdf.tmp"
+    final_pdf = export / "schema_discovery_figure_book.pdf"
+    written: list[Path] = []
+    with PdfPages(
+        temporary_pdf,
+        metadata={"Title": "Cosmos Raw-Source Schema Discovery", "Author": "Brannigan Lab"},
+    ) as pdf:
+        for filename, render in zip(SCHEMA_DISCOVERY_PAGE_FILES, schema_discovery_renderers(report), strict=True):
+            figure = render()
+            temporary_png = export / (filename + ".tmp")
+            figure.savefig(temporary_png, format="png", dpi=300, facecolor=figure.get_facecolor())
+            os.replace(temporary_png, export / filename)
+            pdf.savefig(figure, dpi=300, facecolor=figure.get_facecolor())
+            plt.close(figure)
+            written.append(export / filename)
+    os.replace(temporary_pdf, final_pdf)
+    written.append(final_pdf)
+    final_present = {item.name for item in export.iterdir() if item.is_file()}
+    if final_present != expected:
+        raise RuntimeError("Schema discovery export contract mismatch")
+    return written
+
+
+def schema_discovery_run_dir(cfg: RunConfig) -> Path:
+    if cfg.output_dir:
+        return Path(cfg.output_dir).expanduser().resolve()
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return DEFAULT_RESULTS_ROOT / f"schema_discovery_{stamp}"
+
+
+def _atomic_metadata_csv(path: Path, frame: Any) -> None:
+    atomic_text(path, frame.to_csv(index=False, lineterminator="\n"))
+
+
+def run_schema_discovery(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
+    run_dir = schema_discovery_run_dir(cfg)
+    if run_dir.exists() and any(run_dir.iterdir()):
+        raise PreflightError(
+            "Schema discovery output directory is not empty",
+            [str(run_dir)],
+            ["Choose a new --output-dir so metadata from separate database states cannot be mixed."],
+        )
+    connection = connect_cosmos()
+    try:
+        report = discover_cosmos_schema(connection)
+    finally:
+        connection.close()
+    internal = run_dir / "INTERNAL"
+    export = run_dir / "FIGURES_TO_EXPORT"
+    internal.mkdir(parents=True, exist_ok=True)
+    export.mkdir(parents=True, exist_ok=True)
+    for name in (
+        "columns", "keys", "foreign_keys", "synonyms", "cohort_modules", "object_dependencies", "candidates",
+        "candidate_columns", "shared_keys",
+    ):
+        _atomic_metadata_csv(internal / f"{name}.csv", report[name])
+    rendered = render_schema_discovery_book(report, export)
+    database_frame = report["database"]
+    database_name = (
+        str(database_frame["DATABASE_NAME"].iloc[0])
+        if not database_frame.empty and "DATABASE_NAME" in database_frame
+        else None
+    )
+    manifest = {
+        "status": "schema_discovery_complete",
+        "schema_discovery_version": SCHEMA_DISCOVERY_VERSION,
+        "study_version": STUDY_VERSION,
+        "script_sha256": sha256_file(SCRIPT_PATH),
+        "generated_utc": utc_now(),
+        "database_name": database_name,
+        "object_count": int(report["columns"][["TABLE_SCHEMA", "TABLE_NAME"]].drop_duplicates().shape[0]),
+        "column_count": int(len(report["columns"])),
+        "candidate_count": int(len(report["candidates"])),
+        "warnings": list(report["warnings"]),
+        "dependencies": dict(dependencies),
+        "privacy": "SQL Server metadata only; no patient rows or values queried",
+        "export_files": [path.name for path in rendered],
+    }
+    atomic_json(run_dir / "schema_discovery_manifest.json", manifest)
+    return run_dir
 
 
 # ======================================================================================
@@ -5815,10 +7318,66 @@ def run_embedded_self_tests() -> dict[str, Any]:
         "18_small_cell_suppression",
         bool(suppressed.loc[0, "small_cell_suppressed"]) and pd.isna(suppressed.loc[0, "n"]) and not bool(suppressed.loc[1, "small_cell_suppressed"]),
     )
+    table_fixture = pd.DataFrame(
+        {
+            "origin_month": [0, 0],
+            "target_month": [12, 24],
+            "n": [5, 12],
+            "effective_sample_size": [4.8, 11.5],
+            "estimability": ["estimable", "estimable"],
+            "suppressed": [False, False],
+        }
+    )
+    table_figure, table_axis = plt.subplots()
+    draw_compact_table(table_axis, table_fixture, list(table_fixture.columns))
+    table_text = [
+        cell.get_text().get_text() for cell in table_axis.tables[0].get_celld().values()
+    ]
+    plt.close(table_figure)
+    check(
+        "18b_figure_table_small_cell_suppression",
+        "<11" in table_text
+        and "4.800" not in table_text
+        and "Suppressed" in table_text,
+        str(table_text),
+    )
+
+    selection_fixture = {
+        "selected": pd.DataFrame(
+            {
+                "cohort": ["surgery", "surgery"],
+                "outcome": ["bmi", "bmi"],
+                "origin_month": [0, 3],
+                "selected_candidate": ["candidate_a", "candidate_b"],
+            }
+        ),
+        "metrics": pd.DataFrame(
+            {
+                "cohort": ["surgery"] * 4,
+                "outcome": ["bmi"] * 4,
+                "origin_month": [0, 0, 3, 3],
+                "candidate": ["candidate_a", "candidate_b", "candidate_a", "candidate_b"],
+                "n": [5, 20, 20, 20],
+                "crps": [1.0, 2.0, 3.0, 4.0],
+            }
+        ),
+    }
+    selected_fixture_metrics = selected_only_metric_frame(selection_fixture).sort_values("origin_month")
+    masked_fixture_metrics = mask_small_cell_metrics(selected_fixture_metrics, ["crps"])
+    check(
+        "18c_selected_origin_and_plot_disclosure_control",
+        selected_fixture_metrics["candidate"].tolist() == ["candidate_a", "candidate_b"]
+        and pd.isna(masked_fixture_metrics.iloc[0]["crps"])
+        and masked_fixture_metrics.iloc[1]["crps"] == 4.0,
+        str(masked_fixture_metrics.to_dict(orient="records")),
+    )
 
     # 19. A forced preflight failure creates exactly one PNG and a one-page PDF.
     with tempfile.TemporaryDirectory(prefix="metabolic-preflight-test-") as directory:
         failure_cfg = RunConfig(mode="self-test", output_dir=directory)
+        partial_export = Path(directory) / "FIGURES_TO_EXPORT"
+        partial_export.mkdir(parents=True)
+        atomic_bytes(partial_export / PAGE_FILES[0], b"partial run artifact")
         failure_png = render_preflight_failure(failure_cfg, "Forced gate failure", ["exact units missing"], ["Provide raw unit fields"])
         failure_pdf = failure_png.parent / "metabolic_trajectory_figure_book.pdf"
         check(
@@ -6008,6 +7567,400 @@ def run_embedded_self_tests() -> dict[str, Any]:
         f"forbidden={forbidden_imports}; project_local={project_local_imports}",
     )
 
+    # 29. The quarantined legacy-wide adapter remains deterministic for historical
+    # feasibility comparisons, but query_cosmos never calls it.
+    mbs_fixture = pd.DataFrame(
+        [
+            {
+                "PatKey": "DIRECT-MBS",
+                "CptCode": "43775",
+                "ProcDateValue": "2020-01-15",
+                "AgeAtEvent": 45,
+                "PriorGLP1": 0,
+                "PostOpGLP1": 0,
+                "PMH_PriorMBS": 0,
+                "PMH_dialysis_transplant": 0,
+                "BMIatEvent": 42.0,
+                "BMI12mPostEvent": 31.0,
+                "ActiveEndInterval": 900,
+            }
+        ]
+    )
+    glp1_fixture = pd.DataFrame(
+        [
+            {
+                "PatKey": "DIRECT-GLP1",
+                "AgeAtEvent": 50,
+                "PriorGLP1": 0,
+                "GLP1StartDate": "2020-02-01",
+                "GLP1EndDate": "2021-03-06",
+                "GLP1Duration": 400,
+                "GLP1Name": "semaglutide",
+                "GLP1Route": "subcutaneous",
+                "MostRecentDose": 1.0,
+                "MaxGLP1Dose": 2.4,
+                "PMH_PriorMBS": 0,
+                "MBSduringGLP1": 0,
+                "PMH_dialysis_transplant": 0,
+                "BMIatEvent": 38.0,
+                "BMI12mPostEvent": 32.0,
+                "ActiveEndInterval": 900,
+            }
+        ]
+    )
+
+    class DirectFixtureConnection:
+        def __init__(self) -> None:
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+    direct_connection = DirectFixtureConnection()
+    captured_sql: list[str] = []
+
+    def direct_fixture_reader(sql: str, connection: Any) -> Any:
+        captured_sql.append(sql)
+        if connection is not direct_connection:
+            raise AssertionError("query used an unexpected connection")
+        if "[MBSCohort]" in sql:
+            return mbs_fixture.copy()
+        if "[GLP1Cohort]" in sql:
+            return glp1_fixture.copy()
+        raise AssertionError("query did not name a supported direct cohort table")
+
+    source_environment = ("METABOLIC_SOURCE_SCHEMA", "METABOLIC_MBS_TABLE", "METABOLIC_GLP1_TABLE")
+    saved_environment = {name: os.environ.get(name) for name in source_environment}
+    direct_bundle: DataBundle | None = None
+    direct_cohorts = pd.DataFrame()
+    direct_failure: PreflightError | None = None
+    try:
+        for name in source_environment:
+            os.environ.pop(name, None)
+        direct_frames, direct_sql, direct_names = load_direct_wide_tables(
+            direct_connection,
+            RunConfig.create("smoke", None, False),
+            read_sql=direct_fixture_reader,
+        )
+        direct_bundle = wide_tables_to_data_bundle(direct_frames, direct_sql, direct_names)
+        direct_cohorts = construct_cohorts(direct_bundle)["cohorts"]
+
+        def unavailable_reader(sql: str, connection: Any) -> Any:
+            raise RuntimeError("fixture table unavailable")
+
+        try:
+            load_direct_wide_tables(
+                direct_connection,
+                RunConfig.create("smoke", None, False),
+                read_sql=unavailable_reader,
+            )
+        except PreflightError as exc:
+            direct_failure = exc
+    finally:
+        direct_connection.close()
+        for name, value in saved_environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    check(
+        "29_legacy_wide_adapter_normalization",
+        direct_bundle is not None
+        and direct_connection.closed
+        and len(captured_sql) == 2
+        and all("SELECT TOP (2000) *" in sql for sql in captured_sql)
+        and all("INFORMATION_SCHEMA" not in sql for sql in captured_sql)
+        and any("[dbo].[MBSCohort]" in sql for sql in captured_sql)
+        and any("[dbo].[GLP1Cohort]" in sql for sql in captured_sql)
+        and direct_bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
+        and direct_bundle.metadata.get("measurement_timing") == "nominal_horizon_from_wide_columns"
+        and direct_bundle.metadata.get("preflight", {}).get("status") == "passed_with_wide_source_limitations"
+        and set(direct_cohorts["cohort"]) == {"surgery", "incretin"},
+        f"queries={len(captured_sql)}; cohorts={sorted(direct_cohorts.get('cohort', pd.Series(dtype=str)).unique())}",
+    )
+    direct_failure_text = " ".join(
+        [
+            direct_failure.title if direct_failure else "",
+            *(direct_failure.issues if direct_failure else []),
+            *(direct_failure.details if direct_failure else []),
+        ]
+    )
+    check(
+        "30_legacy_wide_failure_diagnostics",
+        direct_failure is not None
+        and direct_failure.title == "Cosmos direct cohort query failed"
+        and "MBSCohort" in direct_failure_text
+        and "GLP1Cohort" in direct_failure_text
+        and "Patients source contract" not in direct_failure_text,
+        direct_failure_text,
+    )
+
+    # 31. The real feasibility extract is multi-row for some GLP-1 patients. Never
+    # collapse those episodes without a reviewed new-user/index-event rule.
+    repeated_glp1 = pd.concat(
+        [
+            glp1_fixture,
+            glp1_fixture.assign(GLP1StartDate="2021-05-01", GLP1EndDate="2022-05-01", GLP1Name="tirzepatide"),
+        ],
+        ignore_index=True,
+    )
+    repeated_failure: PreflightError | None = None
+    try:
+        resolve_wide_fields(repeated_glp1, "GLP1Cohort")
+    except PreflightError as exc:
+        repeated_failure = exc
+    check(
+        "31_multirow_glp1_requires_reviewed_index_rule",
+        repeated_failure is not None
+        and repeated_failure.title == "GLP1Cohort direct query is not one row per patient"
+        and "Deduplicate the source query" in " ".join(repeated_failure.details),
+        str(repeated_failure or "duplicate rows were silently accepted"),
+    )
+
+    # 32. Schema discovery reads only metadata and can rank normalized source tables
+    # even when patient, procedure, medication, and measurement fields are separated.
+    metadata_rows: list[dict[str, Any]] = []
+
+    def add_metadata_table(table_name: str, columns: Sequence[tuple[str, str]], table_type: str = "BASE TABLE") -> None:
+        for ordinal, (column_name, data_type) in enumerate(columns, start=1):
+            metadata_rows.append(
+                {
+                    "TABLE_CATALOG": "SyntheticProject",
+                    "TABLE_SCHEMA": "raw",
+                    "TABLE_NAME": table_name,
+                    "TABLE_TYPE": table_type,
+                    "COLUMN_NAME": column_name,
+                    "ORDINAL_POSITION": ordinal,
+                    "DATA_TYPE": data_type,
+                    "CHARACTER_MAXIMUM_LENGTH": np.nan,
+                    "NUMERIC_PRECISION": np.nan,
+                    "NUMERIC_SCALE": np.nan,
+                    "IS_NULLABLE": "YES",
+                }
+            )
+
+    add_metadata_table(
+        "PatientDimension",
+        [("PatKey", "bigint"), ("CenterID", "nvarchar"), ("BirthYear", "int"), ("Sex", "nvarchar"),
+         ("ObservationStartDate", "date"), ("ObservationEndDate", "date")],
+    )
+    add_metadata_table(
+        "ProcedureFact",
+        [("PatKey", "bigint"), ("ProcedureDate", "date"), ("CptCode", "nvarchar"), ("EncounterKey", "bigint")],
+    )
+    add_metadata_table(
+        "MedicationDispenseFact",
+        [("PatKey", "bigint"), ("MedicationID", "bigint"), ("RxNorm", "nvarchar"), ("FillDate", "date"),
+         ("DaysSupply", "int"), ("Dose", "numeric"), ("DoseUnit", "nvarchar")],
+    )
+    add_metadata_table(
+        "LabResultFact",
+        [("PatKey", "bigint"), ("ResultDate", "date"), ("NumericValue", "numeric"),
+         ("ResultUnit", "nvarchar"), ("LoincCode", "nvarchar"), ("EncounterKey", "bigint")],
+    )
+    add_metadata_table(
+        "EncounterFact",
+        [("PatKey", "bigint"), ("EncounterKey", "bigint"), ("EncounterDate", "date"), ("CenterID", "nvarchar")],
+    )
+    add_metadata_table(
+        "DiagnosisFact",
+        [("PatKey", "bigint"), ("DiagnosisDate", "date"), ("ICD10", "nvarchar"), ("EncounterKey", "bigint")],
+    )
+    metadata_columns = pd.DataFrame(metadata_rows)
+    metadata_keys = pd.DataFrame(
+        [
+            {
+                "TABLE_SCHEMA": "raw",
+                "TABLE_NAME": "PatientDimension",
+                "COLUMN_NAME": "PatKey",
+                "CONSTRAINT_TYPE": "PRIMARY KEY",
+                "CONSTRAINT_NAME": "PK_PatientDimension",
+                "ORDINAL_POSITION": 1,
+            }
+        ]
+    )
+    metadata_foreign_keys = pd.DataFrame(
+        [
+            {
+                "CHILD_SCHEMA": "raw",
+                "CHILD_TABLE": "ProcedureFact",
+                "CHILD_COLUMN": "PatKey",
+                "PARENT_SCHEMA": "raw",
+                "PARENT_TABLE": "PatientDimension",
+                "PARENT_COLUMN": "PatKey",
+                "FOREIGN_KEY_NAME": "FK_Procedure_Patient",
+            }
+        ]
+    )
+    captured_discovery_sql: list[str] = []
+
+    def metadata_fixture_reader(sql: str, connection: Any) -> Any:
+        captured_discovery_sql.append(sql)
+        if "schema-discovery: database" in sql:
+            return pd.DataFrame({"DATABASE_NAME": ["SyntheticProject"]})
+        if "schema-discovery: columns" in sql:
+            return metadata_columns.copy()
+        if "schema-discovery: keys" in sql:
+            return metadata_keys.copy()
+        if "schema-discovery: foreign-keys" in sql:
+            return metadata_foreign_keys.copy()
+        if "schema-discovery: synonyms" in sql:
+            return pd.DataFrame(columns=["SYNONYM_SCHEMA", "SYNONYM_NAME", "BASE_OBJECT_NAME"])
+        if "schema-discovery: cohort-modules" in sql:
+            return pd.DataFrame(
+                columns=["MODULE_SCHEMA", "MODULE_NAME", "MODULE_TYPE", "REFERENCES_MBSCOHORT", "REFERENCES_GLP1COHORT"]
+            )
+        if "schema-discovery: object-dependencies" in sql:
+            return pd.DataFrame(
+                [
+                    {
+                        "REFERENCING_SCHEMA": "dbo",
+                        "REFERENCING_OBJECT": "GLP1Cohort",
+                        "REFERENCING_TYPE": "VIEW",
+                        "REFERENCED_SERVER": np.nan,
+                        "REFERENCED_DATABASE": np.nan,
+                        "REFERENCED_SCHEMA": "raw",
+                        "REFERENCED_OBJECT": "MedicationDispenseFact",
+                        "IS_SCHEMA_BOUND": 0,
+                        "IS_AMBIGUOUS": 0,
+                    }
+                ]
+            )
+        raise AssertionError("schema discovery attempted an unreviewed query")
+
+    discovery_fixture = discover_cosmos_schema(object(), read_sql=metadata_fixture_reader)
+    best_objects = {
+        domain: str(group.iloc[0]["object"])
+        for domain, group in discovery_fixture["candidates"].groupby("domain", sort=False)
+        if not group.empty
+    }
+    check(
+        "32_schema_discovery_metadata_only",
+        len(captured_discovery_sql) == len(SCHEMA_DISCOVERY_SQL)
+        and all("metabolic-schema-discovery:" in sql for sql in captured_discovery_sql)
+        and best_objects.get("patients") == "raw.PatientDimension"
+        and best_objects.get("procedures") == "raw.ProcedureFact"
+        and best_objects.get("medications") == "raw.MedicationDispenseFact"
+        and best_objects.get("measurements") == "raw.LabResultFact"
+        and not discovery_fixture["foreign_keys"].empty
+        and not discovery_fixture["object_dependencies"].empty,
+        str(best_objects),
+    )
+
+    # 33. The schema-only packet is screenshot-ready and keeps all machine-readable
+    # metadata outside FIGURES_TO_EXPORT.
+    with tempfile.TemporaryDirectory(prefix="metabolic-schema-discovery-test-") as directory:
+        export = Path(directory) / "FIGURES_TO_EXPORT"
+        rendered_discovery = render_schema_discovery_book(discovery_fixture, export)
+        present = {path.name for path in export.iterdir() if path.is_file()}
+        check(
+            "33_schema_discovery_figure_contract",
+            len(rendered_discovery) == len(SCHEMA_DISCOVERY_PAGE_FILES) + 1
+            and present == set(SCHEMA_DISCOVERY_PAGE_FILES) | {"schema_discovery_figure_book.pdf"}
+            and all((export / name).stat().st_size > 0 for name in present),
+            str(sorted(present)),
+        )
+
+    # 34. The production loader executes embedded canonical raw queries itself,
+    # applies the bounded-run token, and produces a strict raw-event DataBundle.
+    raw_contract_fixture = {
+        logical_name: (
+            f"/* fixture-raw:{logical_name} */\n"
+            f"SELECT {RAW_SQL_TOP_TOKEN} * FROM [raw].[{logical_name.title()}Source]"
+        )
+        for logical_name in RAW_REQUIRED_SOURCES
+    }
+    raw_frames = {
+        "patients": pd.DataFrame(
+            [
+                {
+                    "patient_id": "RAW-P1",
+                    "center_id": "CENTER-1",
+                    "birth_year": 1975,
+                    "observation_start_date": "2018-01-01",
+                    "observation_end_date": "2025-12-31",
+                    "administrative_end_date": "2025-12-31",
+                }
+            ]
+        ),
+        "procedures": pd.DataFrame(
+            [{"patient_id": "RAW-P1", "procedure_date": "2020-01-15", "procedure_code": "43775"}]
+        ),
+        "medications": pd.DataFrame(
+            [
+                {
+                    "patient_id": "RAW-P1",
+                    "ingredient": "semaglutide",
+                    "fill_date": "2019-01-01",
+                    "days_supply": 183,
+                }
+            ]
+        ),
+        "measurements": pd.DataFrame(
+            [
+                {
+                    "patient_id": "RAW-P1",
+                    "measurement_date": "2020-01-15",
+                    "measurement_type": "bmi",
+                    "raw_value": 42.0,
+                    "unit": "kg/m2",
+                    "source_concept": "BMI",
+                }
+            ]
+        ),
+    }
+    captured_raw_sql: list[str] = []
+
+    def raw_fixture_reader(sql: str, connection: Any) -> Any:
+        captured_raw_sql.append(sql)
+        match = re.search(r"fixture-raw:([a-z_]+)", sql)
+        if match is None:
+            raise AssertionError("raw fixture query marker is missing")
+        return raw_frames[match.group(1)].copy()
+
+    raw_bundle = load_embedded_raw_bundle(
+        object(),
+        RunConfig.create("preflight-only", None, False),
+        sql_contract=raw_contract_fixture,
+        read_sql=raw_fixture_reader,
+        preflight_only=True,
+    )
+    check(
+        "34_embedded_raw_sql_executes_standalone",
+        len(captured_raw_sql) == len(RAW_REQUIRED_SOURCES)
+        and all("TOP (2000)" in query for query in captured_raw_sql)
+        and all("MBSCohort" not in query and "GLP1Cohort" not in query for query in captured_raw_sql)
+        and raw_bundle.metadata.get("source_mode") == "cosmos_embedded_raw_sql"
+        and raw_bundle.metadata.get("strict_raw_event_contract") is True
+        and raw_bundle.metadata.get("preflight", {}).get("status") == "passed",
+        str(raw_bundle.metadata),
+    )
+
+    # 35. An absent contract and any attempted premade-cohort reference both stop
+    # before a database query can be issued.
+    absent_contract_failure: PreflightError | None = None
+    forbidden_contract_failure: PreflightError | None = None
+    try:
+        validate_embedded_raw_sql({})
+    except PreflightError as exc:
+        absent_contract_failure = exc
+    forbidden_contract = dict(raw_contract_fixture)
+    forbidden_contract["patients"] = (
+        f"SELECT {RAW_SQL_TOP_TOKEN} * FROM [dbo].[MBSCohort]"
+    )
+    try:
+        validate_embedded_raw_sql(forbidden_contract)
+    except PreflightError as exc:
+        forbidden_contract_failure = exc
+    check(
+        "35_production_rejects_missing_or_premade_contract",
+        absent_contract_failure is not None
+        and absent_contract_failure.title == "Reviewed raw-source SQL is not yet embedded"
+        and forbidden_contract_failure is not None
+        and "forbidden premade cohort" in " ".join(forbidden_contract_failure.issues),
+        f"absent={absent_contract_failure}; forbidden={forbidden_contract_failure}",
+    )
+
     return {
         "status": "passed",
         "tests": results,
@@ -6065,6 +8018,14 @@ def write_preflight_success(context: RunContext, bundle: DataBundle, dependencie
             "status": "preflight passed",
             "dependencies": dict(dependencies),
             "preflight": bundle.metadata.get("preflight", {}),
+            "measurement_timing": bundle.metadata.get("measurement_timing", "exact_day"),
+            "medication_coverage_semantics": bundle.metadata.get(
+                "medication_coverage_semantics", "audited_raw_events"
+            ),
+            "center_validation_available": bool(
+                bundle.metadata.get("center_validation_available", True)
+            ),
+            "source_limitations": list(bundle.metadata.get("limitations", [])),
         }
     }
     configure_figure_style()
@@ -6097,7 +8058,8 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
         atomic_json(context.run_dir / "run_state.json", context.state)
         return context.run_dir
 
-    print("[metabolic] constructing cohorts and exact-day outcomes", flush=True)
+    timing_label = bundle.metadata.get("measurement_timing", "exact-day")
+    print(f"[metabolic] constructing cohorts and outcomes ({timing_label})", flush=True)
     cohort_artifacts, cohort_hash = load_or_run_stage(
         context, "cohorts", lambda: construct_cohorts(bundle)
     )
@@ -6162,6 +8124,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
         metrics, pit_values = evaluate_predictions(calibrated, weight_diagnostics)
         iqr = development_iqr_by_task(weighted_rows)
         gates = apply_success_gates(metrics, selected, iqr)
+        gates = apply_source_claim_limit(gates, bundle.metadata)
         bootstrap_ci, comparisons = bootstrap_uncertainty(calibrated, selected, cfg)
         sensitivity = weight_sensitivity_table(calibrated, selected)
         gap_sensitivity = gap_rule_sensitivity(bundle)
@@ -6278,9 +8241,21 @@ def sanitize_exception_text(value: Any) -> str:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Start on a new Cosmos schema with --schema-discovery. Production remains hard-gated "
+            "until reviewed raw-table CTEs are embedded in this file."
+        ),
+    )
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--preflight-only", action="store_true", help="Validate dependencies, schemas, dates, maturity, and exposure semantics only")
+    modes.add_argument(
+        "--schema-discovery",
+        action="store_true",
+        help="Query SQL Server metadata only and render raw-source candidate/key figures; no patient rows are read",
+    )
     modes.add_argument("--self-test", action="store_true", help="Run deterministic embedded tests without Cosmos")
     modes.add_argument("--smoke", action="store_true", help="Run a bounded end-to-end study with reduced tuning")
     modes.add_argument("--plot-only", action="store_true", help="Rebuild figures from a verified matching aggregate checkpoint")
@@ -6293,9 +8268,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.self_test and args.resume:
         raise SystemExit("--resume is not meaningful with --self-test")
+    if args.schema_discovery and args.resume:
+        raise SystemExit("--resume is not meaningful with --schema-discovery")
     mode = "production"
     if args.preflight_only:
         mode = "preflight-only"
+    elif args.schema_discovery:
+        mode = "schema-discovery"
     elif args.self_test:
         mode = "self-test"
     elif args.smoke:
@@ -6303,7 +8282,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     elif args.plot_only:
         mode = "plot-only"
     cfg = RunConfig.create(mode, args.output_dir, args.resume)
-    require_database = mode in {"production", "preflight-only"}
+    require_database = mode in {"production", "preflight-only", "schema-discovery"}
     dependencies, dependency_issues = dependency_manifest(require_database=require_database)
     if dependency_issues:
         failure = render_preflight_failure(cfg, "Runtime dependency preflight failed", dependency_issues)
@@ -6319,6 +8298,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if mode == "plot-only":
             run_dir = verified_plot_only(cfg)
+        elif mode == "schema-discovery":
+            run_dir = run_schema_discovery(cfg, dependencies)
         else:
             run_dir = run_study(cfg, dependencies)
         print(f"[metabolic] completed: {run_dir}")
