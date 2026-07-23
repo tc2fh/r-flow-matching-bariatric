@@ -8,10 +8,10 @@ modeling, calibration, evaluation, and figure-book workflow:
 
 This file is intentionally self-contained. It imports no project-local Python code.
 The ``--schema-discovery`` mode opens its own pyodbc connection and inventories only
-SQL Server metadata. It does not read patient rows. The resulting screenshot-friendly
-figures are used to freeze explicit raw-table joins before a production extraction.
-The current wide-cohort compatibility path remains labeled exploratory and is not the
-required final raw-source implementation.
+SQL Server metadata. It does not read patient rows. Production directly queries the
+accessible ``dbo.MBSCohort`` and ``dbo.GLP1Cohort`` tables, constructs one reviewed
+index row per patient and source, and keeps the resulting wide-source claims labeled
+exploratory where exact event timing is unavailable.
 Human-facing output is restricted to numbered PNG pages and one matching PDF in
 ``FIGURES_TO_EXPORT``. Restart artifacts live in the fingerprinted run directory.
 """
@@ -66,9 +66,9 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
-STUDY_VERSION = "metabolic-trajectory-1.2.0"
+STUDY_VERSION = "metabolic-trajectory-1.3.0"
 SQL_CONTRACT_VERSION = "metabolic-raw-events-v1.1.0"
-LEGACY_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.0.0"
+DIRECT_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.1.0"
 SCHEMA_DISCOVERY_VERSION = "metabolic-schema-discovery-v1.0.0"
 DEFAULT_CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -672,11 +672,13 @@ def carry_stockpile_forward(
     records: Sequence[CoverageRecord],
     cap_days: int = STOCKPILE_CAP_DAYS,
 ) -> list[CoverageRecord]:
-    """Carry same-ingredient overlap forward without changing record starts.
+    """Carry same-ingredient dispense overlap forward without changing starts.
 
     The amount moved to the end of a fill is the supported overlap with earlier
     same-ingredient coverage, capped at ``cap_days``. This preserves exact uncovered
-    days while preventing implausible unbounded accumulation.
+    days while preventing implausible unbounded accumulation. Explicit treatment
+    intervals and administrations already define their supported end and are not
+    extended as if they were stockpilable dispenses.
     """
     if cap_days < 0:
         raise ValueError("Stockpile cap cannot be negative")
@@ -687,8 +689,9 @@ def carry_stockpile_forward(
     adjusted: list[CoverageRecord] = []
     for item in accepted:
         key = (item.patient_id, item.ingredient)
-        overlap = max(0, prior_end.get(key, item.start_day - 1) - item.start_day + 1)
-        carried = min(overlap, cap_days)
+        stockpilable = item.source_type in {"dispense", "fill"}
+        overlap = max(0, prior_end.get(key, item.start_day - 1) - item.start_day + 1) if stockpilable else 0
+        carried = min(overlap, cap_days) if stockpilable else 0
         end_day = item.end_day + carried
         prior_end[key] = max(prior_end.get(key, item.start_day - 1), end_day)
         adjusted.append(
@@ -1141,7 +1144,7 @@ def suppress_small_cells(frame: Any, count_columns: Sequence[str], threshold: in
 
 
 # ======================================================================================
-# 4. Metadata discovery, embedded raw SQL, legacy-wide audit, gates, and checkpoints
+# 4. Metadata discovery, direct wide inputs, optional raw SQL, gates, and checkpoints
 # ======================================================================================
 
 
@@ -1558,10 +1561,9 @@ def discover_cosmos_schema(
     }
 
 
-# These queries are intentionally frozen in the production file after reviewing the
-# metadata-only discovery packet. Each query may use multiple raw tables and CTEs, but
-# must return the canonical columns documented below. An empty mapping is a deliberate
-# hard gate: production cannot silently substitute a wide, preconstructed cohort.
+# This optional raw-event contract is retained for a future database that exposes the
+# necessary normalized tables. The current production entry point uses the two reviewed
+# direct wide inputs discovered in ProjectD332AFD.
 EMBEDDED_RAW_SOURCE_SQL: dict[str, str] = {}
 RAW_SQL_TOP_TOKEN = "/*METABOLIC_TOP*/"
 RAW_REQUIRED_SOURCES = ("patients", "procedures", "medications", "measurements")
@@ -1841,17 +1843,6 @@ def resolve_wide_fields(frame: Any, logical_name: str) -> dict[str, str]:
             ["Missing wide field: " + item for item in missing],
             [f"The script queried {logical_name} itself, but the returned schema cannot construct that cohort."],
         )
-    patient_values = frame[resolved["patient_id"]].dropna().astype(str)
-    duplicate_patients = patient_values.loc[patient_values.duplicated(keep=False)].unique()
-    if len(duplicate_patients):
-        raise PreflightError(
-            f"{logical_name} direct query is not one row per patient",
-            [f"{len(duplicate_patients)} patient identifiers occur on multiple wide rows"],
-            [
-                "The wide-column interpretation requires one reviewed index row per patient and source. "
-                "Deduplicate the source query with an explicit, clinically reviewed index-event rule."
-            ],
-        )
     return resolved
 
 
@@ -1864,13 +1855,46 @@ def direct_source_names() -> tuple[str, str, str]:
     return schema, mbs_table, glp1_table
 
 
-def build_direct_source_sql(schema: str, table: str, limit: int | None = None) -> str:
-    top = f"TOP ({int(limit)}) " if limit is not None else ""
-    order = "\nORDER BY [PatKey]" if limit is not None else ""
+def build_direct_schema_probe_sql(schema: str, table: str) -> str:
     return (
-        f"/* {LEGACY_WIDE_CONTRACT_VERSION}: direct wide cohort input */\n"
-        f"SELECT {top}*\n"
-        f"FROM {quote_identifier(schema)}.{quote_identifier(table)}{order}"
+        f"/* {DIRECT_WIDE_CONTRACT_VERSION}: column probe; no patient rows */\n"
+        "SELECT TOP (0) *\n"
+        f"FROM {quote_identifier(schema)}.{quote_identifier(table)}"
+    )
+
+
+def build_direct_source_sql(
+    schema: str,
+    table: str,
+    resolved: Mapping[str, str],
+    patient_limit: int | None = None,
+) -> str:
+    qualified = f"{quote_identifier(schema)}.{quote_identifier(table)}"
+    patient_column = quote_identifier(resolved["patient_id"])
+    projected_columns = list(dict.fromkeys(resolved.values()))
+    projection = ",\n    ".join(
+        f"[source].{quote_identifier(column)}" for column in projected_columns
+    )
+    marker = f"/* {DIRECT_WIDE_CONTRACT_VERSION}: direct wide cohort input */"
+    if patient_limit is None:
+        return (
+            f"{marker}\n"
+            f"SELECT\n    {projection}\n"
+            f"FROM {qualified} AS [source]"
+        )
+    return (
+        f"{marker}\n"
+        "WITH [sampled_patients] AS (\n"
+        f"    SELECT TOP ({int(patient_limit)}) {patient_column}\n"
+        f"    FROM {qualified}\n"
+        f"    WHERE {patient_column} IS NOT NULL\n"
+        f"    GROUP BY {patient_column}\n"
+        f"    ORDER BY {patient_column}\n"
+        ")\n"
+        f"SELECT\n    {projection}\n"
+        f"FROM {qualified} AS [source]\n"
+        "INNER JOIN [sampled_patients] AS [sample]\n"
+        f"    ON [sample].{patient_column} = [source].{patient_column}"
     )
 
 
@@ -1882,17 +1906,25 @@ def load_direct_wide_tables(
 ) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
     reader = read_sql or pd.read_sql_query
     schema, mbs_table, glp1_table = direct_source_names()
-    limit = cfg.smoke_query_limit if cfg.smoke else (2000 if preflight_only or cfg.mode == "preflight-only" else None)
-    sources = {
-        "MBSCohort": (mbs_table, build_direct_source_sql(schema, mbs_table, limit)),
-        "GLP1Cohort": (glp1_table, build_direct_source_sql(schema, glp1_table, limit)),
-    }
+    patient_limit = cfg.smoke_query_limit if cfg.smoke else (2000 if preflight_only or cfg.mode == "preflight-only" else None)
+    sources = {"MBSCohort": mbs_table, "GLP1Cohort": glp1_table}
     frames: dict[str, Any] = {}
     sql: dict[str, str] = {}
     qualified: dict[str, str] = {}
     failures: list[str] = []
-    for logical_name, (table_name, query) in sources.items():
+    for logical_name, table_name in sources.items():
+        probe = build_direct_schema_probe_sql(schema, table_name)
         try:
+            schema_frame = reader(probe, connection)
+            if not len(schema_frame.columns):
+                raise ValueError("column probe returned no columns")
+            resolved = resolve_wide_fields(schema_frame, logical_name)
+            query = build_direct_source_sql(
+                schema,
+                table_name,
+                resolved,
+                patient_limit,
+            )
             frame = reader(query, connection)
         except Exception as exc:
             failures.append(f"{logical_name}: {type(exc).__name__}: {sanitize_exception_text(exc)}")
@@ -1908,8 +1940,8 @@ def load_direct_wide_tables(
             "Cosmos direct cohort query failed",
             failures,
             [
-                "The quarantined feasibility helper queried dbo.MBSCohort and dbo.GLP1Cohort through pyodbc.",
-                "Production query_cosmos does not call this helper or depend on either premade cohort.",
+                "Production directly queries the configured MBSCohort and GLP1Cohort objects through pyodbc.",
+                "Confirm SELECT access, table names, and the ProjectD332AFD database connection.",
             ],
         )
     return frames, sql, qualified
@@ -1940,8 +1972,139 @@ def reported_medication_end(start: Any, end: Any, duration: Any) -> Any:
         return end_date
     duration_days = wide_numeric(duration)
     if pd.notna(start_date) and math.isfinite(duration_days) and duration_days >= 1:
-        return start_date + pd.Timedelta(days=int(round(duration_days)) - 1)
+        try:
+            return start_date + pd.Timedelta(days=int(round(duration_days)) - 1)
+        except (OverflowError, ValueError):
+            return pd.NaT
     return pd.NaT
+
+
+def select_primary_incretin_episode(
+    episodes: Sequence[CoverageEpisode],
+) -> CoverageEpisode | None:
+    """Return the earliest persistent episode with a 365-day interepisode washout."""
+    ordered = sorted(episodes, key=lambda item: (item.start_day, item.supported_end_day))
+    for episode in ordered:
+        previous_supported = [
+            prior.supported_end_day
+            for prior in ordered
+            if prior.supported_end_day < episode.start_day
+        ]
+        new_user = not previous_supported or episode.start_day - max(previous_supported) - 1 >= 365
+        if episode.qualifies_183 and new_user:
+            return episode
+    return None
+
+
+def select_wide_index_rows(
+    frame: Any,
+    resolved: Mapping[str, str],
+    logical_name: str,
+    preferred_anchors: Mapping[str, Any] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Select one deterministic clinically aligned index row per patient and source."""
+    patient_column = resolved["patient_id"]
+    index_field = "procedure_date" if logical_name == "MBSCohort" else "glp1_start"
+    patient_ids = frame[patient_column].astype("string").str.strip()
+    nonblank = patient_ids.notna() & patient_ids.ne("")
+    index_dates = pd.to_datetime(frame[resolved[index_field]], errors="coerce").dt.normalize()
+    active_end = pd.to_numeric(frame[resolved["active_end_days"]], errors="coerce")
+    valid = nonblank & index_dates.notna() & active_end.notna() & active_end.ge(0)
+    candidates = pd.DataFrame(
+        {
+            "_row_index": frame.index,
+            "_patient_id": patient_ids,
+            "_index_date": index_dates,
+            "_active_end": active_end,
+            "_valid": valid,
+        },
+        index=frame.index,
+    )
+    target_columns = [
+        column for canonical, column in resolved.items() if canonical.startswith("target_")
+    ]
+    mapped_columns = list(dict.fromkeys(resolved.values()))
+    candidates["_row_hash"] = pd.util.hash_pandas_object(
+        frame[mapped_columns], index=False
+    ).astype("uint64")
+    candidates["_outcome_count"] = (
+        frame[target_columns].notna().sum(axis=1) if target_columns else 0
+    )
+    candidates["_baseline_bmi"] = pd.to_numeric(
+        frame[resolved["target_bmi_0"]], errors="coerce"
+    )
+    candidates["_source_end"] = pd.NaT
+    candidates["_tie_text"] = ""
+    anchor_count = 0
+    if logical_name == "MBSCohort":
+        codes = frame[resolved["procedure_code"]].astype("string").fillna("")
+        candidates["_qualifying"] = codes.map(procedure_category).notna()
+        candidates["_tie_text"] = codes
+        candidates = candidates.loc[candidates["_valid"]].sort_values(
+            [
+                "_patient_id", "_qualifying", "_index_date", "_outcome_count",
+                "_active_end", "_baseline_bmi", "_tie_text", "_row_hash", "_row_index",
+            ],
+            ascending=[True, False, True, False, False, True, True, True, True],
+            kind="mergesort",
+        )
+        rule = "earliest valid qualifying bariatric procedure; deterministic completeness tie-break"
+    else:
+        end_dates = pd.to_datetime(
+            frame[resolved["glp1_end"]], errors="coerce"
+        ).dt.normalize() if "glp1_end" in resolved else pd.Series(pd.NaT, index=frame.index)
+        if "glp1_duration" in resolved:
+            durations = pd.to_numeric(frame[resolved["glp1_duration"]], errors="coerce")
+            derived_ends = index_dates + pd.to_timedelta(
+                durations.round().sub(1), unit="D", errors="coerce"
+            )
+            end_dates = end_dates.fillna(derived_ends)
+        candidates["_source_end"] = end_dates
+        candidates["_tie_text"] = frame[resolved["glp1_name"]].astype("string").fillna("")
+        anchors = pd.Series(preferred_anchors or {}, dtype="object")
+        candidates["_preferred_anchor"] = candidates["_patient_id"].map(anchors)
+        candidates["_preferred_anchor"] = pd.to_datetime(
+            candidates["_preferred_anchor"], errors="coerce"
+        ).dt.normalize()
+        candidates["_anchor_match"] = candidates["_index_date"].eq(
+            candidates["_preferred_anchor"]
+        )
+        anchor_count = int(candidates.loc[candidates["_anchor_match"] & candidates["_valid"], "_patient_id"].nunique())
+        candidates = candidates.loc[
+            candidates["_valid"]
+            & (candidates["_preferred_anchor"].isna() | candidates["_anchor_match"])
+        ].sort_values(
+            [
+                "_patient_id", "_index_date", "_source_end", "_outcome_count",
+                "_active_end", "_baseline_bmi", "_tie_text", "_row_hash", "_row_index",
+            ],
+            ascending=[True, True, False, False, False, True, True, True, True],
+            kind="mergesort",
+        )
+        rule = (
+            "row starting the earliest qualifying 183-day episode after a 365-day "
+            "interepisode washout; earliest valid row retained only when no episode qualifies"
+        )
+    selected_indices = candidates.drop_duplicates("_patient_id", keep="first")["_row_index"]
+    selected = frame.loc[selected_indices].copy().reset_index(drop=True)
+    patient_counts = patient_ids.loc[nonblank].value_counts()
+    audit = {
+        "rule": rule,
+        "input_rows": int(len(frame)),
+        "source_patients": int(patient_counts.size),
+        "multirow_patients": int(patient_counts.gt(1).sum()),
+        "valid_index_rows": int(valid.sum()),
+        "selected_index_rows": int(len(selected)),
+        "patients_without_valid_index_row": int(patient_counts.size - candidates["_patient_id"].nunique()),
+    }
+    if logical_name == "GLP1Cohort":
+        audit.update(
+            {
+                "qualifying_episode_anchors": int(len(preferred_anchors or {})),
+                "qualifying_anchors_with_valid_wide_row": anchor_count,
+            }
+        )
+    return selected, audit
 
 
 def merge_patient_payload(existing: dict[str, Any], candidate: Mapping[str, Any]) -> None:
@@ -1954,7 +2117,7 @@ def merge_patient_payload(existing: dict[str, Any], candidate: Mapping[str, Any]
         valid = [value for value in values if pd.notna(value)]
         existing[column] = max(valid) if valid else pd.NaT
     for column in (
-        "postop_incretin_flag", "prior_mbs_flag", "dialysis_transplant_flag", "diabetes_flag",
+        "prior_incretin_flag", "postop_incretin_flag", "prior_mbs_flag", "dialysis_transplant_flag", "diabetes_flag",
         "mbs_during_incretin_flag", "hypertension", "dyslipidemia", "osa", "insulin", "biguanide", "sglt2",
     ):
         existing[column] = max(wide_numeric(existing.get(column), 0.0), wide_numeric(candidate.get(column), 0.0))
@@ -1973,31 +2136,119 @@ def wide_tables_to_data_bundle(
     frames: Mapping[str, Any],
     sql: Mapping[str, str],
     qualified_names: Mapping[str, str],
+    preflight_only: bool = False,
 ) -> DataBundle:
-    mbs = frames["MBSCohort"].copy()
-    glp1 = frames["GLP1Cohort"].copy()
+    mbs = frames["MBSCohort"].copy().reset_index(drop=True)
+    glp1 = frames["GLP1Cohort"].copy().reset_index(drop=True)
     resolved_by_source = {
         "MBSCohort": resolve_wide_fields(mbs, "MBSCohort"),
         "GLP1Cohort": resolve_wide_fields(glp1, "GLP1Cohort"),
     }
-    patients_by_id: dict[str, dict[str, Any]] = {}
     procedure_rows: list[dict[str, Any]] = []
     medication_rows: list[dict[str, Any]] = []
-    measurement_rows: list[dict[str, Any]] = []
-    center_values: list[str] = []
 
+    # Preserve every reported procedure and exposure interval. Patient attributes and
+    # nominal outcomes are selected only after the primary index episode is known.
     for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1)):
         resolved = resolved_by_source[logical_name]
         source_table = qualified_names[logical_name]
-        index_field = "procedure_date" if logical_name == "MBSCohort" else "glp1_start"
         for row_number, (_, row) in enumerate(frame.iterrows()):
             patient_raw = wide_value(row, resolved, "patient_id", "")
             if pd.isna(patient_raw) or not str(patient_raw).strip():
                 continue
-            patient_id = str(patient_raw)
+            patient_id = str(patient_raw).strip()
+
+            if logical_name == "MBSCohort":
+                procedure_date = wide_date(wide_value(row, resolved, "procedure_date"))
+                if pd.notna(procedure_date):
+                    procedure_rows.append(
+                        {
+                            "patient_id": patient_id,
+                            "procedure_date": procedure_date,
+                            "procedure_code": wide_value(row, resolved, "procedure_code", ""),
+                            "procedure_concept_id": wide_value(row, resolved, "procedure_code", ""),
+                            "source_table": source_table,
+                        }
+                    )
+
+            medication_start = wide_date(wide_value(row, resolved, "glp1_start"))
+            medication_end = reported_medication_end(
+                medication_start,
+                wide_value(row, resolved, "glp1_end"),
+                wide_value(row, resolved, "glp1_duration"),
+            )
+            reported_exposure = logical_name == "GLP1Cohort" or any(
+                wide_numeric(wide_value(row, resolved, flag), 0.0) == 1
+                for flag in ("prior_glp1", "postop_glp1")
+            )
+            if reported_exposure:
+                ingredient = wide_value(row, resolved, "glp1_name", "")
+                medication_rows.append(
+                    {
+                        "patient_id": patient_id,
+                        "ingredient": ingredient,
+                        "medication_concept": ingredient,
+                        "route": wide_value(row, resolved, "glp1_route", "unknown"),
+                        "formulation": "unknown",
+                        "medication_start_date": medication_start,
+                        "medication_end_date": medication_end,
+                        "source_type": "reported_wide_episode",
+                        "source_id": f"{logical_name}-{row_number}",
+                        "dose": wide_numeric(wide_value(row, resolved, "dose")),
+                        "dose_unit": wide_value(row, resolved, "dose_unit", ""),
+                        "source_table": source_table,
+                        "source_cohort": "surgery" if logical_name == "MBSCohort" else "incretin",
+                    }
+                )
+
+    procedure_columns = [
+        "patient_id", "procedure_date", "procedure_code", "procedure_concept_id", "source_table",
+    ]
+    medication_columns = [
+        "patient_id", "ingredient", "medication_concept", "route", "formulation",
+        "medication_start_date", "medication_end_date", "source_type", "source_id", "dose",
+        "dose_unit", "source_table", "source_cohort",
+    ]
+    procedures = pd.DataFrame(procedure_rows, columns=procedure_columns).drop_duplicates(ignore_index=True)
+    medications = pd.DataFrame(medication_rows, columns=medication_columns).drop_duplicates(ignore_index=True)
+
+    incretin_medications = medications.loc[medications["source_cohort"].eq("incretin")]
+    incretin_records, incretin_medication_audit = medication_frame_to_coverage(incretin_medications)
+    incretin_episodes, _ = reconstruct_coverage_episodes(incretin_records)
+    episodes_by_patient: dict[str, list[CoverageEpisode]] = defaultdict(list)
+    for episode in incretin_episodes:
+        episodes_by_patient[episode.patient_id].append(episode)
+    epoch = pd.Timestamp("1970-01-01")
+    preferred_glp1_anchors = {
+        patient_id: epoch + pd.Timedelta(days=selected.start_day)
+        for patient_id, episodes in episodes_by_patient.items()
+        if (selected := select_primary_incretin_episode(episodes)) is not None
+    }
+
+    selected_frames: dict[str, Any] = {}
+    index_selection: dict[str, dict[str, Any]] = {}
+    for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1)):
+        anchors = preferred_glp1_anchors if logical_name == "GLP1Cohort" else None
+        selected_frames[logical_name], index_selection[logical_name] = select_wide_index_rows(
+            frame,
+            resolved_by_source[logical_name],
+            logical_name,
+            preferred_anchors=anchors,
+        )
+
+    patients_by_id: dict[str, dict[str, Any]] = {}
+    measurement_rows: list[dict[str, Any]] = []
+    selected_center_values: list[str] = []
+    for logical_name in ("MBSCohort", "GLP1Cohort"):
+        frame = selected_frames[logical_name]
+        resolved = resolved_by_source[logical_name]
+        source_table = qualified_names[logical_name]
+        index_field = "procedure_date" if logical_name == "MBSCohort" else "glp1_start"
+        for _, row in frame.iterrows():
+            patient_id = str(wide_value(row, resolved, "patient_id", "")).strip()
             index_date = wide_date(wide_value(row, resolved, index_field))
             active_end_days = wide_numeric(wide_value(row, resolved, "active_end_days"))
-            if pd.isna(index_date) or not math.isfinite(active_end_days) or active_end_days < 0:
+            if not patient_id or pd.isna(index_date) or not math.isfinite(active_end_days) or active_end_days < 0:
                 continue
             observation_end = index_date + pd.Timedelta(days=int(active_end_days))
             supplied_admin_end = wide_date(wide_value(row, resolved, "administrative_end_date"))
@@ -2008,8 +2259,7 @@ def wide_tables_to_data_bundle(
             birth_year = int(index_date.year - age) if math.isfinite(age) else np.nan
             center_raw = wide_value(row, resolved, "center_id", CENTER_UNAVAILABLE)
             center_id = CENTER_UNAVAILABLE if pd.isna(center_raw) or not str(center_raw).strip() else str(center_raw)
-            if center_id != CENTER_UNAVAILABLE:
-                center_values.append(center_id)
+            selected_center_values.append(center_id)
             candidate_patient = {
                 "patient_id": patient_id,
                 "center_id": center_id,
@@ -2022,6 +2272,8 @@ def wide_tables_to_data_bundle(
                 "observation_start_date": observation_start,
                 "observation_end_date": observation_end,
                 "administrative_end_date": administrative_end,
+                "wide_index_date": index_date,
+                "prior_incretin_flag": prior_glp1,
                 "postop_incretin_flag": wide_numeric(wide_value(row, resolved, "postop_glp1"), 0.0),
                 "prior_mbs_flag": wide_numeric(wide_value(row, resolved, "prior_mbs"), 0.0),
                 "dialysis_transplant_flag": wide_numeric(wide_value(row, resolved, "dialysis_transplant"), 0.0),
@@ -2051,47 +2303,6 @@ def wide_tables_to_data_bundle(
             else:
                 patients_by_id[patient_id] = {**candidate_patient, **source_specific}
 
-            if logical_name == "MBSCohort":
-                procedure_rows.append(
-                    {
-                        "patient_id": patient_id,
-                        "procedure_date": index_date,
-                        "procedure_code": wide_value(row, resolved, "procedure_code", ""),
-                        "procedure_concept_id": wide_value(row, resolved, "procedure_code", ""),
-                        "source_table": source_table,
-                    }
-                )
-
-            medication_start = wide_date(wide_value(row, resolved, "glp1_start"))
-            medication_end = reported_medication_end(
-                medication_start,
-                wide_value(row, resolved, "glp1_end"),
-                wide_value(row, resolved, "glp1_duration"),
-            )
-            reported_exposure = logical_name == "GLP1Cohort" or any(
-                wide_numeric(wide_value(row, resolved, flag), 0.0) == 1
-                for flag in ("prior_glp1", "postop_glp1")
-            )
-            if reported_exposure and pd.notna(medication_start) and pd.notna(medication_end):
-                ingredient = wide_value(row, resolved, "glp1_name", "")
-                medication_rows.append(
-                    {
-                        "patient_id": patient_id,
-                        "ingredient": ingredient,
-                        "medication_concept": ingredient,
-                        "route": wide_value(row, resolved, "glp1_route", "unknown"),
-                        "formulation": "unknown",
-                        "medication_start_date": medication_start,
-                        "medication_end_date": medication_end,
-                        "source_type": "reported_wide_episode",
-                        "source_id": f"{logical_name}-{row_number}",
-                        "dose": wide_numeric(wide_value(row, resolved, "dose")),
-                        "dose_unit": wide_value(row, resolved, "dose_unit", ""),
-                        "source_table": source_table,
-                        "source_cohort": "surgery" if logical_name == "MBSCohort" else "incretin",
-                    }
-                )
-
             for outcome, month, _, unit in WIDE_TARGET_FIELDS:
                 canonical = f"target_{outcome}_{month}"
                 source_column = resolved.get(canonical)
@@ -2113,21 +2324,25 @@ def wide_tables_to_data_bundle(
                         "source_concept": source_column + " (wide nominal horizon)",
                         "source_table": source_table,
                         "source_cohort": "surgery" if logical_name == "MBSCohort" else "incretin",
+                        "index_anchor_date": index_date,
                         "timing_precision": "nominal_horizon_from_wide_column" if month else "index_event_date",
                     }
                 )
 
     patients = pd.DataFrame(patients_by_id.values())
-    procedures = pd.DataFrame(procedure_rows).drop_duplicates()
-    medications = pd.DataFrame(medication_rows).drop_duplicates()
     measurements = pd.DataFrame(measurement_rows).drop_duplicates()
     encounters = pd.DataFrame(columns=["patient_id", "encounter_date", "source_table"])
     diagnoses = pd.DataFrame(columns=["patient_id", "diagnosis_date", "diagnosis_code", "source_table"])
-    center_complete = bool(len(patients) and patients["center_id"].ne(CENTER_UNAVAILABLE).all())
-    center_validation_available = center_complete and len(set(center_values)) >= 3
+    center_complete = bool(selected_center_values) and all(
+        value != CENTER_UNAVAILABLE for value in selected_center_values
+    )
+    center_validation_available = center_complete and len(set(selected_center_values)) >= 3
     limitations = [
+        "MBSCohort and GLP1Cohort are upstream analytic cohort tables; their defining SQL and upstream inclusion transforms are not visible in this database.",
         "Outcome values come from fixed wide horizon columns; exact measurement timestamps and within-window counts are unavailable.",
-        "GLP1StartDate and GLP1EndDate are treated as one reported exposure interval; fill-level gaps and stockpiling cannot be audited.",
+        "Each GLP1StartDate and GLP1EndDate pair is treated as one reported exposure interval; fill-level gaps and adherence within that interval cannot be audited.",
+        "For patients with multiple GLP1 rows, nominal outcomes are anchored only to the earliest episode satisfying the 183-day persistence and 365-day interepisode washout rules.",
+        "PriorGLP1 or PostOpGLP1 flags without an accepted dated interval are excluded rather than assigned a proxy treatment date.",
         "Observation start is operationalized as 365 days before index when PriorGLP1 is zero; the wide tables do not expose exact enrollment start.",
     ]
     if not all("administrative_end_date" in resolved for resolved in resolved_by_source.values()):
@@ -2145,19 +2360,32 @@ def wide_tables_to_data_bundle(
         diagnoses=diagnoses,
         metadata={
             "source_mode": "cosmos_direct_wide_cohorts",
-            "sql_contract_version": LEGACY_WIDE_CONTRACT_VERSION,
+            "sql_contract_version": DIRECT_WIDE_CONTRACT_VERSION,
             "sql": dict(sql),
             "query_fingerprint": digest({key: normalize_sql(value) for key, value in sql.items()}),
             "schema_fingerprint": digest({key: frame_schema(value) for key, value in frames.items()}),
             "source_tables": dict(qualified_names),
             "source_row_counts": {key: len(value) for key, value in frames.items()},
+            "source_unique_patient_counts": {
+                logical_name: int(
+                    frame[resolved_by_source[logical_name]["patient_id"]].dropna().astype(str).nunique()
+                )
+                for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
+            },
+            "index_row_selection": index_selection,
+            "accepted_incretin_interval_records": int(len(incretin_records)),
+            "rejected_incretin_interval_records": int(
+                (~incretin_medication_audit["accepted"]).sum()
+                if not incretin_medication_audit.empty else 0
+            ),
             "measurement_timing": "nominal_horizon_from_wide_columns",
-            "medication_coverage_semantics": "single_reported_start_end_interval",
+            "medication_coverage_semantics": "reported_start_end_intervals_across_all_patient_rows",
             "center_validation_available": center_validation_available,
+            "strict_raw_event_contract": False,
             "limitations": limitations,
         },
     )
-    bundle.metadata["preflight"] = validate_data_bundle(bundle)
+    bundle.metadata["preflight"] = validate_data_bundle(bundle, preflight_only=preflight_only)
     return bundle
 
 
@@ -2234,6 +2462,7 @@ def medication_frame_to_coverage(medications: Any, index_dates: Mapping[str, Any
 def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> dict[str, Any]:
     issues: list[str] = []
     details: list[str] = []
+    wide_source = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
     if bundle.patients.empty or bundle.patients["patient_id"].isna().any():
         issues.append("Stable patient identifiers are missing or null")
     if "center_id" not in bundle.patients or bundle.patients["center_id"].isna().any():
@@ -2262,16 +2491,38 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
     accepted = int(medication_audit["accepted"].sum()) if not medication_audit.empty else 0
     if accepted == 0:
         issues.append("No medication record yields accepted audited coverage semantics")
-    if "postop_incretin_flag" in bundle.patients and not preflight_only:
+    if "postop_incretin_flag" in bundle.patients:
         flagged = bundle.patients.loc[pd.to_numeric(bundle.patients["postop_incretin_flag"], errors="coerce").eq(1), "patient_id"].astype(str)
-        medication_patients = set(bundle.medications["patient_id"].astype(str))
+        timing_medications = bundle.medications
+        if wide_source and "source_cohort" in timing_medications:
+            timing_medications = timing_medications.loc[timing_medications["source_cohort"].eq("surgery")]
+        timing_records, _ = medication_frame_to_coverage(timing_medications)
+        procedure_dates = bundle.procedures[["patient_id", "procedure_date"]].copy()
+        procedure_dates["patient_id"] = procedure_dates["patient_id"].astype(str)
+        procedure_dates["procedure_date"] = pd.to_datetime(
+            procedure_dates["procedure_date"], errors="coerce"
+        )
+        procedure_index = procedure_dates.dropna(subset=["procedure_date"]).groupby(
+            "patient_id"
+        )["procedure_date"].min().to_dict()
+        epoch = pd.Timestamp("1970-01-01")
+        medication_patients = {
+            record.patient_id
+            for record in timing_records
+            if record.patient_id in procedure_index
+            and record.start_day >= int((pd.Timestamp(procedure_index[record.patient_id]) - epoch).days)
+        }
         unresolved = sorted(set(flagged).difference(medication_patients))
         if unresolved:
-            issues.append(f"Postoperative incretin start is unresolved for {len(unresolved)} flagged surgical patients")
-            details.append("Every flagged postoperative exposure requires an exact accepted start date; no proxy date is permitted")
+            if wide_source:
+                details.append(
+                    f"{len(unresolved)} flagged surgical patients lack a reported postoperative start and will be excluded from the primary cohort"
+                )
+            elif not preflight_only:
+                issues.append(f"Postoperative incretin start is unresolved for {len(unresolved)} flagged surgical patients")
+                details.append("Every flagged postoperative exposure requires an exact accepted start date; no proxy date is permitted")
     if issues:
         raise PreflightError("Production data preflight failed", issues, details)
-    wide_source = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
     limitations = list(bundle.metadata.get("limitations", [])) if wide_source else []
     details.extend(limitations)
     result = {
@@ -2316,10 +2567,19 @@ def connect_cosmos() -> Any:
 
 
 def query_cosmos(cfg: RunConfig, preflight_only: bool = False) -> DataBundle:
-    validate_embedded_raw_sql(EMBEDDED_RAW_SOURCE_SQL)
     connection = connect_cosmos()
     try:
-        return load_embedded_raw_bundle(connection, cfg, preflight_only=preflight_only)
+        frames, sql, qualified_names = load_direct_wide_tables(
+            connection,
+            cfg,
+            preflight_only=preflight_only,
+        )
+        return wide_tables_to_data_bundle(
+            frames,
+            sql,
+            qualified_names,
+            preflight_only=preflight_only,
+        )
     finally:
         connection.close()
 
@@ -2967,16 +3227,22 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             )
             for item in records_by_patient.get(str(patient_id), [])
         ]
+        unresolved_prior_flag = bool(
+            direct_wide
+            and numeric_or_default(patient or {}, "prior_incretin_flag") == 1
+            and not any(item.start_day < 0 for item in relative_records)
+        )
         history = classify_surgical_incretin_history(
             relative_records,
             postoperative_flag=bool(numeric_or_default(patient or {}, "postop_incretin_flag")),
+            timing_unknown=unresolved_prior_flag,
         )
         if not exclusion and history["classification"] == "previously_treated":
             exclusion = "qualifying_six_month_prior_episode"
-        if not exclusion and history["classification"] == "unknown":
-            exclusion = "unknown_exposure_timing"
         if not exclusion and history["unresolved_postoperative_start"]:
             exclusion = "postop_flag_without_start"
+        if not exclusion and history["classification"] == "unknown":
+            exclusion = "unknown_exposure_timing"
         exposure_rows.append(
             {
                 "patient_id": str(patient_id),
@@ -3035,16 +3301,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         if patient is not None and direct_wide:
             patient = patient_for_source(patient, "glp1")
         exclusion = ""
-        selected_episode: CoverageEpisode | None = None
-        for episode in sorted(episodes_by_patient[patient_id], key=lambda item: item.start_day):
-            previous_supported = [
-                prior.supported_end_day for prior in episodes_by_patient[patient_id]
-                if prior.supported_end_day < episode.start_day
-            ]
-            new_user = not previous_supported or episode.start_day - max(previous_supported) - 1 >= 365
-            if episode.qualifies_183 and new_user:
-                selected_episode = episode
-                break
+        selected_episode = select_primary_incretin_episode(episodes_by_patient[patient_id])
         if patient is None:
             exclusion = "missing_patient_record"
         elif selected_episode is None:
@@ -7187,6 +7444,25 @@ def run_embedded_self_tests() -> dict[str, Any]:
         str([(item.start_day, item.end_day) for item in stockpiled]),
     )
 
+    explicit_intervals = [
+        CoverageRecord(
+            patient_id="P",
+            start_day=start,
+            end_day=end,
+            ingredient="semaglutide",
+            therapy_class=INCRETIN_INGREDIENTS["semaglutide"],
+            source_type="explicit_treatment",
+            source_table="synthetic.wide",
+        )
+        for start, end in ((0, 29), (20, 49))
+    ]
+    explicit_adjusted = carry_stockpile_forward(explicit_intervals)
+    check(
+        "06b_explicit_intervals_do_not_stockpile",
+        explicit_adjusted[-1].end_day == 49,
+        str([(item.start_day, item.end_day) for item in explicit_adjusted]),
+    )
+
     # 7. A 31-day uncovered gap splits episodes under the primary rule.
     gap_episodes, _ = reconstruct_coverage_episodes([record(0, 40), record(72, 182)])
     check(
@@ -7567,8 +7843,8 @@ def run_embedded_self_tests() -> dict[str, Any]:
         f"forbidden={forbidden_imports}; project_local={project_local_imports}",
     )
 
-    # 29. The quarantined legacy-wide adapter remains deterministic for historical
-    # feasibility comparisons, but query_cosmos never calls it.
+    # 29. The production query path opens one connection, queries both direct source
+    # tables itself, keeps complete bounded patient histories, and closes the connection.
     mbs_fixture = pd.DataFrame(
         [
             {
@@ -7631,18 +7907,17 @@ def run_embedded_self_tests() -> dict[str, Any]:
 
     source_environment = ("METABOLIC_SOURCE_SCHEMA", "METABOLIC_MBS_TABLE", "METABOLIC_GLP1_TABLE")
     saved_environment = {name: os.environ.get(name) for name in source_environment}
+    original_connect_cosmos = globals()["connect_cosmos"]
+    original_read_sql_query = pd.read_sql_query
     direct_bundle: DataBundle | None = None
     direct_cohorts = pd.DataFrame()
     direct_failure: PreflightError | None = None
     try:
         for name in source_environment:
             os.environ.pop(name, None)
-        direct_frames, direct_sql, direct_names = load_direct_wide_tables(
-            direct_connection,
-            RunConfig.create("smoke", None, False),
-            read_sql=direct_fixture_reader,
-        )
-        direct_bundle = wide_tables_to_data_bundle(direct_frames, direct_sql, direct_names)
+        globals()["connect_cosmos"] = lambda: direct_connection
+        pd.read_sql_query = direct_fixture_reader
+        direct_bundle = query_cosmos(RunConfig.create("smoke", None, False))
         direct_cohorts = construct_cohorts(direct_bundle)["cohorts"]
 
         def unavailable_reader(sql: str, connection: Any) -> Any:
@@ -7650,30 +7925,42 @@ def run_embedded_self_tests() -> dict[str, Any]:
 
         try:
             load_direct_wide_tables(
-                direct_connection,
+                object(),
                 RunConfig.create("smoke", None, False),
                 read_sql=unavailable_reader,
             )
         except PreflightError as exc:
             direct_failure = exc
     finally:
-        direct_connection.close()
+        globals()["connect_cosmos"] = original_connect_cosmos
+        pd.read_sql_query = original_read_sql_query
+        if not direct_connection.closed:
+            direct_connection.close()
         for name, value in saved_environment.items():
             if value is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+    captured_probe_sql = [sql for sql in captured_sql if "column probe" in sql]
+    captured_source_sql = [sql for sql in captured_sql if "direct wide cohort input" in sql]
     check(
-        "29_legacy_wide_adapter_normalization",
+        "29_production_direct_wide_query_e2e",
         direct_bundle is not None
         and direct_connection.closed
-        and len(captured_sql) == 2
-        and all("SELECT TOP (2000) *" in sql for sql in captured_sql)
+        and len(captured_sql) == 4
+        and len(captured_probe_sql) == 2
+        and all("SELECT TOP (0) *" in sql for sql in captured_probe_sql)
+        and len(captured_source_sql) == 2
+        and all("WITH [sampled_patients]" in sql for sql in captured_source_sql)
+        and all("SELECT TOP (2000) [PatKey]" in sql for sql in captured_source_sql)
+        and all("INNER JOIN [sampled_patients]" in sql for sql in captured_source_sql)
+        and all("[source].*" not in sql for sql in captured_source_sql)
         and all("INFORMATION_SCHEMA" not in sql for sql in captured_sql)
         and any("[dbo].[MBSCohort]" in sql for sql in captured_sql)
         and any("[dbo].[GLP1Cohort]" in sql for sql in captured_sql)
         and direct_bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
         and direct_bundle.metadata.get("measurement_timing") == "nominal_horizon_from_wide_columns"
+        and direct_bundle.metadata.get("strict_raw_event_contract") is False
         and direct_bundle.metadata.get("preflight", {}).get("status") == "passed_with_wide_source_limitations"
         and set(direct_cohorts["cohort"]) == {"surgery", "incretin"},
         f"queries={len(captured_sql)}; cohorts={sorted(direct_cohorts.get('cohort', pd.Series(dtype=str)).unique())}",
@@ -7686,7 +7973,7 @@ def run_embedded_self_tests() -> dict[str, Any]:
         ]
     )
     check(
-        "30_legacy_wide_failure_diagnostics",
+        "30_direct_wide_failure_diagnostics",
         direct_failure is not None
         and direct_failure.title == "Cosmos direct cohort query failed"
         and "MBSCohort" in direct_failure_text
@@ -7695,8 +7982,8 @@ def run_embedded_self_tests() -> dict[str, Any]:
         direct_failure_text,
     )
 
-    # 31. The real feasibility extract is multi-row for some GLP-1 patients. Never
-    # collapse those episodes without a reviewed new-user/index-event rule.
+    # 31. The real feasibility extract is multi-row for some GLP-1 patients. All
+    # intervals remain available, while outcomes use the reviewed primary episode.
     repeated_glp1 = pd.concat(
         [
             glp1_fixture,
@@ -7704,17 +7991,49 @@ def run_embedded_self_tests() -> dict[str, Any]:
         ],
         ignore_index=True,
     )
-    repeated_failure: PreflightError | None = None
-    try:
-        resolve_wide_fields(repeated_glp1, "GLP1Cohort")
-    except PreflightError as exc:
-        repeated_failure = exc
+    repeated_frames = {"MBSCohort": mbs_fixture, "GLP1Cohort": repeated_glp1}
+    repeated_bundle = wide_tables_to_data_bundle(
+        repeated_frames,
+        {"MBSCohort": "fixture mbs", "GLP1Cohort": "fixture glp1"},
+        {"MBSCohort": "dbo.MBSCohort", "GLP1Cohort": "dbo.GLP1Cohort"},
+    )
+    reversed_bundle = wide_tables_to_data_bundle(
+        {"MBSCohort": mbs_fixture, "GLP1Cohort": repeated_glp1.iloc[::-1].reset_index(drop=True)},
+        {"MBSCohort": "fixture mbs", "GLP1Cohort": "fixture glp1"},
+        {"MBSCohort": "dbo.MBSCohort", "GLP1Cohort": "dbo.GLP1Cohort"},
+    )
+    repeated_cohort = construct_cohorts(repeated_bundle)["cohorts"]
+    repeated_glp1_cohort = repeated_cohort.loc[repeated_cohort["cohort"].eq("incretin")].iloc[0]
+    repeated_glp1_measurements = repeated_bundle.measurements.loc[
+        repeated_bundle.measurements["source_cohort"].eq("incretin")
+    ]
     check(
-        "31_multirow_glp1_requires_reviewed_index_rule",
-        repeated_failure is not None
-        and repeated_failure.title == "GLP1Cohort direct query is not one row per patient"
-        and "Deduplicate the source query" in " ".join(repeated_failure.details),
-        str(repeated_failure or "duplicate rows were silently accepted"),
+        "31_multirow_glp1_deterministic_primary_episode",
+        len(repeated_bundle.medications.loc[repeated_bundle.medications["source_cohort"].eq("incretin")]) == 2
+        and repeated_bundle.metadata["index_row_selection"]["GLP1Cohort"]["multirow_patients"] == 1
+        and repeated_bundle.metadata["index_row_selection"]["GLP1Cohort"]["selected_index_rows"] == 1
+        and pd.Timestamp(repeated_glp1_cohort["index_date"]) == pd.Timestamp("2020-02-01")
+        and repeated_glp1_cohort["treatment"] == "semaglutide"
+        and repeated_glp1_measurements["index_anchor_date"].nunique() == 1
+        and pd.Timestamp(repeated_glp1_measurements["index_anchor_date"].iloc[0]) == pd.Timestamp("2020-02-01")
+        and repeated_bundle.patients.loc[repeated_bundle.patients["patient_id"].eq("DIRECT-GLP1"), "glp1__wide_index_date"].iloc[0]
+        == reversed_bundle.patients.loc[reversed_bundle.patients["patient_id"].eq("DIRECT-GLP1"), "glp1__wide_index_date"].iloc[0],
+        str(repeated_bundle.metadata["index_row_selection"]["GLP1Cohort"]),
+    )
+
+    flagged_bundle = wide_tables_to_data_bundle(
+        {"MBSCohort": mbs_fixture.assign(PostOpGLP1=1), "GLP1Cohort": glp1_fixture},
+        {"MBSCohort": "fixture mbs", "GLP1Cohort": "fixture glp1"},
+        {"MBSCohort": "dbo.MBSCohort", "GLP1Cohort": "dbo.GLP1Cohort"},
+    )
+    flagged_artifacts = construct_cohorts(flagged_bundle)
+    flagged_details = " ".join(flagged_bundle.metadata["preflight"]["details"])
+    check(
+        "31b_undated_postoperative_flag_is_excluded_not_imputed",
+        "flagged surgical patients lack a reported postoperative start" in flagged_details
+        and "postop_flag_without_start" in set(flagged_artifacts["funnel"]["stage"])
+        and set(flagged_artifacts["cohorts"]["cohort"]) == {"incretin"},
+        flagged_details,
     )
 
     # 32. Schema discovery reads only metadata and can rank normalized source tables
@@ -7936,8 +8255,8 @@ def run_embedded_self_tests() -> dict[str, Any]:
         str(raw_bundle.metadata),
     )
 
-    # 35. An absent contract and any attempted premade-cohort reference both stop
-    # before a database query can be issued.
+    # 35. The optional future raw-source loader remains strictly validated even though
+    # the current production path uses the two reviewed direct wide tables.
     absent_contract_failure: PreflightError | None = None
     forbidden_contract_failure: PreflightError | None = None
     try:
@@ -7953,7 +8272,7 @@ def run_embedded_self_tests() -> dict[str, Any]:
     except PreflightError as exc:
         forbidden_contract_failure = exc
     check(
-        "35_production_rejects_missing_or_premade_contract",
+        "35_optional_raw_contract_validation",
         absent_contract_failure is not None
         and absent_contract_failure.title == "Reviewed raw-source SQL is not yet embedded"
         and forbidden_contract_failure is not None
@@ -8245,8 +8564,8 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Start on a new Cosmos schema with --schema-discovery. Production remains hard-gated "
-            "until reviewed raw-table CTEs are embedded in this file."
+            "Production queries MBSCohort and GLP1Cohort directly. Use --schema-discovery "
+            "only when moving to a different Cosmos schema or auditing newly exposed sources."
         ),
     )
     modes = parser.add_mutually_exclusive_group()
