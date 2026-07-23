@@ -66,9 +66,9 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
-STUDY_VERSION = "metabolic-trajectory-1.3.0"
+STUDY_VERSION = "metabolic-trajectory-1.3.1"
 SQL_CONTRACT_VERSION = "metabolic-raw-events-v1.1.0"
-DIRECT_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.1.0"
+DIRECT_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.1.1"
 SCHEMA_DISCOVERY_VERSION = "metabolic-schema-discovery-v1.0.0"
 DEFAULT_CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -413,6 +413,8 @@ def target_window(month: int) -> TargetWindow:
 
 
 TARGET_WINDOWS = {month: target_window(month) for month in sorted(WINDOW_MONTHS)}
+MAX_WIDE_STUDY_FOLLOWUP_DAYS = max(window.end_day for window in TARGET_WINDOWS.values())
+MAX_PLAUSIBLE_WIDE_FOLLOWUP_DAYS = int(round(50 * DAYS_PER_YEAR))
 
 
 def normalize_sql(sql: str) -> str:
@@ -1979,6 +1981,64 @@ def reported_medication_end(start: Any, end: Any, duration: Any) -> Any:
     return pd.NaT
 
 
+def resolve_wide_followup_days(
+    frame: Any,
+    resolved: Mapping[str, str],
+) -> Any:
+    """Resolve ActiveEndInterval without assuming every numeric value is a day count.
+
+    Reported values are retained only within a generous 50-year plausibility bound and
+    are truncated at the final study window because later opportunity is unused. A
+    non-null wide outcome proves observation through its nominal horizon, so it can
+    extend a short reported interval or provide a conservative fallback when the source
+    interval is missing, negative, infinite, or implausibly large.
+    """
+    raw = pd.to_numeric(frame[resolved["active_end_days"]], errors="coerce").astype(float)
+    observed_horizon = pd.Series(np.nan, index=frame.index, dtype=float)
+    for outcome, month, _, _ in WIDE_TARGET_FIELDS:
+        source_column = resolved.get(f"target_{outcome}_{month}")
+        if source_column is None:
+            continue
+        values = pd.to_numeric(frame[source_column], errors="coerce")
+        day = 0 if month == 0 else month_to_nominal_day(month)
+        present = values.notna()
+        observed_horizon.loc[present] = observed_horizon.loc[present].fillna(0).clip(
+            lower=day
+        )
+
+    finite = np.isfinite(raw)
+    plausible = finite & raw.between(0, MAX_PLAUSIBLE_WIDE_FOLLOWUP_DAYS)
+    effective = pd.Series(np.nan, index=frame.index, dtype=float)
+    effective.loc[plausible] = raw.loc[plausible].clip(
+        upper=MAX_WIDE_STUDY_FOLLOWUP_DAYS
+    )
+    extend = plausible & observed_horizon.notna() & observed_horizon.gt(effective)
+    effective.loc[extend] = observed_horizon.loc[extend].clip(
+        upper=MAX_WIDE_STUDY_FOLLOWUP_DAYS
+    )
+    fallback = ~plausible & observed_horizon.notna()
+    effective.loc[fallback] = observed_horizon.loc[fallback].clip(
+        upper=MAX_WIDE_STUDY_FOLLOWUP_DAYS
+    )
+
+    method = pd.Series("unusable", index=frame.index, dtype="string")
+    method.loc[plausible] = "reported_days"
+    method.loc[plausible & raw.gt(MAX_WIDE_STUDY_FOLLOWUP_DAYS)] = (
+        "reported_days_capped_to_study_horizon"
+    )
+    method.loc[extend] = "reported_days_extended_by_outcome_horizon"
+    method.loc[fallback] = "outcome_horizon_fallback"
+    return pd.DataFrame(
+        {
+            "raw_active_end": raw,
+            "observed_outcome_horizon": observed_horizon,
+            "effective_active_end": effective,
+            "resolution_method": method,
+        },
+        index=frame.index,
+    )
+
+
 def select_primary_incretin_episode(
     episodes: Sequence[CoverageEpisode],
 ) -> CoverageEpisode | None:
@@ -2008,7 +2068,8 @@ def select_wide_index_rows(
     patient_ids = frame[patient_column].astype("string").str.strip()
     nonblank = patient_ids.notna() & patient_ids.ne("")
     index_dates = pd.to_datetime(frame[resolved[index_field]], errors="coerce").dt.normalize()
-    active_end = pd.to_numeric(frame[resolved["active_end_days"]], errors="coerce")
+    followup = resolve_wide_followup_days(frame, resolved)
+    active_end = followup["effective_active_end"]
     valid = nonblank & index_dates.notna() & active_end.notna() & active_end.ge(0)
     candidates = pd.DataFrame(
         {
@@ -2096,6 +2157,10 @@ def select_wide_index_rows(
         "valid_index_rows": int(valid.sum()),
         "selected_index_rows": int(len(selected)),
         "patients_without_valid_index_row": int(patient_counts.size - candidates["_patient_id"].nunique()),
+        "active_end_resolution_counts": {
+            str(key): int(value)
+            for key, value in followup["resolution_method"].value_counts().sort_index().items()
+        },
     }
     if logical_name == "GLP1Cohort":
         audit.update(
@@ -2240,14 +2305,17 @@ def wide_tables_to_data_bundle(
     measurement_rows: list[dict[str, Any]] = []
     selected_center_values: list[str] = []
     for logical_name in ("MBSCohort", "GLP1Cohort"):
-        frame = selected_frames[logical_name]
+        frame = selected_frames[logical_name].copy()
         resolved = resolved_by_source[logical_name]
         source_table = qualified_names[logical_name]
         index_field = "procedure_date" if logical_name == "MBSCohort" else "glp1_start"
+        selected_followup = resolve_wide_followup_days(frame, resolved)
+        frame["_effective_active_end_days"] = selected_followup["effective_active_end"]
+        frame["_active_end_resolution_method"] = selected_followup["resolution_method"]
         for _, row in frame.iterrows():
             patient_id = str(wide_value(row, resolved, "patient_id", "")).strip()
             index_date = wide_date(wide_value(row, resolved, index_field))
-            active_end_days = wide_numeric(wide_value(row, resolved, "active_end_days"))
+            active_end_days = wide_numeric(row["_effective_active_end_days"])
             if not patient_id or pd.isna(index_date) or not math.isfinite(active_end_days) or active_end_days < 0:
                 continue
             observation_end = index_date + pd.Timedelta(days=int(active_end_days))
@@ -2273,6 +2341,7 @@ def wide_tables_to_data_bundle(
                 "observation_end_date": observation_end,
                 "administrative_end_date": administrative_end,
                 "wide_index_date": index_date,
+                "active_end_resolution_method": str(row["_active_end_resolution_method"]),
                 "prior_incretin_flag": prior_glp1,
                 "postop_incretin_flag": wide_numeric(wide_value(row, resolved, "postop_glp1"), 0.0),
                 "prior_mbs_flag": wide_numeric(wide_value(row, resolved, "prior_mbs"), 0.0),
@@ -2347,7 +2416,7 @@ def wide_tables_to_data_bundle(
     ]
     if not all("administrative_end_date" in resolved for resolved in resolved_by_source.values()):
         limitations.append(
-            "ActiveEndInterval is treated as patient-specific observation and administrative opportunity when no explicit data-through date exists."
+            "Plausible ActiveEndInterval day counts are bounded at the final study window; missing, negative, infinite, or implausibly large values use the latest non-null wide outcome horizon as conservative opportunity."
         )
     if not center_validation_available:
         limitations.append("A usable center identifier is unavailable, so geographic holdout validation is not performed.")
@@ -2534,12 +2603,18 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
         "strict_raw_event_contract": not wide_source,
     }
     if wide_source:
+        index_selection = dict(bundle.metadata.get("index_row_selection", {}))
         result.update(
             {
                 "source_row_counts": dict(bundle.metadata.get("source_row_counts", {})),
                 "measurement_timing": bundle.metadata.get("measurement_timing"),
                 "medication_coverage_semantics": bundle.metadata.get("medication_coverage_semantics"),
                 "center_validation_available": bool(bundle.metadata.get("center_validation_available")),
+                "index_row_selection": index_selection,
+                "active_end_resolution_counts": {
+                    source: dict(audit.get("active_end_resolution_counts", {}))
+                    for source, audit in index_selection.items()
+                },
                 "limitations": limitations,
             }
         )
@@ -8034,6 +8109,32 @@ def run_embedded_self_tests() -> dict[str, Any]:
         and "postop_flag_without_start" in set(flagged_artifacts["funnel"]["stage"])
         and set(flagged_artifacts["cohorts"]["cohort"]) == {"incretin"},
         flagged_details,
+    )
+
+    overflow_active_end = 2_914_070_000_000_000
+    overflow_bundle = wide_tables_to_data_bundle(
+        {
+            "MBSCohort": mbs_fixture.assign(ActiveEndInterval=overflow_active_end),
+            "GLP1Cohort": glp1_fixture,
+        },
+        {"MBSCohort": "fixture mbs", "GLP1Cohort": "fixture glp1"},
+        {"MBSCohort": "dbo.MBSCohort", "GLP1Cohort": "dbo.GLP1Cohort"},
+    )
+    overflow_cohorts = construct_cohorts(overflow_bundle)["cohorts"]
+    overflow_patient = overflow_bundle.patients.loc[
+        overflow_bundle.patients["patient_id"].eq("DIRECT-MBS")
+    ].iloc[0]
+    expected_observation_end = pd.Timestamp("2020-01-15") + pd.Timedelta(
+        days=month_to_nominal_day(12)
+    )
+    check(
+        "31c_implausible_active_end_uses_outcome_horizon",
+        overflow_patient["mbs__active_end_resolution_method"] == "outcome_horizon_fallback"
+        and pd.Timestamp(overflow_patient["observation_end_date"]) == expected_observation_end
+        and overflow_bundle.metadata["preflight"]["active_end_resolution_counts"]["MBSCohort"]
+        == {"outcome_horizon_fallback": 1}
+        and set(overflow_cohorts["cohort"]) == {"surgery", "incretin"},
+        str(overflow_bundle.metadata["preflight"]["active_end_resolution_counts"]),
     )
 
     # 32. Schema discovery reads only metadata and can rank normalized source tables
