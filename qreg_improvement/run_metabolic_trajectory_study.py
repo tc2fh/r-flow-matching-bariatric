@@ -65,9 +65,9 @@ os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
 os.environ.setdefault("LOKY_MAX_CPU_COUNT", "1")
 
-STUDY_VERSION = "metabolic-trajectory-1.3.1"
+STUDY_VERSION = "metabolic-trajectory-1.4.0"
 SQL_CONTRACT_VERSION = "metabolic-raw-events-v1.1.0"
-DIRECT_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.1.1"
+DIRECT_WIDE_CONTRACT_VERSION = "metabolic-direct-wide-v1.2.0"
 SCHEMA_DISCOVERY_VERSION = "metabolic-schema-discovery-v1.0.0"
 DEFAULT_CONNECTION_STRING = (
     "Driver={ODBC Driver 17 for SQL Server};"
@@ -1952,6 +1952,22 @@ def build_direct_schema_probe_sql(schema: str, table: str) -> str:
     )
 
 
+def build_direct_source_count_sql(
+    schema: str,
+    table: str,
+    patient_column: str,
+) -> str:
+    qualified = f"{quote_identifier(schema)}.{quote_identifier(table)}"
+    patient = quote_identifier(patient_column)
+    return (
+        f"/* {DIRECT_WIDE_CONTRACT_VERSION}: aggregate source count; no patient values */\n"
+        "SELECT\n"
+        "    COUNT_BIG(*) AS [source_rows],\n"
+        f"    COUNT_BIG(DISTINCT {patient}) AS [source_patients]\n"
+        f"FROM {qualified}"
+    )
+
+
 def build_direct_source_sql(
     schema: str,
     table: str,
@@ -1992,7 +2008,7 @@ def load_direct_wide_tables(
     cfg: RunConfig,
     read_sql: Callable[[str, Any], Any] | None = None,
     preflight_only: bool = False,
-) -> tuple[dict[str, Any], dict[str, str], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, str], dict[str, str], dict[str, dict[str, int]]]:
     reader = read_sql or pd.read_sql_query
     schema, mbs_table, glp1_table = direct_source_names()
     patient_limit = cfg.smoke_query_limit if cfg.smoke else (2000 if preflight_only or cfg.mode == "preflight-only" else None)
@@ -2000,6 +2016,7 @@ def load_direct_wide_tables(
     frames: dict[str, Any] = {}
     sql: dict[str, str] = {}
     qualified: dict[str, str] = {}
+    source_totals: dict[str, dict[str, int]] = {}
     failures: list[str] = []
     for logical_name, table_name in sources.items():
         probe = build_direct_schema_probe_sql(schema, table_name)
@@ -2008,6 +2025,19 @@ def load_direct_wide_tables(
             if not len(schema_frame.columns):
                 raise ValueError("column probe returned no columns")
             resolved = resolve_wide_fields(schema_frame, logical_name)
+            count_query = build_direct_source_count_sql(
+                schema,
+                table_name,
+                resolved["patient_id"],
+            )
+            count_frame = reader(count_query, connection)
+            if count_frame.empty:
+                raise ValueError("aggregate source count returned no rows")
+            count_row = count_frame.iloc[0]
+            source_totals[logical_name] = {
+                "rows": int(count_row["source_rows"]),
+                "patients": int(count_row["source_patients"]),
+            }
             query = build_direct_source_sql(
                 schema,
                 table_name,
@@ -2023,6 +2053,7 @@ def load_direct_wide_tables(
             continue
         frames[logical_name] = frame.drop_duplicates().reset_index(drop=True)
         sql[logical_name] = query
+        sql[f"{logical_name}_aggregate_count"] = count_query
         qualified[logical_name] = f"{schema}.{table_name}"
     if failures:
         raise PreflightError(
@@ -2033,7 +2064,7 @@ def load_direct_wide_tables(
                 "Confirm SELECT access, table names, and the ProjectD332AFD database connection.",
             ],
         )
-    return frames, sql, qualified
+    return frames, sql, qualified, source_totals
 
 
 def wide_value(row: Any, resolved: Mapping[str, str], canonical: str, default: Any = math.nan) -> Any:
@@ -2288,6 +2319,7 @@ def wide_tables_to_data_bundle(
     frames: Mapping[str, Any],
     sql: Mapping[str, str],
     qualified_names: Mapping[str, str],
+    source_totals: Mapping[str, Mapping[str, int]] | None = None,
     preflight_only: bool = False,
 ) -> DataBundle:
     mbs = frames["MBSCohort"].copy().reset_index(drop=True)
@@ -2528,6 +2560,19 @@ def wide_tables_to_data_bundle(
                 )
                 for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
             },
+            "source_total_row_counts": {
+                logical_name: int((source_totals or {}).get(logical_name, {}).get("rows", len(frame)))
+                for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
+            },
+            "source_total_unique_patient_counts": {
+                logical_name: int(
+                    (source_totals or {}).get(logical_name, {}).get(
+                        "patients",
+                        frame[resolved_by_source[logical_name]["patient_id"]].dropna().astype(str).nunique(),
+                    )
+                )
+                for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
+            },
             "index_row_selection": index_selection,
             "accepted_incretin_interval_records": int(len(incretin_records)),
             "rejected_incretin_interval_records": int(
@@ -2691,9 +2736,22 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
     }
     if wide_source:
         index_selection = dict(bundle.metadata.get("index_row_selection", {}))
+        sampled_patients = dict(bundle.metadata.get("source_unique_patient_counts", {}))
+        total_patients = dict(bundle.metadata.get("source_total_unique_patient_counts", sampled_patients))
+        sampling_fractions = {
+            source: (
+                float(sampled_patients.get(source, 0)) / float(total)
+                if float(total) > 0 else math.nan
+            )
+            for source, total in total_patients.items()
+        }
         result.update(
             {
                 "source_row_counts": dict(bundle.metadata.get("source_row_counts", {})),
+                "source_unique_patient_counts": sampled_patients,
+                "source_total_row_counts": dict(bundle.metadata.get("source_total_row_counts", {})),
+                "source_total_unique_patient_counts": total_patients,
+                "source_patient_sampling_fractions": sampling_fractions,
                 "measurement_timing": bundle.metadata.get("measurement_timing"),
                 "medication_coverage_semantics": bundle.metadata.get("medication_coverage_semantics"),
                 "center_validation_available": bool(bundle.metadata.get("center_validation_available")),
@@ -2731,7 +2789,7 @@ def connect_cosmos() -> Any:
 def query_cosmos(cfg: RunConfig, preflight_only: bool = False) -> DataBundle:
     connection = connect_cosmos()
     try:
-        frames, sql, qualified_names = load_direct_wide_tables(
+        frames, sql, qualified_names, source_totals = load_direct_wide_tables(
             connection,
             cfg,
             preflight_only=preflight_only,
@@ -2740,6 +2798,7 @@ def query_cosmos(cfg: RunConfig, preflight_only: bool = False) -> DataBundle:
             frames,
             sql,
             qualified_names,
+            source_totals=source_totals,
             preflight_only=preflight_only,
         )
     finally:
@@ -5021,8 +5080,51 @@ def fit_ode_candidate(task: Any, cohorts: Any, measurements: Any, cfg: RunConfig
 # ======================================================================================
 
 
+def prediction_development_iqr_map(predictions: Any) -> dict[tuple[str, str, int], float]:
+    development = predictions.loc[
+        predictions["split"].eq("train") & predictions["target_observed"]
+    ].drop_duplicates("row_id")
+    scales: dict[tuple[str, str, int], float] = {}
+    for keys, group in development.groupby(["cohort", "outcome", "target_month"], sort=True):
+        values = pd.to_numeric(group["target_value"], errors="coerce").dropna().to_numpy(float)
+        if len(values):
+            q25, q75 = np.quantile(values, [0.25, 0.75])
+            scales[(str(keys[0]), str(keys[1]), int(keys[2]))] = max(float(q75 - q25), 1e-8)
+    return scales
+
+
+def equal_horizon_standardized_crps(
+    frame: Any,
+    matrix: Any,
+    weights: Any,
+    scale_map: Mapping[tuple[str, str, int], float],
+) -> float:
+    if frame.empty:
+        return math.nan
+    values: list[float] = []
+    target_months = pd.to_numeric(frame["target_month"], errors="coerce").to_numpy(int)
+    for target_month in sorted(set(int(item) for item in target_months)):
+        mask = target_months == target_month
+        cohort = str(frame.iloc[0]["cohort"])
+        outcome = str(frame.iloc[0]["outcome"])
+        scale = float(scale_map.get((cohort, outcome, target_month), math.nan))
+        if not math.isfinite(scale) or scale <= 0:
+            continue
+        y = frame.loc[mask, "target_value"].to_numpy(float)
+        values.append(
+            quantile_crps(
+                y,
+                np.asarray(matrix, dtype=float)[mask],
+                np.asarray(weights, dtype=float)[mask],
+            )
+            / scale
+        )
+    return float(np.mean(values)) if values else math.nan
+
+
 def candidate_validation_scores(predictions: Any) -> Any:
     rows: list[dict[str, Any]] = []
+    scale_map = prediction_development_iqr_map(predictions)
     observed = predictions.loc[predictions["split"].eq("validation") & predictions["target_observed"]].copy()
     group_columns = ["cohort", "outcome", "origin_month", "candidate", "architecture"]
     for keys, group in observed.groupby(group_columns, sort=True):
@@ -5033,6 +5135,12 @@ def candidate_validation_scores(predictions: Any) -> Any:
             {
                 **dict(zip(group_columns, keys, strict=False)),
                 "validation_crps": quantile_crps(y, matrix, weights),
+                "validation_standardized_crps": equal_horizon_standardized_crps(
+                    group,
+                    matrix,
+                    weights,
+                    scale_map,
+                ),
                 "validation_rmse": float(np.sqrt(np.average((y - matrix[:, 3]) ** 2, weights=weights))),
                 "coverage_80": float(np.average((y >= matrix[:, 1]) & (y <= matrix[:, 5]), weights=weights)),
                 "coverage_90": float(np.average((y >= matrix[:, 0]) & (y <= matrix[:, 6]), weights=weights)),
@@ -5048,9 +5156,10 @@ def add_ensemble_candidates(predictions: Any, cfg: RunConfig) -> tuple[Any, Any]
         return predictions, pd.DataFrame()
     ensemble_predictions: list[Any] = []
     weight_rows: list[dict[str, Any]] = []
+    scale_map = prediction_development_iqr_map(predictions)
     group_columns = ["cohort", "outcome", "origin_month"]
     for keys, scores in leaderboard.groupby(group_columns, sort=True):
-        scores = scores.sort_values("validation_crps")
+        scores = scores.sort_values(["validation_standardized_crps", "validation_crps"])
         selected_candidates: list[str] = []
         used_architectures: set[str] = set()
         for row in scores.itertuples(index=False):
@@ -5089,9 +5198,17 @@ def add_ensemble_candidates(predictions: Any, cfg: RunConfig) -> tuple[Any, Any]
             continue
         y = identity.loc[validation_mask, "target_value"].to_numpy(float)
         sample_weight = identity.loc[validation_mask, "analysis_weight"].to_numpy(float)
+        validation_identity = identity.loc[validation_mask].copy()
         best_weights = np.full(len(matrices), 1.0 / len(matrices))
         best_matrix = sum(weight * matrix[validation_mask] for weight, matrix in zip(best_weights, matrices, strict=False))
-        best_score = quantile_crps(y, rearrange_quantiles(best_matrix), sample_weight)
+        best_matrix = rearrange_quantiles(best_matrix)
+        best_score = equal_horizon_standardized_crps(
+            validation_identity,
+            best_matrix,
+            sample_weight,
+            scale_map,
+        )
+        best_raw_score = quantile_crps(y, best_matrix, sample_weight)
         best_base = scores.iloc[0]
         rng = np.random.default_rng(cfg.seed + int(origin_month) * 17 + len(outcome))
         trial_count = 80 if cfg.smoke else 1000
@@ -5106,9 +5223,16 @@ def add_ensemble_candidates(predictions: Any, cfg: RunConfig) -> tuple[Any, Any]
                 continue
             if abs(coverage_90 - 0.90) > abs(float(best_base["coverage_90"]) - 0.90) + 1e-8:
                 continue
-            score = quantile_crps(y, matrix, sample_weight)
+            score = equal_horizon_standardized_crps(
+                validation_identity,
+                matrix,
+                sample_weight,
+                scale_map,
+            )
             if score < best_score:
-                best_score, best_weights = score, weights
+                best_score = score
+                best_raw_score = quantile_crps(y, matrix, sample_weight)
+                best_weights = weights
         all_matrix = rearrange_quantiles(
             sum(weight * item for weight, item in zip(best_weights, matrices, strict=False))
         )
@@ -5128,7 +5252,8 @@ def add_ensemble_candidates(predictions: Any, cfg: RunConfig) -> tuple[Any, Any]
                     "origin_month": origin_month,
                     "candidate": candidate,
                     "weight": float(architecture_weight),
-                    "validation_crps": best_score,
+                    "validation_crps": best_raw_score,
+                    "validation_standardized_crps": best_score,
                 }
             )
     if ensemble_predictions:
@@ -5457,13 +5582,20 @@ def select_models(leaderboard: Any) -> Any:
         viable["coverage_penalty"] = (viable["coverage_80"] - 0.80).abs() + (viable["coverage_90"] - 0.90).abs()
         acceptable = viable.loc[(viable["coverage_80"] - 0.80).abs().le(0.05) & (viable["coverage_90"] - 0.90).abs().le(0.05)]
         pool = acceptable if not acceptable.empty else viable
-        selected = pool.sort_values(["validation_crps", "coverage_penalty", "candidate"]).iloc[0]
+        selected = pool.sort_values(
+            ["validation_standardized_crps", "coverage_penalty", "validation_crps", "candidate"]
+        ).iloc[0]
         rows.append(
             {
                 **dict(zip(group_columns, keys, strict=False)),
                 "selected_candidate": selected["candidate"],
                 "validation_crps": selected["validation_crps"],
-                "selection_reason": "lowest validation CRPS among candidates passing interval calibration" if not acceptable.empty else "lowest validation CRPS; no candidate passed both coverage gates",
+                "validation_standardized_crps": selected["validation_standardized_crps"],
+                "selection_reason": (
+                    "lowest equal-horizon standardized validation CRPS among candidates passing interval calibration"
+                    if not acceptable.empty
+                    else "lowest equal-horizon standardized validation CRPS; no candidate passed both coverage gates"
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -5484,10 +5616,16 @@ def development_iqr_by_task(weighted_rows: Any) -> Any:
     return pd.DataFrame(rows)
 
 
-def apply_success_gates(metrics: Any, selected: Any, iqr_table: Any) -> Any:
+def apply_success_gates(
+    metrics: Any,
+    selected: Any,
+    iqr_table: Any,
+    comparisons: Any | None = None,
+) -> Any:
     rows: list[dict[str, Any]] = []
     merged = metrics.merge(iqr_table, on=["cohort", "outcome", "target_month"], how="left")
     merged["standardized_crps"] = merged["crps"] / merged["development_iqr"]
+    comparison_frame = comparisons if comparisons is not None else pd.DataFrame()
     for selection in selected.itertuples(index=False):
         task = merged.loc[
             merged["cohort"].eq(selection.cohort)
@@ -5496,8 +5634,24 @@ def apply_success_gates(metrics: Any, selected: Any, iqr_table: Any) -> Any:
         ]
         candidate = task.loc[task["candidate"].eq(selection.selected_candidate)]
         baselines = task.loc[task["candidate"].isin(["population_change", "persistence"])]
+        guard_by_split: dict[str, bool] = {}
+        for split, split_candidate in candidate.groupby("split", sort=True):
+            improvements: list[float] = []
+            split_baselines = baselines.loc[baselines["split"].eq(split)]
+            for target_month, current_cell in split_candidate.groupby("target_month", sort=True):
+                baseline_cell = split_baselines.loc[split_baselines["target_month"].eq(target_month)]
+                if current_cell.empty or baseline_cell.empty:
+                    continue
+                current_value = float(current_cell.iloc[0]["standardized_crps"])
+                baseline_value = float(baseline_cell["standardized_crps"].min())
+                if math.isfinite(current_value) and math.isfinite(baseline_value) and baseline_value > 0:
+                    improvements.append((baseline_value - current_value) / baseline_value)
+            guard_by_split[str(split)] = bool(improvements) and min(improvements) >= -0.05
         for (target_month, split), current in candidate.groupby(["target_month", "split"], sort=True):
             baseline_cell = baselines.loc[baselines["target_month"].eq(target_month) & baselines["split"].eq(split)]
+            current_row: Any | None = None
+            strongest: Any | None = None
+            gate_values: dict[str, bool] = {}
             if current.empty or baseline_cell.empty:
                 status = "Not estimable"
                 improvement = np.nan
@@ -5506,16 +5660,29 @@ def apply_success_gates(metrics: Any, selected: Any, iqr_table: Any) -> Any:
                 current_row = current.iloc[0]
                 strongest = baseline_cell.sort_values("standardized_crps").iloc[0]
                 improvement = (strongest["standardized_crps"] - current_row["standardized_crps"]) / max(strongest["standardized_crps"], 1e-12)
-                gates = {
+                gate_values = {
                     "crps_improvement_at_least_10_pct": improvement >= 0.10,
                     "coverage_80_within_5_points": abs(current_row["coverage_80"] - 0.80) <= 0.05,
                     "coverage_90_within_5_points": abs(current_row["coverage_90"] - 0.90) <= 0.05,
                     "weight_gate": current_row["estimability"] == "estimable",
                     "minimum_cell": int(current_row["n"]) >= MIN_CELL_SIZE,
+                    "no_horizon_more_than_5_pct_worse": guard_by_split.get(str(split), False),
                 }
-                failed = [name for name, passed in gates.items() if not passed]
+                failed = [name for name, passed in gate_values.items() if not passed]
                 status = "Supported" if not failed else ("Promising but not yet validated" if len(failed) <= 2 else "Exploratory")
-                reasons = "all gates passed" if not failed else "failed: " + " | ".join(failed)
+                reasons = "all available gates passed" if not failed else "failed: " + " | ".join(failed)
+
+            comparison_row: Any | None = None
+            if not comparison_frame.empty:
+                matched_comparison = comparison_frame.loc[
+                    comparison_frame["cohort"].eq(selection.cohort)
+                    & comparison_frame["outcome"].eq(selection.outcome)
+                    & comparison_frame["origin_month"].eq(selection.origin_month)
+                    & comparison_frame["target_month"].eq(target_month)
+                    & comparison_frame["split"].eq(split)
+                ]
+                if not matched_comparison.empty:
+                    comparison_row = matched_comparison.iloc[0]
             rows.append(
                 {
                     "cohort": selection.cohort,
@@ -5525,6 +5692,31 @@ def apply_success_gates(metrics: Any, selected: Any, iqr_table: Any) -> Any:
                     "split": split,
                     "selected_candidate": selection.selected_candidate,
                     "relative_standardized_crps_improvement": improvement,
+                    "n": int(current_row["n"]) if current_row is not None else 0,
+                    "effective_sample_size": (
+                        float(current_row["effective_sample_size"]) if current_row is not None else np.nan
+                    ),
+                    "selected_crps": float(current_row["crps"]) if current_row is not None else np.nan,
+                    "baseline_crps": float(strongest["crps"]) if strongest is not None else np.nan,
+                    "selected_rmse": float(current_row["rmse"]) if current_row is not None else np.nan,
+                    "coverage_80": float(current_row["coverage_80"]) if current_row is not None else np.nan,
+                    "coverage_90": float(current_row["coverage_90"]) if current_row is not None else np.nan,
+                    "weight_gate_pass": gate_values.get("weight_gate", False),
+                    "minimum_cell_pass": gate_values.get("minimum_cell", False),
+                    "horizon_guard_pass": gate_values.get("no_horizon_more_than_5_pct_worse", False),
+                    "paired_crps_difference": (
+                        float(comparison_row["mean_crps_difference"]) if comparison_row is not None else np.nan
+                    ),
+                    "paired_crps_difference_low": (
+                        float(comparison_row["difference_low"]) if comparison_row is not None else np.nan
+                    ),
+                    "paired_crps_difference_high": (
+                        float(comparison_row["difference_high"]) if comparison_row is not None else np.nan
+                    ),
+                    "paired_fdr_q_value": (
+                        float(comparison_row["fdr_q_value"]) if comparison_row is not None else np.nan
+                    ),
+                    "source_contract_pass": True,
                     "claim_status": status,
                     "gate_detail": reasons,
                 }
@@ -5538,7 +5730,21 @@ def apply_source_claim_limit(gates: Any, metadata: Mapping[str, Any]) -> Any:
     limited = gates.copy()
     estimable = limited["claim_status"].ne("Not estimable")
     limited.loc[estimable, "claim_status"] = "Exploratory"
+    limited["source_contract_pass"] = False
     suffix = "source limit: nominal wide-horizon timing and no fill-level coverage audit"
+    limited["gate_detail"] = limited["gate_detail"].astype(str).map(
+        lambda value: value + " | " + suffix if value else suffix
+    )
+    return limited
+
+
+def apply_smoke_claim_limit(gates: Any, cfg: RunConfig) -> Any:
+    if not cfg.smoke or gates.empty:
+        return gates
+    limited = gates.copy()
+    estimable = limited["claim_status"].ne("Not estimable")
+    limited.loc[estimable, "claim_status"] = "Exploratory"
+    suffix = "run limit: bounded smoke sample with reduced tuning and bootstrap replication"
     limited["gate_detail"] = limited["gate_detail"].astype(str).map(
         lambda value: value + " | " + suffix if value else suffix
     )
@@ -5576,11 +5782,16 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
                 matrix = frame[list(QUANTILE_COLUMNS)].to_numpy(float)
                 frame["row_crps"] = row_crps(frame["target_value"], matrix)
                 frame["squared_error"] = (frame["target_value"].to_numpy(float) - matrix[:, 3]) ** 2
+                frame["covered_80"] = (
+                    (frame["target_value"].to_numpy(float) >= matrix[:, 1])
+                    & (frame["target_value"].to_numpy(float) <= matrix[:, 5])
+                ).astype(float)
                 candidate_data[candidate] = frame
         for candidate, frame in candidate_data.items():
             patient_ids = np.asarray(sorted(frame["patient_id"].astype(str).unique()))
             crps_samples: list[float] = []
             rmse_samples: list[float] = []
+            coverage_80_samples: list[float] = []
             for _ in range(cfg.bootstrap_replicates):
                 sampled = rng.choice(patient_ids, size=len(patient_ids), replace=True)
                 counts = pd.Series(sampled).value_counts()
@@ -5588,6 +5799,7 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
                 weights = merged["analysis_weight"].to_numpy(float) * merged["bootstrap_count"].to_numpy(float)
                 crps_samples.append(weighted_mean(merged["row_crps"], weights))
                 rmse_samples.append(math.sqrt(weighted_mean(merged["squared_error"], weights)))
+                coverage_80_samples.append(weighted_mean(merged["covered_80"], weights))
             ci_rows.append(
                 {
                     "cohort": keys[0], "outcome": keys[1], "origin_month": keys[2], "target_month": keys[3],
@@ -5596,6 +5808,8 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
                     "crps_high": float(np.quantile(crps_samples, 0.975)),
                     "rmse_low": float(np.quantile(rmse_samples, 0.025)),
                     "rmse_high": float(np.quantile(rmse_samples, 0.975)),
+                    "coverage_80_low": float(np.quantile(coverage_80_samples, 0.025)),
+                    "coverage_80_high": float(np.quantile(coverage_80_samples, 0.975)),
                     "replicates": cfg.bootstrap_replicates,
                 }
             )
@@ -5614,7 +5828,9 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
                         "split": keys[4], "candidate": candidate, "bootstrap_type": "center_clustered",
                         "crps_low": float(np.quantile(center_crps, 0.025)),
                         "crps_high": float(np.quantile(center_crps, 0.975)),
-                        "rmse_low": np.nan, "rmse_high": np.nan, "replicates": cfg.bootstrap_replicates,
+                        "rmse_low": np.nan, "rmse_high": np.nan,
+                        "coverage_80_low": np.nan, "coverage_80_high": np.nan,
+                        "replicates": cfg.bootstrap_replicates,
                     }
                 )
         if selected_candidate in candidate_data:
@@ -5854,6 +6070,7 @@ PALETTE = {
 }
 
 PAGE_FILES = (
+    "00_executive_summary.png",
     "01_run_identity_and_status.png",
     "02_cohort_funnels.png",
     "03_exposure_continuity_and_censoring.png",
@@ -6071,6 +6288,7 @@ def build_figure_data(
     selected: Any,
     calibration: Any,
     metrics: Any,
+    iqr: Any,
     pit_values: Any,
     bootstrap_ci: Any,
     comparisons: Any,
@@ -6099,6 +6317,8 @@ def build_figure_data(
             "source_mode": bundle.metadata.get("source_mode", "unknown"),
             "cohort_date_range": index_range,
             "status": "completed",
+            "run_mode": context.cfg.mode,
+            "smoke_query_limit": context.cfg.smoke_query_limit if context.cfg.smoke else None,
             "dependencies": dict(dependencies),
             "preflight": bundle.metadata.get("preflight", {}),
             "measurement_timing": bundle.metadata.get("measurement_timing", "exact_day"),
@@ -6111,6 +6331,13 @@ def build_figure_data(
             "source_limitations": list(bundle.metadata.get("limitations", [])),
         },
         "funnel": cohort_artifacts["funnel"],
+        "cohort_counts": (
+            cohorts.drop_duplicates("patient_id")
+            .groupby("cohort")
+            .size()
+            .rename("n")
+            .reset_index()
+        ),
         "exposure": exposure_summary(cohort_artifacts["exposure"], cohort_artifacts["medication_audit"]),
         "baseline": baseline_table,
         "support": target_support_table(weighted_rows),
@@ -6127,6 +6354,7 @@ def build_figure_data(
         "selected": selected,
         "calibration": calibration,
         "metrics": metrics,
+        "iqr": iqr,
         "pit_histograms": aggregate_pit_histograms(pit_values, selected),
         "bootstrap_ci": bootstrap_ci,
         "comparisons": comparisons,
@@ -6169,6 +6397,191 @@ def new_page(number: int, title: str, subtitle: str) -> Any:
     figure.text(0.115, 0.915, subtitle, fontsize=9.5, color=PALETTE["muted"], va="top")
     figure.lines.append(plt.Line2D([0.055, 0.945], [0.893, 0.893], transform=figure.transFigure, color=PALETTE["grid"], lw=1.0))
     figure.text(0.055, 0.025, "Aggregate, disclosure-controlled output | Cells n < 11 suppressed | Noncausal prognostic study", fontsize=7.5, color=PALETTE["muted"])
+    return figure
+
+
+def wide_source_limited(data: Mapping[str, Any]) -> bool:
+    return data.get("identity", {}).get("preflight", {}).get("strict_raw_event_contract") is False
+
+
+def run_badge(data: Mapping[str, Any]) -> tuple[str, str]:
+    identity = data.get("identity", {})
+    mode = str(identity.get("run_mode", "unknown"))
+    if mode == "smoke":
+        return "SMOKE - NON-INFERENTIAL", PALETTE["red"]
+    if mode == "preflight-only":
+        return "PREFLIGHT ONLY", PALETTE["blue"]
+    if wide_source_limited(data):
+        return "FULL WIDE-SOURCE - EXPLORATORY", PALETTE["orange"]
+    return "FULL RAW-EVENT RUN", PALETTE["green"]
+
+
+def add_run_provenance(figure: Any, data: Mapping[str, Any]) -> None:
+    label, color = run_badge(data)
+    figure.text(
+        0.945,
+        0.025,
+        label,
+        ha="right",
+        fontsize=8.2,
+        fontweight="bold",
+        color=color,
+        bbox={"boxstyle": "round,pad=0.25", "facecolor": "white", "edgecolor": color, "alpha": 0.95},
+    )
+
+
+def source_aware_text(data: Mapping[str, Any], value: str) -> str:
+    if not wide_source_limited(data):
+        return value
+    replacements = (
+        ("six-month incretin continuers", "patients with a reported ≥183-day incretin interval"),
+        ("six-month continuers", "reported ≥183-day interval cohort"),
+        ("primary six-month continuers", "primary reported ≥183-day interval cohort"),
+        ("no new user six month continuation episode", "no qualifying reported ≥183-day interval"),
+        ("patients with accepted exposure", "patients with an accepted reported interval"),
+        ("six month continuer", "reported ≥183-day interval"),
+        ("six-month persistence", "reported interval duration"),
+    )
+    result = str(value)
+    for original, replacement in replacements:
+        result = result.replace(original, replacement)
+        result = result.replace(original.replace("-", "_").replace(" ", "_"), replacement)
+    return result
+
+
+def executive_comparison_table(data: Mapping[str, Any]) -> Any:
+    comparisons = data.get("comparisons", pd.DataFrame())
+    if comparisons.empty:
+        return comparisons
+    baseline_metrics = selected_only_metric_frame(data)
+    baseline_metrics = baseline_metrics.loc[
+        baseline_metrics["origin_month"].eq(0)
+        & baseline_metrics["split"].eq("temporal_test")
+    ][["cohort", "outcome", "origin_month", "target_month", "split", "n"]]
+    summary = comparisons.loc[
+        comparisons["origin_month"].eq(0)
+        & comparisons["split"].eq("temporal_test")
+    ].merge(
+        baseline_metrics,
+        on=["cohort", "outcome", "origin_month", "target_month", "split"],
+        how="left",
+        validate="one_to_one",
+    )
+    summary["95% CI"] = summary.apply(
+        lambda row: f"{row['difference_low']:.3f} to {row['difference_high']:.3f}",
+        axis=1,
+    )
+    return summary[
+        [
+            "cohort",
+            "outcome",
+            "target_month",
+            "n",
+            "baseline",
+            "mean_crps_difference",
+            "95% CI",
+            "fdr_q_value",
+        ]
+    ].sort_values(["cohort", "outcome", "target_month"])
+
+
+def render_page_00(data: Mapping[str, Any]) -> Any:
+    identity = data["identity"]
+    badge, badge_color = run_badge(data)
+    figure = new_page(
+        0,
+        "Executive summary",
+        "Screenshot-ready run provenance, cohort yield, matched performance, limitations, and permitted interpretation",
+    )
+    figure.text(
+        0.50,
+        0.855,
+        badge,
+        ha="center",
+        va="center",
+        fontsize=18,
+        fontweight="bold",
+        color=badge_color,
+    )
+    left = figure.add_axes([0.06, 0.54, 0.42, 0.22])
+    right = figure.add_axes([0.54, 0.54, 0.40, 0.22])
+    middle = figure.add_axes([0.06, 0.24, 0.88, 0.22])
+    bottom = figure.add_axes([0.06, 0.07, 0.88, 0.11])
+
+    panel_label(left, "A", "Source coverage")
+    preflight = identity.get("preflight", {})
+    sampled = preflight.get("source_unique_patient_counts", {})
+    totals = preflight.get("source_total_unique_patient_counts", sampled)
+    source_rows = []
+    if sampled or totals:
+        for source in sorted(set(sampled) | set(totals)):
+            sampled_value = int(sampled.get(source, 0))
+            total_value = int(totals.get(source, sampled_value))
+            source_rows.append(
+                {
+                    "source": source,
+                    "queried patients": sampled_value,
+                    "available patients": total_value,
+                    "fraction": sampled_value / total_value if total_value else np.nan,
+                }
+            )
+        source_columns = ["source", "queried patients", "available patients", "fraction"]
+    else:
+        for source, rows in preflight.get("row_counts", {}).items():
+            source_rows.append({"source": source, "queried rows": int(rows)})
+        source_columns = ["source", "queried rows"]
+    draw_compact_table(left, pd.DataFrame(source_rows), source_columns, max_rows=6)
+
+    panel_label(right, "B", "Cohorts and claim classification")
+    cohort_counts = data.get("cohort_counts", pd.DataFrame()).copy()
+    if not cohort_counts.empty:
+        cohort_counts["category"] = "eligible cohort"
+        cohort_counts = cohort_counts.rename(columns={"cohort": "item"})
+    gates = data.get("gates", pd.DataFrame())
+    status_counts = (
+        gates["claim_status"].value_counts().rename_axis("item").reset_index(name="n")
+        if not gates.empty else pd.DataFrame(columns=["item", "n"])
+    )
+    if not status_counts.empty:
+        status_counts["category"] = "decision cells"
+    combined = pd.concat(
+        [
+            cohort_counts[["category", "item", "n"]] if not cohort_counts.empty else cohort_counts,
+            status_counts[["category", "item", "n"]] if not status_counts.empty else status_counts,
+        ],
+        ignore_index=True,
+    )
+    draw_compact_table(right, combined, ["category", "item", "n"], max_rows=8)
+
+    panel_label(middle, "C", "Baseline-origin paired CRPS difference versus strongest simple baseline")
+    comparisons = executive_comparison_table(data)
+    draw_compact_table(middle, comparisons, list(comparisons.columns), max_rows=9)
+
+    panel_label(bottom, "D", "Permitted interpretation")
+    bottom.axis("off")
+    if identity.get("run_mode") == "smoke":
+        conclusion = (
+            "This bounded smoke run validates the end-to-end pipeline only. Reduced tuning, bootstrap replication, and "
+            "sample size make every performance result non-inferential. Run the same fingerprint without --smoke before "
+            "interpreting any metric."
+        )
+        if wide_source_limited(data):
+            conclusion += (
+                " The wide source additionally uses nominal horizons and reported start-end intervals and lacks geographic validation."
+            )
+    elif wide_source_limited(data):
+        conclusion = (
+            "Exploratory temporal prediction results only. Follow-up values use nominal wide-column horizons; "
+            "reported medication start-end intervals do not establish fill-level adherence; administrative opportunity "
+            "is operationalized; and unavailable center identity prevents geographic validation. Do not claim exact-time "
+            "trajectories, confirmed persistence, five-year performance without supported cells, treatment effects, or transportability."
+        )
+    else:
+        conclusion = (
+            "Claims remain prognostic, horizon-specific, treatment-policy explicit, and noncausal. Supported cells still "
+            "require the displayed calibration, weighting, uncertainty, and transportability gates."
+        )
+    bottom.text(0.01, 0.82, textwrap.fill(conclusion, width=145), va="top", fontsize=8.7, color=PALETTE["ink"])
     return figure
 
 
@@ -6290,6 +6703,9 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
                     .replace("coverage 90 within 5 points", "90% coverage")
                     .replace("weight gate", "weight")
                     .replace("minimum cell", "cell n")
+                    .replace("no horizon more than 5 pct worse", "horizon guard")
+                    .replace("source limit: nominal wide-horizon timing and no fill-level coverage audit", "wide-source contract")
+                    .replace("run limit: bounded smoke sample with reduced tuning and bootstrap replication", "smoke run")
                 )
             if len(display.columns) <= 3 and column in {"assertion", "detail"}:
                 width = 52
@@ -6323,16 +6739,20 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
         "mature_without_target": "Mature without\ntarget",
         "n_calibration": "Calib.\nn",
         "origin_month": "Origin\nmonth",
+        "paired_crps_difference_high": "Paired CRPS\nCI high",
         "qualifying_patients": "Qualifying\npatients",
         "reclassified_vs_primary": "Reclassified\nvs primary",
         "relative_standardized_crps_improvement": "Relative CRPS\nimprovement",
         "repeated_fraction": "Repeated\nfraction",
         "selected_candidate": "Selected\nmodel",
         "small_cell_suppressed": "Suppressed",
+        "source_contract_pass": "Source\ncontract",
         "target_month": "Target\nmonth",
         "valid_measurements": "Valid\nn",
         "validation_crps": "Validation\nCRPS",
+        "validation_standardized_crps": "Std. validation\nCRPS",
         "version/status": "Version / status",
+        "weight_gate_pass": "Weight\ngate",
         "width_80": "80%\nwidth",
         "width_90": "90%\nwidth",
     }
@@ -6376,13 +6796,17 @@ def draw_compact_table(axis: Any, frame: Any, columns: Sequence[str], labels: Se
         "coverage": 0.75,
         "coverage_80": 0.85,
         "coverage_90": 0.85,
+        "paired_crps_difference_high": 0.95,
         "crps": 0.75,
         "heldout": 0.75,
         "n": 0.60,
         "origin_month": 0.70,
         "passed": 0.70,
+        "source_contract_pass": 0.78,
         "suppressed": 0.80,
         "target_month": 0.70,
+        "validation_standardized_crps": 1.00,
+        "weight_gate_pass": 0.72,
     }
     widths = [wide_columns.get(column, narrow_columns.get(column, 1.0)) for column in display_columns]
     width_total = sum(widths)
@@ -6417,8 +6841,9 @@ def render_page_01(data: Mapping[str, Any]) -> Any:
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.32])
     panel_label(left, "A", "Immutable run identity")
     left.axis("off")
+    badge, _ = run_badge(data)
     identity_lines = [
-        ("Status", identity["status"].upper()),
+        ("Status", badge),
         ("Study version", identity["study_version"]),
         ("Run fingerprint", str(identity["fingerprint"])[:32] + "..."),
         ("Script SHA-256", str(identity["script_sha256"])[:32] + "..."),
@@ -6442,21 +6867,43 @@ def render_page_01(data: Mapping[str, Any]) -> Any:
     preflight = identity.get("preflight", {})
     wide_limited = preflight.get("strict_raw_event_contract") is False
     counts = preflight.get("source_row_counts", preflight.get("row_counts", {}))
+    sampled_patients = preflight.get("source_unique_patient_counts", {})
+    total_patients = preflight.get("source_total_unique_patient_counts", sampled_patients)
     accepted_value = preflight.get("accepted_medication_records", "not reported")
     accepted_text = f"{int(accepted_value):,}" if isinstance(accepted_value, (int, float)) else str(accepted_value)
+    cohort_counts = data.get("cohort_counts", pd.DataFrame())
+    cohort_text = (
+        " | ".join(f"{row.cohort} {int(row.n):,}" for row in cohort_counts.itertuples(index=False))
+        if not cohort_counts.empty else "not constructed in preflight-only mode"
+    )
+    gates = data.get("gates", pd.DataFrame())
+    gate_text = (
+        " | ".join(f"{status} {int(count):,}" for status, count in gates["claim_status"].value_counts().items())
+        if not gates.empty else "not evaluated in preflight-only mode"
+    )
     if wide_limited:
         limitations = preflight.get("limitations", identity.get("source_limitations", []))
         limitation_text = " ".join(str(item) for item in limitations[:3])
+        sampling_text = " | ".join(
+            f"{source} {int(sampled_patients.get(source, 0)):,} of {int(total):,} patients"
+            for source, total in total_patients.items()
+        )
         text = (
             "The standalone direct SQL preflight completed against MBSCohort and GLP1Cohort. Required wide columns, "
             "units, index dates, and reported medication intervals were usable. This is not an exact raw-event contract.\n\n"
             + "Direct query rows: "
             + " | ".join(f"{key} {value:,}" for key, value in counts.items())
+            + f"\nPatient coverage: {sampling_text}"
             + f"\nAccepted reported medication intervals: {accepted_text}\n"
+            + f"Eligible cohorts: {cohort_text}\nDecision cells: {gate_text}\n"
             + limitation_text
         )
-        result_text = "RESULT: COMPLETED WITH SOURCE LIMITATIONS"
-        result_color = PALETTE["orange"]
+        if identity.get("run_mode") == "smoke":
+            result_text = "RESULT: SMOKE COMPLETED - NON-INFERENTIAL"
+            result_color = PALETTE["red"]
+        else:
+            result_text = "RESULT: FULL WIDE-SOURCE RUN - EXPLORATORY"
+            result_color = PALETTE["orange"]
     else:
         text = (
             "All hard gates passed. Exact surgery, medication, and measurement dates were verified; "
@@ -6466,19 +6913,31 @@ def render_page_01(data: Mapping[str, Any]) -> Any:
             + " | ".join(f"{key} {value:,}" for key, value in counts.items())
             + f"\nAccepted medication records: {accepted_text}"
         )
-        result_text = "RESULT: COMPLETED"
-        result_color = PALETTE["green"]
+        if identity.get("run_mode") == "smoke":
+            result_text = "RESULT: SMOKE COMPLETED - NON-INFERENTIAL"
+            result_color = PALETTE["red"]
+        else:
+            result_text = "RESULT: COMPLETED"
+            result_color = PALETTE["green"]
     bottom.text(0.02, 0.88, text, va="top", fontsize=9.2, color=PALETTE["ink"], linespacing=1.35, wrap=True)
     bottom.text(0.02, 0.10, result_text, fontsize=15, fontweight="bold", color=result_color)
     return figure
 
 
 def render_page_02(data: Mapping[str, Any]) -> Any:
-    figure = new_page(2, "Cohort funnels", "Every inclusion and exclusion is enumerated separately for surgery and six-month incretin continuers")
+    subtitle = source_aware_text(
+        data,
+        "Every inclusion and exclusion is enumerated separately for surgery and six-month incretin continuers",
+    )
+    figure = new_page(2, "Cohort funnels", subtitle)
     funnel = data["funnel"].copy()
     for panel_index, cohort_name in enumerate(("surgery", "incretin")):
         axis = figure.add_axes([0.145 + panel_index * 0.47, 0.11, 0.325, 0.73])
-        panel_label(axis, chr(ord("A") + panel_index), "Surgical cohort" if cohort_name == "surgery" else "Incretin cohort")
+        panel_label(
+            axis,
+            chr(ord("A") + panel_index),
+            "Surgical cohort" if cohort_name == "surgery" else source_aware_text(data, "Six-month continuer cohort"),
+        )
         subset = funnel.loc[funnel["cohort"].eq(cohort_name)].copy().head(14)
         if subset.empty:
             empty_panel(axis)
@@ -6488,7 +6947,17 @@ def render_page_02(data: Mapping[str, Any]) -> Any:
         counts = pd.to_numeric(subset["n_patients"], errors="coerce").fillna(0)
         plotted_counts = counts.mask(counts.gt(0) & counts.lt(MIN_CELL_SIZE), 0)
         axis.barh(y, plotted_counts, color=colors, alpha=0.88)
-        axis.set_yticks(y, [textwrap.fill(str(item).replace("_", " "), width=21) for item in subset["stage"]], fontsize=7.1)
+        axis.set_yticks(
+            y,
+            [
+                textwrap.fill(
+                    source_aware_text(data, str(item).replace("_", " ")),
+                    width=21,
+                )
+                for item in subset["stage"]
+            ],
+            fontsize=7.1,
+        )
         axis.invert_yaxis()
         axis.set_xlabel("Patients")
         axis.grid(axis="x")
@@ -6503,7 +6972,7 @@ def render_page_02(data: Mapping[str, Any]) -> Any:
 def render_page_03(data: Mapping[str, Any]) -> Any:
     wide_limited = data["identity"].get("preflight", {}).get("strict_raw_event_contract") is False
     subtitle = (
-        "Reported start-end intervals, operational 183-day continuation, prior exposure, and censor timing"
+        "Reported start-end intervals, ≥183-day interval eligibility, prior exposure, and reported censor timing"
         if wide_limited
         else "Coverage evidence, 183-day persistence, switches, prior-exposure strata, and exact censor timing"
     )
@@ -6520,12 +6989,15 @@ def render_page_03(data: Mapping[str, Any]) -> Any:
     if classification.empty:
         empty_panel(axes[0])
     else:
-        labels = [f"{row.cohort.title()} | {str(row.classification).replace('_', ' ')}" for row in classification.itertuples(index=False)]
+        labels = [
+            f"{row.cohort.title()} | {source_aware_text(data, str(row.classification).replace('_', ' '))}"
+            for row in classification.itertuples(index=False)
+        ]
         axes[0].barh(np.arange(len(labels)), classification["n"].fillna(0), color=PALETTE["blue"])
         axes[0].set_yticks(np.arange(len(labels)), [textwrap.fill(item, width=22) for item in labels], fontsize=7.0)
         axes[0].invert_yaxis()
         axes[0].set_xlabel("Patients")
-    panel_label(axes[1], "B", "Censoring counts")
+    panel_label(axes[1], "B", "Reported interval-end and surgery censoring counts" if wide_limited else "Censoring counts")
     draw_compact_table(axes[1], exposure["censoring"], ["cohort", "n", "censored", "day_zero", "median_censor_day"])
     panel_label(axes[2], "C", "Reported interval source audit" if wide_limited else "Coverage source audit")
     draw_compact_table(axes[2], exposure["sources"], ["source_type", "accepted", "reason", "n"], max_rows=9)
@@ -6606,16 +7078,28 @@ def heatmap_table(axis: Any, frame: Any, row_column: str, column_column: str, va
 
 
 def render_page_05(data: Mapping[str, Any]) -> Any:
-    figure = new_page(5, "Follow-up and target support", "Administrative maturity is separated from missing measurement and treatment or surgery censoring")
+    wide_limited = wide_source_limited(data)
+    subtitle = (
+        "Operationalized follow-up opportunity is separated from missing nominal-horizon values and reported censoring"
+        if wide_limited
+        else "Administrative maturity is separated from missing measurement and treatment or surgery censoring"
+    )
+    figure = new_page(5, "Follow-up and target support", subtitle)
     support = data["support"].copy()
     support = support.loc[support["origin_month"].eq(0)].copy()
     support = mask_small_cell_metrics(support, ["target_availability_pct"], count_column="eligible")
     support["task"] = support["cohort"].str.title() + " | " + support["outcome"].str.upper()
     top = figure.add_axes([0.12, 0.48, 0.80, 0.36])
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.27])
-    panel_label(top, "A", "Baseline-origin valid target availability among eligible rows (%)")
+    panel_label(
+        top,
+        "A",
+        "Baseline-origin available nominal-horizon values among eligible rows (%)"
+        if wide_limited
+        else "Baseline-origin valid target availability among eligible rows (%)",
+    )
     heatmap_table(top, support, "task", "target_month", "target_availability_pct", "eligible")
-    panel_label(bottom, "B", "Opportunity decomposition")
+    panel_label(bottom, "B", "Operational opportunity decomposition" if wide_limited else "Opportunity decomposition")
     summary = support.groupby(["cohort", "outcome"])[["administratively_mature", "mature_with_target", "mature_without_target", "censored", "administratively_immature"]].sum().reset_index()
     draw_compact_table(bottom, summary, list(summary.columns), max_rows=8)
     return figure
@@ -6660,10 +7144,15 @@ def render_page_06(data: Mapping[str, Any]) -> Any:
 
 def render_page_07(data: Mapping[str, Any]) -> Any:
     center_available = bool(data["split"]["metadata"].get("center_validation_available", True))
+    wide_limited = wide_source_limited(data)
     split_subtitle = (
         "Global patient assignment, temporal testing, geographic holdout, and timestamp-level invariants"
         if center_available
-        else "Global patient assignment, temporal testing, and explicit geographic-validation unavailability"
+        else (
+            "Global patient assignment, temporal testing, nominal-horizon ordering, and explicit geographic-validation unavailability"
+            if wide_limited
+            else "Global patient assignment, temporal testing, and explicit geographic-validation unavailability"
+        )
     )
     figure = new_page(7, "Split and leakage audit", split_subtitle)
     left = figure.add_axes([0.06, 0.50, 0.36, 0.34])
@@ -6693,8 +7182,22 @@ def render_page_07(data: Mapping[str, Any]) -> Any:
             "and no sentinel center is treated as a real site. Patient-global assignment and protected temporal testing remain active."
         )
     right.text(0.02, 0.90, design_text, va="top", fontsize=9.7, linespacing=1.55, color=PALETTE["ink"], wrap=True)
-    panel_label(bottom, "C", "Leakage assertions")
-    draw_compact_table(bottom, split["leakage"], ["assertion", "passed", "detail"], max_rows=10)
+    panel_label(bottom, "C", "Nominal-horizon leakage assertions" if wide_limited else "Leakage assertions")
+    leakage = split["leakage"].copy()
+    if wide_limited and not leakage.empty:
+        leakage["assertion"] = leakage["assertion"].replace(
+            {
+                "Every feature timestamp is at or before origin": "Every nominal feature horizon is at or before origin",
+                "Every target is strictly after origin": "Every nominal target horizon is strictly after origin",
+                "No observed target is on or after treatment or surgery censoring": "No available nominal target is on or after reported censoring",
+            }
+        )
+        leakage["detail"] = leakage["detail"].astype(str).str.replace(
+            "Window and plausibility constants",
+            "Nominal-horizon and plausibility constants",
+            regex=False,
+        )
+    draw_compact_table(bottom, leakage, ["assertion", "passed", "detail"], max_rows=10)
     return figure
 
 
@@ -6704,11 +7207,16 @@ def render_page_08(data: Mapping[str, Any]) -> Any:
     right = figure.add_axes([0.57, 0.48, 0.37, 0.36])
     bottom = figure.add_axes([0.06, 0.10, 0.88, 0.27])
     leaderboard = data["leaderboard"].loc[data["leaderboard"]["origin_month"].eq(0)].copy()
-    panel_label(left, "A", "Baseline-origin validation CRPS")
+    panel_label(left, "A", "Equal-horizon standardized validation CRPS")
     if leaderboard.empty:
         empty_panel(left)
     else:
-        summary = leaderboard.groupby("candidate")["validation_crps"].mean().sort_values().head(8)
+        summary = (
+            leaderboard.groupby("candidate")["validation_standardized_crps"]
+            .mean()
+            .sort_values()
+            .head(8)
+        )
         left.barh(np.arange(len(summary)), summary.values, color=PALETTE["blue"])
         aliases = {
             "catboost_multi_quantile": "CatBoost",
@@ -6724,9 +7232,14 @@ def render_page_08(data: Mapping[str, Any]) -> Any:
         }
         left.set_yticks(np.arange(len(summary)), [aliases.get(str(item), str(item).replace("_", " ")) for item in summary.index], fontsize=7.2)
         left.invert_yaxis()
-        left.set_xlabel("Mean validation CRPS (lower is better)")
+        left.set_xlabel("Mean task-standardized CRPS (equal horizons; lower is better)")
     panel_label(right, "B", "Selected models")
-    draw_compact_table(right, data["selected"], ["cohort", "outcome", "origin_month", "selected_candidate", "validation_crps"], max_rows=12)
+    draw_compact_table(
+        right,
+        data["selected"],
+        ["cohort", "outcome", "origin_month", "selected_candidate", "validation_standardized_crps"],
+        max_rows=12,
+    )
     panel_label(bottom, "C", "Candidate execution status")
     draw_compact_table(bottom, data["model_status"], ["cohort", "outcome", "origin_month", "candidate", "status", "reason"], max_rows=10)
     return figure
@@ -6794,12 +7307,36 @@ def selected_only_metric_frame(data: Mapping[str, Any]) -> Any:
     )
 
 
+def merge_patient_bootstrap_intervals(data: Mapping[str, Any], metrics: Any) -> Any:
+    intervals = data.get("bootstrap_ci", pd.DataFrame())
+    if metrics.empty or intervals.empty:
+        return metrics.copy()
+    intervals = intervals.loc[intervals["bootstrap_type"].eq("patient")].copy()
+    keys = ["cohort", "outcome", "origin_month", "target_month", "split", "candidate"]
+    return metrics.merge(
+        intervals[
+            keys
+            + [
+                "crps_low",
+                "crps_high",
+                "rmse_low",
+                "rmse_high",
+                "coverage_80_low",
+                "coverage_80_high",
+            ]
+        ],
+        on=keys,
+        how="left",
+        validate="one_to_one",
+    )
+
+
 def performance_page(data: Mapping[str, Any], number: int, cohort: str, outcome: str, title: str) -> Any:
     center_available = bool(data["split"]["metadata"].get("center_validation_available", True))
     subtitle = (
-        "Factual probabilistic performance on protected temporal and held-out-center tests"
+        "Factual probabilistic performance with 95% patient-bootstrap intervals on protected temporal and held-out-center tests"
         if center_available
-        else "Factual probabilistic performance on protected temporal tests; geographic validation unavailable"
+        else "Factual probabilistic performance with 95% patient-bootstrap intervals; geographic validation unavailable"
     )
     figure = new_page(number, title, subtitle)
     metrics = selected_metric_frame(data, cohort, outcome)
@@ -6818,6 +7355,7 @@ def performance_page(data: Mapping[str, Any], number: int, cohort: str, outcome:
         return figure
     origin_zero = metrics.loc[metrics["origin_month"].eq(0) & metrics["split"].eq("temporal_test")].copy()
     origin_zero = mask_small_cell_metrics(origin_zero, ["crps", "rmse", "coverage_80"])
+    origin_zero = merge_patient_bootstrap_intervals(data, origin_zero)
     colors = {"population_change": PALETTE["orange"], "persistence": PALETTE["muted"]}
     origin_selection = data["selected"].loc[
         data["selected"]["cohort"].eq(cohort)
@@ -6834,7 +7372,29 @@ def performance_page(data: Mapping[str, Any], number: int, cohort: str, outcome:
                 continue
             color = colors.get(candidate, PALETTE["blue"] if candidate == selected_candidate else PALETTE["green"])
             label = "Selected" if candidate == selected_candidate else candidate.replace("_", " ")
-            axis.plot(group["target_month"], group[metric_column], marker="o", label=label, color=color)
+            low_column = f"{metric_column}_low"
+            high_column = f"{metric_column}_high"
+            if low_column in group and high_column in group:
+                values = pd.to_numeric(group[metric_column], errors="coerce").to_numpy(float)
+                low = pd.to_numeric(group[low_column], errors="coerce").to_numpy(float)
+                high = pd.to_numeric(group[high_column], errors="coerce").to_numpy(float)
+                lower_error = np.maximum(values - low, 0.0)
+                upper_error = np.maximum(high - values, 0.0)
+                if np.isfinite(lower_error).any() and np.isfinite(upper_error).any():
+                    axis.errorbar(
+                        group["target_month"],
+                        values,
+                        yerr=np.vstack([lower_error, upper_error]),
+                        marker="o",
+                        label=label,
+                        color=color,
+                        capsize=2.5,
+                        lw=1.4,
+                    )
+                else:
+                    axis.plot(group["target_month"], values, marker="o", label=label, color=color)
+            else:
+                axis.plot(group["target_month"], group[metric_column], marker="o", label=label, color=color)
             plotted = True
         if not plotted:
             empty_panel(axis, "Not estimable after disclosure control")
@@ -6885,12 +7445,46 @@ def render_page_14(data: Mapping[str, Any]) -> Any:
     if pit.empty:
         empty_panel(axes[1])
     else:
-        summary = pit.groupby(["bin_left", "bin_right"])["n"].sum().reset_index()
-        total = max(summary["n"].sum(), 1)
-        axes[1].bar(summary["bin_left"], summary["n"] / total, width=0.095, align="edge", color=PALETTE["blue"], alpha=0.85)
-        axes[1].axhline(0.10, color=PALETTE["ink"], ls="--")
-        axes[1].set_xlabel("Probability integral transform")
-        axes[1].set_ylabel("Proportion")
+        axes[1].axis("off")
+        combinations = [
+            ("surgery", "bmi"),
+            ("surgery", "hba1c"),
+            ("incretin", "bmi"),
+            ("incretin", "hba1c"),
+        ]
+        for index, (cohort, outcome) in enumerate(combinations):
+            column = index % 2
+            row = index // 2
+            inset_y = 0.60 if row == 0 else 0.05
+            inset = axes[1].inset_axes([0.04 + column * 0.49, inset_y, 0.44, 0.29])
+            task = pit.loc[
+                pit["cohort"].eq(cohort)
+                & pit["outcome"].eq(outcome)
+                & pit["origin_month"].eq(0)
+                & pit["split"].eq("temporal_test")
+            ]
+            if task.empty:
+                empty_panel(inset)
+                inset.set_title(f"{cohort.title()} {outcome.upper()}", fontsize=7, pad=1)
+                continue
+            summary = task.groupby(["bin_left", "bin_right"])["n"].sum().reset_index()
+            total = max(summary["n"].sum(), 1)
+            inset.bar(
+                summary["bin_left"],
+                summary["n"] / total,
+                width=0.095,
+                align="edge",
+                color=PALETTE["blue"],
+                alpha=0.85,
+            )
+            inset.axhline(0.10, color=PALETTE["ink"], ls="--", lw=0.8)
+            inset.set_xlim(0, 1)
+            inset.set_title(f"{cohort.title()} {outcome.upper()}", fontsize=7, pad=1)
+            inset.tick_params(labelsize=5.5)
+            if row == 1:
+                inset.set_xlabel("PIT", fontsize=6)
+            if column == 0:
+                inset.set_ylabel("Proportion", fontsize=6)
     calibration = data["calibration"]
     if calibration.empty or data["selected"].empty:
         selected_calibration = calibration
@@ -6922,27 +7516,59 @@ def render_page_15(data: Mapping[str, Any]) -> Any:
         if center_available
         else "Temporal and prespecified subgroup auditing; geographic transportability is not estimable"
     )
-    figure = new_page(15, "Transportability and subgroup audit", subtitle)
+    figure = new_page(
+        15,
+        "Transportability and subgroup audit" if center_available else "Temporal and subgroup audit",
+        subtitle,
+    )
     top = figure.add_axes([0.06, 0.49, 0.88, 0.35])
-    bottom_left = figure.add_axes([0.06, 0.10, 0.42, 0.28])
+    bottom_left = figure.add_axes([0.13, 0.10, 0.35, 0.28])
     bottom_right = figure.add_axes([0.54, 0.10, 0.40, 0.28])
     panel_label(top, "A", "Disclosure-controlled subgroup cells")
     draw_compact_table(top, data["subgroups"], ["cohort", "outcome", "target_month", "split", "subgroup", "value", "n", "crps", "coverage_80", "suppressed"], max_rows=12)
-    panel_label(bottom_left, "B", "Temporal versus geographic CRPS" if center_available else "Protected temporal CRPS")
+    panel_label(
+        bottom_left,
+        "B",
+        "Task-standardized temporal versus geographic CRPS"
+        if center_available
+        else "Task-standardized protected temporal CRPS",
+    )
     metrics = selected_only_metric_frame(data)
     metrics = metrics.loc[metrics["origin_month"].eq(0)].copy()
     metrics = mask_small_cell_metrics(metrics, ["crps"])
+    if not metrics.empty:
+        metrics = metrics.merge(
+            data["iqr"],
+            on=["cohort", "outcome", "target_month"],
+            how="left",
+            validate="many_to_one",
+        )
+        metrics["standardized_crps"] = metrics["crps"] / metrics["development_iqr"]
     if metrics.empty:
         empty_panel(bottom_left)
     else:
-        summary = metrics.groupby("split")["crps"].mean().dropna()
+        summary = (
+            metrics.groupby(["cohort", "outcome", "split"])["standardized_crps"]
+            .mean()
+            .dropna()
+            .sort_values()
+        )
         if summary.empty:
             empty_panel(bottom_left, "Not estimable after disclosure control")
         else:
             positions = np.arange(len(summary))
-            bottom_left.bar(positions, summary.values, color=[PALETTE["blue"], PALETTE["purple"]][:len(summary)])
-            bottom_left.set_xticks(positions, [str(item).replace("_", "\n").title() for item in summary.index], fontsize=8)
-            bottom_left.set_ylabel("Mean CRPS")
+            cohort_aliases = {"surgery": "Surg.", "incretin": "Incr."}
+            split_aliases = {"geographic_test": "geographic", "temporal_test": "temporal"}
+            labels = [
+                f"{cohort_aliases.get(str(cohort), str(cohort).title())} "
+                f"{'HbA1c' if str(outcome).lower() == 'hba1c' else str(outcome).upper()} | "
+                f"{split_aliases.get(str(split), str(split).replace('_', ' '))}"
+                for cohort, outcome, split in summary.index
+            ]
+            bottom_left.barh(positions, summary.values, color=PALETTE["blue"])
+            bottom_left.set_yticks(positions, labels, fontsize=6.4)
+            bottom_left.invert_yaxis()
+            bottom_left.set_xlabel("Mean standardized CRPS across supported horizons")
     panel_label(bottom_right, "C", "Interpretation")
     bottom_right.axis("off")
     if center_available:
@@ -7031,15 +7657,35 @@ def render_page_18(data: Mapping[str, Any]) -> Any:
     bottom_left = figure.add_axes([0.06, 0.10, 0.51, 0.28])
     bottom_right = figure.add_axes([0.62, 0.10, 0.32, 0.28])
     panel_label(top, "A", "Horizon-specific decision table")
-    draw_compact_table(top, data["gates"], ["cohort", "outcome", "origin_month", "target_month", "split", "selected_candidate", "relative_standardized_crps_improvement", "claim_status", "gate_detail"], max_rows=13)
+    draw_compact_table(
+        top,
+        data["gates"],
+        [
+            "cohort",
+            "outcome",
+            "origin_month",
+            "target_month",
+            "split",
+            "n",
+            "relative_standardized_crps_improvement",
+            "coverage_80",
+            "coverage_90",
+            "weight_gate_pass",
+            "source_contract_pass",
+            "claim_status",
+            "gate_detail",
+        ],
+        max_rows=13,
+    )
     panel_label(bottom_left, "B", "Limitations")
     bottom_left.axis("off")
-    limitations = (
+    limitations = source_aware_text(
+        data,
         "This is a prognostic study, not a causal treatment comparison. Surgery and incretin therapy use separate models, "
         "populations, time zeros, and claims. The initiation-origin incretin model is conditional on future six-month persistence. "
         "Treatment censoring and observation may remain informative despite cross-fitted weighting. Recent ingredients can have "
         "short calendar support, so unsupported horizons are not estimable. Conditional sleeve and RYGB projections are model-based, "
-        "overlap-restricted, baseline-origin projections and must not be used to recommend a procedure."
+        "overlap-restricted, baseline-origin projections and must not be used to recommend a procedure.",
     )
     source_limitations = data["identity"].get("source_limitations", [])
     if source_limitations:
@@ -7056,26 +7702,36 @@ def render_page_18(data: Mapping[str, Any]) -> Any:
     panel_label(bottom_right, "C", "Publication conclusion")
     bottom_right.axis("off")
     supported = int(data["gates"]["claim_status"].eq("Supported").sum()) if not data["gates"].empty else 0
+    exploratory = int(data["gates"]["claim_status"].eq("Exploratory").sum()) if not data["gates"].empty else 0
     total = len(data["gates"])
     bottom_right.text(
         0.02,
         0.76,
-        f"Supported cells\n{supported} of {total}",
-        fontsize=16,
+        f"Supported: {supported} of {total}",
+        fontsize=13,
         fontweight="bold",
         color=PALETTE["green"] if supported else PALETTE["orange"],
         va="top",
-        linespacing=1.10,
+    )
+    bottom_right.text(
+        0.02,
+        0.58,
+        f"Exploratory: {exploratory} of {total}",
+        fontsize=13,
+        fontweight="bold",
+        color=PALETTE["orange"],
+        va="top",
     )
     conclusion = "Claims remain prognostic, horizon-specific, treatment-policy explicit, and noncausal."
     if source_limitations:
-        conclusion += " Direct wide-source results remain exploratory."
-    bottom_right.text(0.02, 0.28, textwrap.fill(conclusion, width=40), fontsize=9.5, color=PALETTE["ink"], va="top")
+        conclusion += " Direct wide-source results remain exploratory regardless of apparent metric improvement."
+    bottom_right.text(0.02, 0.34, textwrap.fill(conclusion, width=40), fontsize=9.2, color=PALETTE["ink"], va="top")
     return figure
 
 
 def page_renderers(data: Mapping[str, Any]) -> list[Callable[[], Any]]:
     return [
+        lambda: render_page_00(data),
         lambda: render_page_01(data),
         lambda: render_page_02(data),
         lambda: render_page_03(data),
@@ -7097,12 +7753,16 @@ def page_renderers(data: Mapping[str, Any]) -> list[Callable[[], Any]]:
     ]
 
 
-def validate_export_directory(export: Path) -> None:
+def validate_export_directory(export: Path, *, require_complete: bool = False) -> None:
     expected = set(PAGE_FILES) | {"metabolic_trajectory_figure_book.pdf"}
     present = {item.name for item in export.iterdir() if item.is_file()}
     unexpected = present.difference(expected)
     if unexpected:
         raise RuntimeError("FIGURES_TO_EXPORT contains non-contract files: " + ", ".join(sorted(unexpected)))
+    if require_complete:
+        missing = expected.difference(present)
+        if missing:
+            raise RuntimeError("FIGURES_TO_EXPORT is missing contract files: " + ", ".join(sorted(missing)))
 
 
 def render_figure_book(data: Mapping[str, Any], export: Path) -> list[Path]:
@@ -7115,6 +7775,7 @@ def render_figure_book(data: Mapping[str, Any], export: Path) -> list[Path]:
     with PdfPages(pdf_temporary, metadata={"Title": "Metabolic Trajectory Forecasting Study", "Author": "Brannigan Lab"}) as pdf:
         for filename, render in zip(PAGE_FILES, page_renderers(data), strict=True):
             figure = render()
+            add_run_provenance(figure, data)
             temporary = export / (filename + ".tmp")
             figure.savefig(temporary, format="png", dpi=300, bbox_inches=None, facecolor=figure.get_facecolor())
             replace_file(temporary, export / filename)
@@ -7123,7 +7784,7 @@ def render_figure_book(data: Mapping[str, Any], export: Path) -> list[Path]:
             written.append(export / filename)
     replace_file(pdf_temporary, pdf_final)
     written.append(pdf_final)
-    validate_export_directory(export)
+    validate_export_directory(export, require_complete=True)
     return written
 
 
@@ -7826,6 +8487,72 @@ def run_embedded_self_tests() -> dict[str, Any]:
         str(masked_fixture_metrics.to_dict(orient="records")),
     )
 
+    scale_rows: list[dict[str, Any]] = []
+    for target_month, training_values in ((3, [0.0, 0.0, 2.0, 2.0]), (12, [0.0, 0.0, 200.0, 200.0])):
+        for index, target_value in enumerate(training_values):
+            row = {
+                "row_id": f"train-{target_month}-{index}",
+                "patient_id": f"train-{target_month}-{index}",
+                "cohort": "surgery",
+                "outcome": "bmi",
+                "origin_month": 0,
+                "target_month": target_month,
+                "candidate": "candidate_a",
+                "architecture": "architecture_a",
+                "split": "train",
+                "target_observed": True,
+                "target_value": target_value,
+                "analysis_weight": 1.0,
+            }
+            row.update({column: target_value for column in QUANTILE_COLUMNS})
+            scale_rows.append(row)
+    for candidate, architecture, predictions_by_target in (
+        ("candidate_a", "architecture_a", {3: 0.0, 12: 100.0}),
+        ("candidate_b", "architecture_b", {3: 3.0, 12: 0.0}),
+    ):
+        for target_month, prediction in predictions_by_target.items():
+            for index in range(11):
+                row = {
+                    "row_id": f"validation-{target_month}-{index}",
+                    "patient_id": f"validation-{target_month}-{index}",
+                    "cohort": "surgery",
+                    "outcome": "bmi",
+                    "origin_month": 0,
+                    "target_month": target_month,
+                    "candidate": candidate,
+                    "architecture": architecture,
+                    "split": "validation",
+                    "target_observed": True,
+                    "target_value": 0.0,
+                    "analysis_weight": 1.0,
+                }
+                row.update({column: prediction for column in QUANTILE_COLUMNS})
+                scale_rows.append(row)
+    standardized_fixture = candidate_validation_scores(pd.DataFrame(scale_rows)).set_index("candidate")
+    check(
+        "18d_equal_horizon_standardized_selection_score",
+        standardized_fixture.loc["candidate_a", "validation_crps"]
+        > standardized_fixture.loc["candidate_b", "validation_crps"]
+        and standardized_fixture.loc["candidate_a", "validation_standardized_crps"]
+        < standardized_fixture.loc["candidate_b", "validation_standardized_crps"],
+        str(standardized_fixture[["validation_crps", "validation_standardized_crps"]].to_dict(orient="index")),
+    )
+
+    wide_smoke_display = {
+        "identity": {
+            "run_mode": "smoke",
+            "preflight": {"strict_raw_event_contract": False},
+        }
+    }
+    check(
+        "18e_screenshot_provenance_and_source_language",
+        PAGE_FILES[0] == "00_executive_summary.png"
+        and run_badge(wide_smoke_display)[0] == "SMOKE - NON-INFERENTIAL"
+        and "reported ≥183-day interval cohort"
+        in source_aware_text(wide_smoke_display, "primary six-month continuers"),
+        f"pages={PAGE_FILES[:2]}; badge={run_badge(wide_smoke_display)[0]}",
+    )
+
     # 19. A forced preflight failure creates exactly one PNG and a one-page PDF.
     with tempfile.TemporaryDirectory(prefix="metabolic-preflight-test-") as directory:
         failure_cfg = RunConfig(mode="self-test", output_dir=directory)
@@ -8077,6 +8804,10 @@ def run_embedded_self_tests() -> dict[str, Any]:
         captured_sql.append(sql)
         if connection is not direct_connection:
             raise AssertionError("query used an unexpected connection")
+        if "aggregate source count" in sql and "[MBSCohort]" in sql:
+            return pd.DataFrame([{"source_rows": 5_500, "source_patients": 5_000}])
+        if "aggregate source count" in sql and "[GLP1Cohort]" in sql:
+            return pd.DataFrame([{"source_rows": 6_500, "source_patients": 6_000}])
         if "[MBSCohort]" in sql:
             return mbs_fixture.copy()
         if "[GLP1Cohort]" in sql:
@@ -8120,14 +8851,17 @@ def run_embedded_self_tests() -> dict[str, Any]:
             else:
                 os.environ[name] = value
     captured_probe_sql = [sql for sql in captured_sql if "column probe" in sql]
+    captured_count_sql = [sql for sql in captured_sql if "aggregate source count" in sql]
     captured_source_sql = [sql for sql in captured_sql if "direct wide cohort input" in sql]
     check(
         "29_production_direct_wide_query_e2e",
         direct_bundle is not None
         and direct_connection.closed
-        and len(captured_sql) == 4
+        and len(captured_sql) == 6
         and len(captured_probe_sql) == 2
         and all("SELECT TOP (0) *" in sql for sql in captured_probe_sql)
+        and len(captured_count_sql) == 2
+        and all("COUNT_BIG(DISTINCT [PatKey])" in sql for sql in captured_count_sql)
         and len(captured_source_sql) == 2
         and all("WITH [sampled_patients]" in sql for sql in captured_source_sql)
         and all("SELECT TOP (2000) [PatKey]" in sql for sql in captured_source_sql)
@@ -8140,6 +8874,12 @@ def run_embedded_self_tests() -> dict[str, Any]:
         and direct_bundle.metadata.get("measurement_timing") == "nominal_horizon_from_wide_columns"
         and direct_bundle.metadata.get("strict_raw_event_contract") is False
         and direct_bundle.metadata.get("preflight", {}).get("status") == "passed_with_wide_source_limitations"
+        and direct_bundle.metadata.get("preflight", {}).get("source_total_unique_patient_counts")
+        == {"MBSCohort": 5_000, "GLP1Cohort": 6_000}
+        and math.isclose(
+            direct_bundle.metadata.get("preflight", {}).get("source_patient_sampling_fractions", {}).get("MBSCohort", math.nan),
+            1 / 5_000,
+        )
         and set(direct_cohorts["cohort"]) == {"surgery", "incretin"},
         f"queries={len(captured_sql)}; cohorts={sorted(direct_cohorts.get('cohort', pd.Series(dtype=str)).unique())}",
     )
@@ -8709,6 +9449,8 @@ def write_preflight_success(context: RunContext, bundle: DataBundle, dependencie
             "source_mode": bundle.metadata.get("source_mode", "unknown"),
             "cohort_date_range": ("preflight only", "preflight only"),
             "status": "preflight passed",
+            "run_mode": context.cfg.mode,
+            "smoke_query_limit": context.cfg.smoke_query_limit if context.cfg.smoke else None,
             "dependencies": dict(dependencies),
             "preflight": bundle.metadata.get("preflight", {}),
             "measurement_timing": bundle.metadata.get("measurement_timing", "exact_day"),
@@ -8723,6 +9465,7 @@ def write_preflight_success(context: RunContext, bundle: DataBundle, dependencie
     }
     configure_figure_style()
     figure = render_page_01(data)
+    add_run_provenance(figure, data)
     png = context.export / "01_run_identity_and_status.png"
     temporary_png = context.export / (png.name + ".tmp")
     figure.savefig(temporary_png, format="png", dpi=300, facecolor=figure.get_facecolor())
@@ -8816,9 +9559,10 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     def evaluation_stage() -> dict[str, Any]:
         metrics, pit_values = evaluate_predictions(calibrated, weight_diagnostics)
         iqr = development_iqr_by_task(weighted_rows)
-        gates = apply_success_gates(metrics, selected, iqr)
-        gates = apply_source_claim_limit(gates, bundle.metadata)
         bootstrap_ci, comparisons = bootstrap_uncertainty(calibrated, selected, cfg)
+        gates = apply_success_gates(metrics, selected, iqr, comparisons)
+        gates = apply_source_claim_limit(gates, bundle.metadata)
+        gates = apply_smoke_claim_limit(gates, cfg)
         sensitivity = weight_sensitivity_table(calibrated, selected)
         gap_sensitivity = gap_rule_sensitivity(bundle)
         examples, joint_scores = build_synthetic_trajectory_examples(calibrated, selected, cfg)
@@ -8860,6 +9604,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
             selected=selected,
             calibration=calibration,
             metrics=evaluation["metrics"],
+            iqr=evaluation["iqr"],
             pit_values=evaluation["pit_values"],
             bootstrap_ci=evaluation["bootstrap_ci"],
             comparisons=evaluation["comparisons"],
@@ -8877,7 +9622,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
         aggregate_stage,
         {"evaluation": evaluation_hash},
     )
-    print("[metabolic] rendering 18-page disclosure-controlled figure book", flush=True)
+    print(f"[metabolic] rendering {len(PAGE_FILES)}-page disclosure-controlled figure book", flush=True)
     rendered = render_figure_book(figure_data, context.export)
     context.state["status"] = "completed"
     context.state["completed_utc"] = utc_now()
