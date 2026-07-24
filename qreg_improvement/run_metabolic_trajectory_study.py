@@ -13,7 +13,7 @@ accessible ``dbo.MBSCohort`` and ``dbo.GLP1Cohort`` tables, constructs one revie
 index row per patient and source, and keeps the resulting wide-source claims labeled
 exploratory where exact event timing is unavailable.
 Human-facing output is restricted to numbered PNG pages and one matching PDF in
-``FIGURES_TO_EXPORT``. Restart artifacts live in the fingerprinted run directory.
+``FIGURES_TO_EXPORT``. Restart artifacts live in the timestamped run directory.
 """
 from __future__ import annotations
 
@@ -54,7 +54,6 @@ from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, S
 
 SCRIPT_PATH = Path(__file__).resolve()
 SCRIPT_DIR = SCRIPT_PATH.parent
-DEFAULT_RESULTS_ROOT = SCRIPT_DIR / "results" / "metabolic_trajectory_runs"
 RUNTIME_CACHE = Path(tempfile.gettempdir()) / "metabolic_trajectory_runtime_cache"
 RUNTIME_CACHE.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("MPLCONFIGDIR", str(RUNTIME_CACHE / "matplotlib"))
@@ -119,6 +118,28 @@ WEIGHT_TRUNCATION = (0.01, 0.99)
 ALTERNATE_WEIGHT_TRUNCATION = ((0.005, 0.995), (0.0, 1.0))
 HELDOUT_CENTER_FRACTION = 0.20
 CONNECTION_TIMEOUT_SECONDS = 1000
+ATOMIC_REPLACE_ATTEMPTS = 12
+ATOMIC_REPLACE_INITIAL_DELAY_SECONDS = 0.10
+ATOMIC_REPLACE_MAX_DELAY_SECONDS = 2.0
+RETRYABLE_WINDOWS_REPLACE_ERRORS = frozenset({5, 32, 33})
+
+
+def timestamped_default_output_dir(
+    *,
+    now: datetime | None = None,
+    cwd: Path | None = None,
+) -> Path:
+    """Return a human-readable, collision-safe run directory below the current directory."""
+
+    started_at = now or datetime.now()
+    results_root = (cwd or Path.cwd()).expanduser().resolve() / "results"
+    stem = f"metabolic_trajectory_{started_at.strftime('%Y%m%d_%H%M%S')}"
+    candidate = results_root / stem
+    suffix = 1
+    while candidate.exists():
+        candidate = results_root / f"{stem}_{suffix:02d}"
+        suffix += 1
+    return candidate
 
 # The audited concept set is deliberately explicit. RxCUI values may be extended only after
 # review. Name matching is a transparent fallback for source tables that already expose a
@@ -178,11 +199,26 @@ class RunConfig:
         return self.mode == "smoke"
 
     @classmethod
-    def create(cls, mode: str, output_dir: str | None, resume: bool) -> "RunConfig":
+    def create(
+        cls,
+        mode: str,
+        output_dir: str | None,
+        resume: bool,
+        *,
+        now: datetime | None = None,
+        cwd: Path | None = None,
+    ) -> "RunConfig":
+        if resume and output_dir is None:
+            raise ValueError("--resume requires --output-dir PATH for the existing run")
+        resolved_output_dir = output_dir
+        if resolved_output_dir is None and mode != "plot-only":
+            resolved_output_dir = str(
+                timestamped_default_output_dir(now=now, cwd=cwd)
+            )
         if mode == "smoke":
             return cls(
                 mode=mode,
-                output_dir=output_dir,
+                output_dir=resolved_output_dir,
                 resume=resume,
                 bootstrap_replicates=60,
                 model_trials=2,
@@ -192,7 +228,7 @@ class RunConfig:
                 final_neural_seeds=1,
                 trajectory_draws=200,
             )
-        return cls(mode=mode, output_dir=output_dir, resume=resume)
+        return cls(mode=mode, output_dir=resolved_output_dir, resume=resume)
 
 
 @dataclass(frozen=True)
@@ -295,6 +331,57 @@ def sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
+def retryable_windows_replace_error(error: OSError) -> bool:
+    winerror = getattr(error, "winerror", None)
+    if winerror in RETRYABLE_WINDOWS_REPLACE_ERRORS:
+        return True
+    return os.name == "nt" and isinstance(error, PermissionError)
+
+
+def replace_file(
+    source: str | Path,
+    destination: str | Path,
+    *,
+    attempts: int = ATOMIC_REPLACE_ATTEMPTS,
+    initial_delay: float = ATOMIC_REPLACE_INITIAL_DELAY_SECONDS,
+    maximum_delay: float = ATOMIC_REPLACE_MAX_DELAY_SECONDS,
+    sleeper: Callable[[float], None] = time.sleep,
+    report_retries: bool = True,
+) -> None:
+    """Replace a file with bounded retries for transient Windows/SMB locks."""
+
+    if attempts < 1:
+        raise ValueError("replace attempts must be at least one")
+    delay = max(0.0, float(initial_delay))
+    retried = 0
+    for attempt in range(1, attempts + 1):
+        try:
+            os.replace(source, destination)
+            if retried and report_retries:
+                print(
+                    f"[metabolic] output replace recovered after {retried} "
+                    f"{'retry' if retried == 1 else 'retries'}: {Path(destination).name}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return
+        except OSError as exc:
+            if not retryable_windows_replace_error(exc) or attempt == attempts:
+                raise
+            retried += 1
+            if retried == 1 and report_retries:
+                code = getattr(exc, "winerror", None)
+                print(
+                    f"[metabolic] transient Windows/NAS file lock"
+                    f"{f' (WinError {code})' if code is not None else ''}: "
+                    f"{Path(destination).name}; retrying",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            sleeper(delay)
+            delay = min(maximum_delay, max(delay * 2.0, initial_delay))
+
+
 def atomic_bytes(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
@@ -303,7 +390,7 @@ def atomic_bytes(path: Path, payload: bytes) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        replace_file(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
@@ -570,10 +657,10 @@ def write_failure_pdf(path: Path, title: str, issues: Sequence[str], details: Se
 def failure_run_dir(cfg: RunConfig, title: str, issues: Sequence[str]) -> Path:
     if cfg.output_dir:
         return Path(cfg.output_dir).expanduser().resolve()
-    key = digest({"title": title, "issues": list(issues), "study": STUDY_VERSION})[:16]
     if cfg.mode == "self-test":
+        key = digest({"title": title, "issues": list(issues), "study": STUDY_VERSION})[:16]
         return RUNTIME_CACHE / ("self_test_failure_" + key)
-    return DEFAULT_RESULTS_ROOT / ("preflight_" + key)
+    return timestamped_default_output_dir()
 
 
 def render_preflight_failure(
@@ -2760,7 +2847,14 @@ class RunContext:
             }
         )
 
-    def save_checkpoint(self, stage: str, payload: Any, upstream: Mapping[str, str] | None = None) -> str:
+    def save_checkpoint(
+        self,
+        stage: str,
+        payload: Any,
+        upstream: Mapping[str, str] | None = None,
+        *,
+        elapsed_seconds: float | None = None,
+    ) -> str:
         body_path = self.checkpoints / f"{stage}.pkl"
         meta_path = self.checkpoints / f"{stage}.json"
         atomic_pickle(body_path, payload)
@@ -2775,7 +2869,13 @@ class RunContext:
             "completed_utc": utc_now(),
         }
         atomic_json(meta_path, metadata)
-        self.state.setdefault("stages", {})[stage] = {"status": "complete", "artifact_sha256": artifact_hash}
+        stage_state: dict[str, Any] = {
+            "status": "complete",
+            "artifact_sha256": artifact_hash,
+        }
+        if elapsed_seconds is not None:
+            stage_state["seconds"] = float(elapsed_seconds)
+        self.state.setdefault("stages", {})[stage] = stage_state
         atomic_json(self.run_dir / "run_state.json", self.state)
         return artifact_hash
 
@@ -2831,7 +2931,7 @@ def make_run_context(cfg: RunConfig, bundle: DataBundle, dependencies: Mapping[s
     run_dir = (
         Path(cfg.output_dir).expanduser().resolve()
         if cfg.output_dir
-        else DEFAULT_RESULTS_ROOT / fingerprint[:20]
+        else timestamped_default_output_dir()
     )
     context = RunContext(cfg, run_dir, fingerprint, fingerprint_payload)
     context.initialize()
@@ -7017,11 +7117,11 @@ def render_figure_book(data: Mapping[str, Any], export: Path) -> list[Path]:
             figure = render()
             temporary = export / (filename + ".tmp")
             figure.savefig(temporary, format="png", dpi=300, bbox_inches=None, facecolor=figure.get_facecolor())
-            os.replace(temporary, export / filename)
+            replace_file(temporary, export / filename)
             pdf.savefig(figure, dpi=300, facecolor=figure.get_facecolor())
             plt.close(figure)
             written.append(export / filename)
-    os.replace(pdf_temporary, pdf_final)
+    replace_file(pdf_temporary, pdf_final)
     written.append(pdf_final)
     validate_export_directory(export)
     return written
@@ -7371,11 +7471,11 @@ def render_schema_discovery_book(report: Mapping[str, Any], export: Path) -> lis
             figure = render()
             temporary_png = export / (filename + ".tmp")
             figure.savefig(temporary_png, format="png", dpi=300, facecolor=figure.get_facecolor())
-            os.replace(temporary_png, export / filename)
+            replace_file(temporary_png, export / filename)
             pdf.savefig(figure, dpi=300, facecolor=figure.get_facecolor())
             plt.close(figure)
             written.append(export / filename)
-    os.replace(temporary_pdf, final_pdf)
+    replace_file(temporary_pdf, final_pdf)
     written.append(final_pdf)
     final_present = {item.name for item in export.iterdir() if item.is_file()}
     if final_present != expected:
@@ -7386,8 +7486,7 @@ def render_schema_discovery_book(report: Mapping[str, Any], export: Path) -> lis
 def schema_discovery_run_dir(cfg: RunConfig) -> Path:
     if cfg.output_dir:
         return Path(cfg.output_dir).expanduser().resolve()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return DEFAULT_RESULTS_ROOT / f"schema_discovery_{stamp}"
+    return timestamped_default_output_dir()
 
 
 def _atomic_metadata_csv(path: Path, frame: Any) -> None:
@@ -7650,7 +7749,8 @@ def run_embedded_self_tests() -> dict[str, Any]:
         context = RunContext(resume_cfg, Path(directory), "fingerprint", {"test": True})
         context.initialize()
         payload = pd.DataFrame({"patient_id": ["hashed"], "value": [1]})
-        context.save_checkpoint("stage", payload)
+        context.save_checkpoint("stage", payload, elapsed_seconds=1.25)
+        elapsed_recorded = context.state["stages"]["stage"]["seconds"] == 1.25
         valid_load = context.load_checkpoint("stage") is not None
         metadata_path = context.checkpoints / "stage.json"
         metadata = read_json(metadata_path, {})
@@ -7661,7 +7761,10 @@ def run_embedded_self_tests() -> dict[str, Any]:
         metadata["stage_fingerprint"] = "stale"
         atomic_json(metadata_path, metadata)
         stale_rejected = context.load_checkpoint("stage") is None
-        check("17_checkpoint_resume_validation", valid_load and incomplete_rejected and stale_rejected)
+        check(
+            "17_checkpoint_resume_validation",
+            elapsed_recorded and valid_load and incomplete_rejected and stale_rejected,
+        )
 
     # 18. Small aggregate cells are suppressed.
     suppressed = suppress_small_cells(pd.DataFrame({"group": ["rare", "common"], "n": [10, 11], "estimate": [1.2, 2.3]}), ["n"])
@@ -8381,6 +8484,173 @@ def run_embedded_self_tests() -> dict[str, Any]:
         f"absent={absent_contract_failure}; forbidden={forbidden_contract_failure}",
     )
 
+    # 36. Implicit runs use a timestamped directory below the invocation directory,
+    # explicit overrides remain unchanged, and resume cannot silently target a new run.
+    with tempfile.TemporaryDirectory(prefix="metabolic-output-path-test-") as directory:
+        invocation_dir = Path(directory)
+        fixed_time = datetime(2026, 7, 23, 22, 2, 31)
+        default_cfg = RunConfig.create(
+            "smoke", None, False, now=fixed_time, cwd=invocation_dir
+        )
+        expected = (
+            invocation_dir.resolve()
+            / "results"
+            / "metabolic_trajectory_20260723_220231"
+        )
+        expected.mkdir(parents=True)
+        collided = timestamped_default_output_dir(
+            now=fixed_time, cwd=invocation_dir
+        )
+        explicit_cfg = RunConfig.create(
+            "production", r".\custom-results", False,
+            now=fixed_time, cwd=invocation_dir,
+        )
+        resume_rejected = False
+        try:
+            RunConfig.create(
+                "production", None, True,
+                now=fixed_time, cwd=invocation_dir,
+            )
+        except ValueError:
+            resume_rejected = True
+        check(
+            "36_timestamped_default_output_directory",
+            Path(str(default_cfg.output_dir)) == expected
+            and collided == expected.with_name(expected.name + "_01")
+            and explicit_cfg.output_dir == r".\custom-results"
+            and resume_rejected,
+            (
+                f"default={default_cfg.output_dir}; collision={collided}; "
+                f"explicit={explicit_cfg.output_dir}; "
+                f"resume_rejected={resume_rejected}"
+            ),
+        )
+
+    # 37. Windows/SMB access-denied and sharing locks are retried without weakening
+    # atomic replacement; persistent and unrelated failures still propagate.
+    with tempfile.TemporaryDirectory(prefix="metabolic-replace-test-") as directory:
+        replace_root = Path(directory)
+
+        class RetryableNasLock(PermissionError):
+            winerror = 5
+
+        class NonRetryableReplaceError(OSError):
+            winerror = 87
+
+        original_replace = os.replace
+        transient_source = replace_root / "transient.tmp"
+        transient_target = replace_root / "transient.json"
+        transient_source.write_bytes(b"new")
+        transient_target.write_bytes(b"old")
+        transient_calls = 0
+        transient_delays: list[float] = []
+
+        def transient_replace(source: str | Path, destination: str | Path) -> None:
+            nonlocal transient_calls
+            transient_calls += 1
+            if transient_calls <= 2:
+                raise RetryableNasLock(13, "simulated transient NAS lock")
+            original_replace(source, destination)
+
+        os.replace = transient_replace
+        try:
+            replace_file(
+                transient_source,
+                transient_target,
+                attempts=4,
+                initial_delay=0.1,
+                maximum_delay=0.2,
+                sleeper=transient_delays.append,
+                report_retries=False,
+            )
+        finally:
+            os.replace = original_replace
+        transient_recovered = (
+            transient_calls == 3
+            and transient_delays == [0.1, 0.2]
+            and transient_target.read_bytes() == b"new"
+            and not transient_source.exists()
+        )
+
+        persistent_source = replace_root / "persistent.tmp"
+        persistent_target = replace_root / "persistent.json"
+        persistent_source.write_bytes(b"new")
+        persistent_target.write_bytes(b"old")
+        persistent_calls = 0
+        persistent_delays: list[float] = []
+
+        def persistent_replace(source: str | Path, destination: str | Path) -> None:
+            nonlocal persistent_calls
+            persistent_calls += 1
+            raise RetryableNasLock(13, "simulated persistent NAS lock")
+
+        persistent_raised = False
+        os.replace = persistent_replace
+        try:
+            replace_file(
+                persistent_source,
+                persistent_target,
+                attempts=3,
+                initial_delay=0.1,
+                maximum_delay=0.2,
+                sleeper=persistent_delays.append,
+                report_retries=False,
+            )
+        except RetryableNasLock:
+            persistent_raised = True
+        finally:
+            os.replace = original_replace
+        persistent_preserved = (
+            persistent_raised
+            and persistent_calls == 3
+            and persistent_delays == [0.1, 0.2]
+            and persistent_source.read_bytes() == b"new"
+            and persistent_target.read_bytes() == b"old"
+        )
+
+        unrelated_source = replace_root / "unrelated.tmp"
+        unrelated_target = replace_root / "unrelated.json"
+        unrelated_source.write_bytes(b"new")
+        unrelated_calls = 0
+        unrelated_delays: list[float] = []
+
+        def unrelated_replace(source: str | Path, destination: str | Path) -> None:
+            nonlocal unrelated_calls
+            unrelated_calls += 1
+            raise NonRetryableReplaceError(22, "simulated invalid replace")
+
+        unrelated_raised = False
+        os.replace = unrelated_replace
+        try:
+            replace_file(
+                unrelated_source,
+                unrelated_target,
+                attempts=4,
+                sleeper=unrelated_delays.append,
+                report_retries=False,
+            )
+        except NonRetryableReplaceError:
+            unrelated_raised = True
+        finally:
+            os.replace = original_replace
+        unrelated_not_retried = (
+            unrelated_raised
+            and unrelated_calls == 1
+            and not unrelated_delays
+            and unrelated_source.read_bytes() == b"new"
+            and not unrelated_target.exists()
+        )
+
+        check(
+            "37_windows_nas_replace_retry_contract",
+            transient_recovered and persistent_preserved and unrelated_not_retried,
+            (
+                f"transient={transient_recovered}; "
+                f"persistent={persistent_preserved}; "
+                f"unrelated={unrelated_not_retried}"
+            ),
+        )
+
     return {
         "status": "passed",
         "tests": results,
@@ -8413,9 +8683,12 @@ def load_or_run_stage(
         return loaded, checkpoint_hash(context, stage)
     started = time.perf_counter()
     value = function()
-    artifact_hash = context.save_checkpoint(stage, value, upstream)
-    context.state.setdefault("stages", {}).setdefault(stage, {})["seconds"] = time.perf_counter() - started
-    atomic_json(context.run_dir / "run_state.json", context.state)
+    artifact_hash = context.save_checkpoint(
+        stage,
+        value,
+        upstream,
+        elapsed_seconds=time.perf_counter() - started,
+    )
     return value, artifact_hash
 
 
@@ -8453,12 +8726,12 @@ def write_preflight_success(context: RunContext, bundle: DataBundle, dependencie
     png = context.export / "01_run_identity_and_status.png"
     temporary_png = context.export / (png.name + ".tmp")
     figure.savefig(temporary_png, format="png", dpi=300, facecolor=figure.get_facecolor())
-    os.replace(temporary_png, png)
+    replace_file(temporary_png, png)
     pdf = context.export / "metabolic_trajectory_figure_book.pdf"
     temporary_pdf = context.export / "metabolic_trajectory_figure_book.pdf.tmp"
     with PdfPages(temporary_pdf, metadata={"Title": "Metabolic Trajectory Preflight"}) as writer:
         writer.savefig(figure, dpi=300, facecolor=figure.get_facecolor())
-    os.replace(temporary_pdf, pdf)
+    replace_file(temporary_pdf, pdf)
     plt.close(figure)
     return [png, pdf]
 
@@ -8679,7 +8952,11 @@ def build_parser() -> argparse.ArgumentParser:
     modes.add_argument("--self-test", action="store_true", help="Run deterministic embedded tests without Cosmos")
     modes.add_argument("--smoke", action="store_true", help="Run a bounded end-to-end study with reduced tuning")
     modes.add_argument("--plot-only", action="store_true", help="Rebuild figures from a verified matching aggregate checkpoint")
-    parser.add_argument("--output-dir", default=None, help="Override the fingerprinted run directory")
+    parser.add_argument(
+        "--output-dir",
+        default=None,
+        help=r"Override the default .\results\metabolic_trajectory_YYYYMMDD_HHMMSS run directory",
+    )
     parser.add_argument("--resume", action="store_true", help="Resume only verified fingerprint-compatible checkpoints")
     return parser
 
@@ -8690,6 +8967,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit("--resume is not meaningful with --self-test")
     if args.schema_discovery and args.resume:
         raise SystemExit("--resume is not meaningful with --schema-discovery")
+    if args.resume and not args.output_dir:
+        raise SystemExit("--resume requires --output-dir PATH for the existing run")
     mode = "production"
     if args.preflight_only:
         mode = "preflight-only"
