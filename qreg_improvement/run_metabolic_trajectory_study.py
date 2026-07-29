@@ -3371,12 +3371,17 @@ def procedure_category(value: Any) -> str | None:
     return PROCEDURE_CODES.get(match.group(1)) if match else None
 
 
-def first_later_bariatric_day(procedures: Any, patient_id: str, index_date: Any) -> int | None:
-    subset = procedures.loc[procedures["patient_id"].astype(str).eq(str(patient_id))].copy()
-    subset["code"] = subset["procedure_code"].astype(str).str.extract(r"(\d{5})", expand=False)
-    subset = subset.loc[subset["code"].isin(BARIATRIC_HISTORY_CODES)]
-    subset["day"] = (pd.to_datetime(subset["procedure_date"]) - pd.Timestamp(index_date)).dt.days
-    later = subset.loc[subset["day"].ge(0), "day"]
+def first_later_bariatric_day(bariatric_history: Any, index_date: Any) -> int | None:
+    """First on/after-index day among a patient's bariatric-history procedures.
+
+    ``bariatric_history`` must already be restricted to a single patient and to
+    ``BARIATRIC_HISTORY_CODES`` (the caller in ``construct_cohorts`` does this so the
+    full procedure table is not rescanned once per patient).
+    """
+    if bariatric_history.empty:
+        return None
+    day = (pd.to_datetime(bariatric_history["procedure_date"]) - pd.Timestamp(index_date)).dt.days
+    later = day.loc[day.ge(0)]
     return int(later.min()) if not later.empty else None
 
 
@@ -3392,6 +3397,20 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
     procedures["patient_id"] = procedures["patient_id"].astype(str)
     procedures["procedure_date"] = pd.to_datetime(procedures["procedure_date"], errors="coerce").dt.normalize()
     normalized_measurements, measurement_quality = normalize_measurements(bundle.measurements)
+    # Pre-group per-patient rows once so the cohort loops below do O(1) dict lookups
+    # instead of rescanning the full measurement/procedure tables for every patient.
+    # The per-patient full-frame scans are O(patients x rows) and do not finish on
+    # production-scale data (this mirrors the grouping already used in build_prediction_rows).
+    measurement_groups = {
+        patient_id: group
+        for patient_id, group in normalized_measurements.groupby("patient_id", sort=False)
+    }
+    empty_measurement_frame = normalized_measurements.iloc[0:0]
+    procedure_groups = {
+        patient_id: group
+        for patient_id, group in procedures.groupby("patient_id", sort=False)
+    }
+    empty_procedure_frame = procedures.iloc[0:0]
     direct_wide = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
     if direct_wide and "source_cohort" in bundle.medications:
         surgery_medications = bundle.medications.loc[bundle.medications["source_cohort"].eq("surgery")]
@@ -3435,7 +3454,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "prior_bariatric_surgery"
         elif numeric_or_default(patient, "dialysis_transplant_flag") == 1:
             exclusion = "dialysis_or_transplant"
-        patient_measurements = normalized_measurements.loc[normalized_measurements["patient_id"].eq(str(patient_id))]
+        patient_measurements = measurement_groups.get(str(patient_id), empty_measurement_frame)
         if direct_wide and "source_cohort" in patient_measurements:
             patient_measurements = patient_measurements.loc[patient_measurements["source_cohort"].eq("surgery")]
         baseline_bmi = select_baseline_measurement(patient_measurements, "bmi", index_date)
@@ -3548,11 +3567,11 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "age_under_18"
         elif pd.Timestamp(patient["observation_start_date"]) > index_date - pd.Timedelta(days=365):
             exclusion = "less_than_365_days_washout_observation"
-        patient_procedures = procedures.loc[procedures["patient_id"].eq(str(patient_id))].copy()
+        patient_procedures = procedure_groups.get(str(patient_id), empty_procedure_frame).copy()
         patient_procedures["code"] = patient_procedures["procedure_code"].astype(str).str.extract(r"(\d{5})", expand=False)
         patient_procedures = patient_procedures.loc[patient_procedures["code"].isin(BARIATRIC_HISTORY_CODES)]
         prior_surgery = patient_procedures["procedure_date"].lt(index_date).any()
-        first_surgery_day = first_later_bariatric_day(procedures, str(patient_id), index_date)
+        first_surgery_day = first_later_bariatric_day(patient_procedures, index_date)
         if not exclusion and prior_surgery:
             exclusion = "prior_bariatric_surgery"
         if (
@@ -3563,7 +3582,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "bariatric_surgery_timing_unresolved"
         if not exclusion and first_surgery_day is not None and first_surgery_day <= 182:
             exclusion = "bariatric_surgery_during_first_183_days"
-        patient_measurements = normalized_measurements.loc[normalized_measurements["patient_id"].eq(str(patient_id))]
+        patient_measurements = measurement_groups.get(str(patient_id), empty_measurement_frame)
         if direct_wide and "source_cohort" in patient_measurements:
             patient_measurements = patient_measurements.loc[patient_measurements["source_cohort"].eq("incretin")]
         baseline_bmi = select_baseline_measurement(patient_measurements, "bmi", index_date)
