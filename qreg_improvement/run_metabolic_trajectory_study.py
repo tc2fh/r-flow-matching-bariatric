@@ -568,8 +568,17 @@ def write_failure_png(path: Path, title: str, issues: Sequence[str], details: Se
     lines = [title.upper(), "", *wrapped, "", "THE STUDY STOPPED WITHOUT A SCIENTIFIC FALLBACK."]
     scale = 4
     line_height = 40
+    # Bound the number of rendered lines so a very long error message cannot inflate the
+    # image to gigabytes (the full text is always preserved in preflight_failure.json).
+    max_lines = 150
+    if len(lines) > max_lines:
+        lines = lines[: max_lines - 1] + ["... (failure report truncated; see preflight_failure.json)"]
     height = max(900, 130 + line_height * len(lines))
-    pixels = bytearray([248, 249, 251] * width * height)
+    # Allocate the background in one C-level step. The previous
+    # ``bytearray([248, 249, 251] * width * height)`` first built a Python list of
+    # 3*width*height int references (tens of MB of pointers) and raised MemoryError under
+    # memory pressure; ``bytearray(pattern) * n`` writes the bytes directly.
+    pixels = bytearray((248, 249, 251)) * (width * height)
 
     def rectangle(x0: int, y0: int, x1: int, y1: int, color: tuple[int, int, int]) -> None:
         x0, y0 = max(0, x0), max(0, y0)
@@ -694,12 +703,17 @@ def render_preflight_failure(
         raise RuntimeError(f"Failure export directory contains an unexpected file: {existing.name}")
     png = export / "00_preflight_failure.png"
     pdf = export / "metabolic_trajectory_figure_book.pdf"
-    write_failure_png(png, title, issues, details)
-    write_failure_pdf(pdf, title, issues, details)
+    # Persist the machine-readable failure record first: it is tiny and captures the full
+    # error text, so it survives even if image rendering runs out of memory.
     atomic_json(
         run_dir / "preflight_failure.json",
         {"status": "preflight_failure", "title": title, "issues": list(issues), "details": list(details), "time_utc": utc_now()},
     )
+    try:
+        write_failure_png(png, title, issues, details)
+        write_failure_pdf(pdf, title, issues, details)
+    except Exception as render_error:  # never let report rendering mask the real failure
+        print(f"[metabolic] failure report images could not be rendered: {render_error!r}", file=sys.stderr)
     return png
 
 
@@ -3397,20 +3411,25 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
     procedures["patient_id"] = procedures["patient_id"].astype(str)
     procedures["procedure_date"] = pd.to_datetime(procedures["procedure_date"], errors="coerce").dt.normalize()
     normalized_measurements, measurement_quality = normalize_measurements(bundle.measurements)
-    # Pre-group per-patient rows once so the cohort loops below do O(1) dict lookups
-    # instead of rescanning the full measurement/procedure tables for every patient.
-    # The per-patient full-frame scans are O(patients x rows) and do not finish on
-    # production-scale data (this mirrors the grouping already used in build_prediction_rows).
-    measurement_groups = {
-        patient_id: group
-        for patient_id, group in normalized_measurements.groupby("patient_id", sort=False)
-    }
+    # Map each patient to the integer row positions of their measurements/procedures once,
+    # so the cohort loops below slice per patient in O(1) without rescanning the full tables
+    # (those per-patient full-frame scans were O(patients x rows) and did not finish on
+    # production-scale data). Storing integer positions rather than one materialized
+    # sub-frame per patient keeps peak memory low when there are hundreds of thousands of
+    # patients, which a dict of per-patient DataFrames would not.
+    measurement_positions = normalized_measurements.groupby("patient_id", sort=False).indices
+    procedure_positions = procedures.groupby("patient_id", sort=False).indices
     empty_measurement_frame = normalized_measurements.iloc[0:0]
-    procedure_groups = {
-        patient_id: group
-        for patient_id, group in procedures.groupby("patient_id", sort=False)
-    }
     empty_procedure_frame = procedures.iloc[0:0]
+
+    def measurements_for(patient_id: Any) -> Any:
+        positions = measurement_positions.get(str(patient_id))
+        return empty_measurement_frame if positions is None else normalized_measurements.take(positions)
+
+    def procedures_for(patient_id: Any) -> Any:
+        positions = procedure_positions.get(str(patient_id))
+        return empty_procedure_frame if positions is None else procedures.take(positions)
+
     direct_wide = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
     if direct_wide and "source_cohort" in bundle.medications:
         surgery_medications = bundle.medications.loc[bundle.medications["source_cohort"].eq("surgery")]
@@ -3454,7 +3473,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "prior_bariatric_surgery"
         elif numeric_or_default(patient, "dialysis_transplant_flag") == 1:
             exclusion = "dialysis_or_transplant"
-        patient_measurements = measurement_groups.get(str(patient_id), empty_measurement_frame)
+        patient_measurements = measurements_for(patient_id)
         if direct_wide and "source_cohort" in patient_measurements:
             patient_measurements = patient_measurements.loc[patient_measurements["source_cohort"].eq("surgery")]
         baseline_bmi = select_baseline_measurement(patient_measurements, "bmi", index_date)
@@ -3567,7 +3586,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "age_under_18"
         elif pd.Timestamp(patient["observation_start_date"]) > index_date - pd.Timedelta(days=365):
             exclusion = "less_than_365_days_washout_observation"
-        patient_procedures = procedure_groups.get(str(patient_id), empty_procedure_frame).copy()
+        patient_procedures = procedures_for(patient_id).copy()
         patient_procedures["code"] = patient_procedures["procedure_code"].astype(str).str.extract(r"(\d{5})", expand=False)
         patient_procedures = patient_procedures.loc[patient_procedures["code"].isin(BARIATRIC_HISTORY_CODES)]
         prior_surgery = patient_procedures["procedure_date"].lt(index_date).any()
@@ -3582,7 +3601,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "bariatric_surgery_timing_unresolved"
         if not exclusion and first_surgery_day is not None and first_surgery_day <= 182:
             exclusion = "bariatric_surgery_during_first_183_days"
-        patient_measurements = measurement_groups.get(str(patient_id), empty_measurement_frame)
+        patient_measurements = measurements_for(patient_id)
         if direct_wide and "source_cohort" in patient_measurements:
             patient_measurements = patient_measurements.loc[patient_measurements["source_cohort"].eq("incretin")]
         baseline_bmi = select_baseline_measurement(patient_measurements, "bmi", index_date)
@@ -3739,13 +3758,14 @@ def robust_slope(days: Any, values: Any) -> float:
 
 def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
     rows: list[dict[str, Any]] = []
-    measurement_groups = {
-        patient_id: group.copy()
-        for patient_id, group in measurements.groupby("patient_id", sort=False)
-    }
+    # Map each patient to integer row positions once (instead of materializing one
+    # sub-frame per patient), so peak memory stays low at production scale.
+    measurement_positions = measurements.groupby("patient_id", sort=False).indices
+    empty_measurements = measurements.iloc[0:0]
     for patient in cohorts_with_splits.itertuples(index=False):
         payload = patient._asdict()
-        patient_measurements = measurement_groups.get(str(patient.patient_id), pd.DataFrame(columns=measurements.columns))
+        positions = measurement_positions.get(str(patient.patient_id))
+        patient_measurements = empty_measurements if positions is None else measurements.take(positions)
         index_date = pd.Timestamp(patient.index_date)
         patient_measurements = patient_measurements.copy()
         if not patient_measurements.empty:
@@ -9773,15 +9793,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"preflight failed: {failure}", file=sys.stderr)
         return 2
     except Exception as exc:
-        detail = sanitize_exception_text(exc)
-        failure = render_preflight_failure(
-            cfg,
-            "Study execution failed",
-            [f"{type(exc).__name__}: {detail}"],
-            ["The run stopped before a scientific result was released. Review the console traceback inside the secure VM."],
-        )
-        print(f"study failed: {failure}", file=sys.stderr)
+        # Print the real error first so a failure while rendering the report (e.g.
+        # MemoryError under memory pressure) can never mask the root cause.
         traceback.print_exc()
+        detail = sanitize_exception_text(exc)
+        print(f"study failed: {type(exc).__name__}: {detail}", file=sys.stderr)
+        try:
+            render_preflight_failure(
+                cfg,
+                "Study execution failed",
+                [f"{type(exc).__name__}: {detail}"],
+                ["The run stopped before a scientific result was released. Review the console traceback inside the secure VM."],
+            )
+        except Exception as report_error:
+            print(f"[metabolic] failure report could not be written: {report_error!r}", file=sys.stderr)
         return 1
 
 
