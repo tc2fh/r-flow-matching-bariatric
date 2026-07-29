@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import gc
 import hashlib
 import importlib
 import importlib.metadata
@@ -3756,13 +3757,26 @@ def robust_slope(days: Any, values: Any) -> float:
     return float(np.median(slopes)) if slopes else 0.0
 
 
+# Number of prediction rows to accumulate before flushing to a compact frame. Bounds the
+# transient per-row-dict memory during build_prediction_rows without changing the result.
+PREDICTION_ROW_CHUNK = 250_000
+
+
 def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
     rows: list[dict[str, Any]] = []
+    # Flush accumulated rows into compact frames at patient boundaries so the full list of
+    # per-row dicts (several times the size of the final table) never coexists with it at
+    # production scale; concatenating the chunks is identical to one DataFrame(rows).
+    frames: list[Any] = []
+    chunk_rows = PREDICTION_ROW_CHUNK
     # Map each patient to integer row positions once (instead of materializing one
     # sub-frame per patient), so peak memory stays low at production scale.
     measurement_positions = measurements.groupby("patient_id", sort=False).indices
     empty_measurements = measurements.iloc[0:0]
     for patient in cohorts_with_splits.itertuples(index=False):
+        if len(rows) >= chunk_rows:
+            frames.append(pd.DataFrame(rows))
+            rows = []
         payload = patient._asdict()
         positions = measurement_positions.get(str(patient.patient_id))
         patient_measurements = empty_measurements if positions is None else measurements.take(positions)
@@ -3871,10 +3885,11 @@ def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
                         "effective_censor_day": censor_day if censor_day is not None else np.nan,
                     }
                     rows.append(row)
-    frame = pd.DataFrame(rows)
-    if frame.empty:
+    if rows:
+        frames.append(pd.DataFrame(rows))
+    if not frames:
         raise PreflightError("Prediction-row construction produced no rows", ["No eligible origin and future-target combinations remain"])
-    return frame
+    return frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
 
 
 def leakage_audit(rows: Any, split_metadata: Mapping[str, Any]) -> Any:
@@ -9538,6 +9553,13 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     cohort_artifacts, cohort_hash = load_or_run_stage(
         context, "cohorts", lambda: construct_cohorts(bundle)
     )
+    # Cohort construction has consumed the raw patient/procedure/measurement frames; only
+    # bundle.medications (gap-rule sensitivity) and bundle.metadata are read afterwards.
+    # Release the rest so they do not occupy memory through modeling at production scale.
+    bundle.patients = bundle.patients.iloc[0:0].copy()
+    bundle.procedures = bundle.procedures.iloc[0:0].copy()
+    bundle.measurements = bundle.measurements.iloc[0:0].copy()
+    gc.collect()
     split_payload, split_hash = load_or_run_stage(
         context,
         "global_splits",
@@ -9566,6 +9588,10 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     )
     weighted_rows = weight_payload["rows"]
     weight_diagnostics = weight_payload["diagnostics"]
+    # weighted_rows is a copy of prediction_rows with weight columns added; the original is
+    # not read again, so release it before model fitting, which needs the memory.
+    del prediction_rows
+    gc.collect()
     ode_gates = ode_suitability_gates(cohorts, cohort_artifacts["measurements"], dependencies)
     print("[metabolic] fitting matched candidate roster", flush=True)
     model_payload, model_hash = load_or_run_stage(
