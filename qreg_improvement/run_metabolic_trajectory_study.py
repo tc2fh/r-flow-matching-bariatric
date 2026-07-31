@@ -3761,6 +3761,70 @@ def robust_slope(days: Any, values: Any) -> float:
 # transient per-row-dict memory during build_prediction_rows without changing the result.
 PREDICTION_ROW_CHUNK = 250_000
 
+# Low-cardinality string columns of the prediction-row table. Storing these as pandas
+# `category` (small integer codes + one shared dictionary) instead of object-dtype Python
+# strings is the single largest memory reduction at production scale: each such column drops
+# from ~40-60 bytes/row (a pointer plus str object) to 1-4 bytes/row, and the reduction is
+# exactly lossless. patient_id is included because, although high-cardinality, every id is
+# repeated across ~20-45 origin/target rows, so category codes still roughly halve it.
+PREDICTION_ROW_CATEGORY_COLUMNS = (
+    "patient_id", "cohort", "outcome", "support_status", "split", "center_id",
+    "treatment", "procedure", "index_ingredient", "index_route", "therapy_class",
+    "sex", "race", "ethnicity", "coverage",
+)
+# support_status and outcome are computed, not carried on the patient record, so their
+# category universes are enumerated here; every other categorical universe is derived from
+# the source cohort frame in prediction_row_category_dtypes().
+_SUPPORT_STATUS_LEVELS = (
+    "administratively_immature", "mature_with_target",
+    "treatment_or_surgery_censored", "mature_without_target",
+)
+_OUTCOME_LEVELS = ("bmi", "hba1c")
+
+
+def prediction_row_category_dtypes(cohorts_with_splits: Any) -> dict[str, Any]:
+    """Fixed CategoricalDtype per low-cardinality prediction-row column.
+
+    Categories are derived up front so every flushed chunk shares an identical dtype;
+    pandas only preserves `category` through pd.concat when the dtypes match exactly
+    (differing category sets silently upcast back to object), so this must be fixed, not
+    per-chunk. Values are matched to how build_prediction_rows stores them (str()).
+    """
+    def levels_from(column: str) -> list[str]:
+        if column not in cohorts_with_splits:
+            return []
+        return sorted({str(value) for value in cohorts_with_splits[column].unique()})
+
+    universes: dict[str, list[str]] = {
+        "outcome": list(_OUTCOME_LEVELS),
+        "support_status": list(_SUPPORT_STATUS_LEVELS),
+    }
+    dtypes: dict[str, Any] = {}
+    for column in PREDICTION_ROW_CATEGORY_COLUMNS:
+        levels = universes.get(column, levels_from(column))
+        # A column absent from the source with no enumerated universe cannot be typed here;
+        # it stays object and is simply not compacted (never happens for the fixed schema).
+        if levels:
+            dtypes[column] = pd.CategoricalDtype(categories=levels)
+    return dtypes
+
+
+def compact_prediction_chunk(frame: Any, category_dtypes: Mapping[str, Any]) -> Any:
+    """Apply the fixed categorical dtypes to a freshly built prediction-row chunk.
+
+    Any value outside its fixed category set would become NaN, which for these columns is
+    always a construction bug (the universes are exhaustive by derivation); assert rather
+    than silently corrupt an identifier.
+    """
+    present = {column: dtype for column, dtype in category_dtypes.items() if column in frame.columns}
+    if not present:
+        return frame
+    converted = frame.astype(present)
+    for column in present:
+        if frame[column].notna().any() and converted[column].isna().any() and not frame[column].isna().any():
+            raise RuntimeError(f"Prediction-row column {column!r} produced values outside its fixed category set")
+    return converted
+
 
 def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
     rows: list[dict[str, Any]] = []
@@ -3769,13 +3833,18 @@ def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
     # production scale; concatenating the chunks is identical to one DataFrame(rows).
     frames: list[Any] = []
     chunk_rows = PREDICTION_ROW_CHUNK
+    # Fixed categorical dtypes applied to every flushed chunk so the assembled table stores
+    # its many repeated string columns as small integer codes rather than object-dtype
+    # Python strings. Derived once up front because pd.concat only preserves `category`
+    # across chunks whose dtypes match exactly.
+    category_dtypes = prediction_row_category_dtypes(cohorts_with_splits)
     # Map each patient to integer row positions once (instead of materializing one
     # sub-frame per patient), so peak memory stays low at production scale.
     measurement_positions = measurements.groupby("patient_id", sort=False).indices
     empty_measurements = measurements.iloc[0:0]
     for patient in cohorts_with_splits.itertuples(index=False):
         if len(rows) >= chunk_rows:
-            frames.append(pd.DataFrame(rows))
+            frames.append(compact_prediction_chunk(pd.DataFrame(rows), category_dtypes))
             rows = []
         payload = patient._asdict()
         positions = measurement_positions.get(str(patient.patient_id))
@@ -3886,7 +3955,7 @@ def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
                     }
                     rows.append(row)
     if rows:
-        frames.append(pd.DataFrame(rows))
+        frames.append(compact_prediction_chunk(pd.DataFrame(rows), category_dtypes))
     if not frames:
         raise PreflightError("Prediction-row construction produced no rows", ["No eligible origin and future-target combinations remain"])
     return frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
@@ -3999,6 +4068,23 @@ def quantile_column(quantile: float) -> str:
 
 QUANTILE_COLUMNS = tuple(quantile_column(item) for item in QUANTILES)
 
+# Quantile predictions are stored as float32. They carry only ~7 significant digits of signal,
+# and these seven columns are the largest numeric block of the prediction table, so float32
+# storage roughly halves it. Evaluation reads them back as float64 (every consumer calls
+# .to_numpy(float)), so downstream arithmetic runs in double precision; the only effect is a
+# ~1e-7 relative round-trip on the stored values, scientifically negligible and far inside
+# reporting tolerance. Used only for whole-column assignment (df[cols] = matrix), which takes
+# the array's dtype; the in-place .loc writeback in conformal_calibrate preserves float32 on
+# its own, and computation helpers (rearrange_quantiles, pit_from_quantiles) stay float64.
+# A string dtype, not np.float32, because numpy is imported lazily (module globals np/pd are
+# None until load_runtime_packages runs); np.ascontiguousarray resolves the string at call time.
+QUANTILE_STORE_DTYPE = "float32"
+
+
+def stored_quantiles(matrix: Any) -> Any:
+    """Cast a quantile matrix to the compact storage dtype for assignment into a frame."""
+    return np.ascontiguousarray(matrix, dtype=QUANTILE_STORE_DTYPE)
+
 
 def pinball_loss(y_true: Any, prediction: Any, quantile: float, weights: Any | None = None) -> float:
     y = np.asarray(y_true, dtype=float)
@@ -4071,7 +4157,11 @@ def max_weighted_smd(frame: Any, weight_column: str, group_column: str) -> float
 
 
 def estimate_cross_fitted_weights(rows: Any, seed: int = SEED) -> tuple[Any, Any]:
-    weighted = rows.copy().reset_index(drop=True)
+    # No defensive .copy(): weight estimation only writes newly-created columns (row_id,
+    # probabilities, weights) and reads the rest, so copy-on-write leaves the existing columns
+    # shared with the caller's frame, which is released immediately after this stage. This
+    # avoids duplicating the full prediction-row table at production scale.
+    weighted = rows.reset_index(drop=True)
     weighted["row_id"] = np.arange(len(weighted), dtype=int)
     weighted["treatment_probability"] = np.nan
     weighted["observation_probability"] = np.nan
@@ -4244,7 +4334,7 @@ def fit_population_baseline(task: Any) -> Any:
         change_quantiles = fine.get(fine_key, coarse.get(coarse_key, horizon.get(horizon_key, overall)))
         predictions.append(np.asarray(change_quantiles) + float(row.prediction_reference_value))
     result = prediction_identity(task, "population_change", "empirical_baseline")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(np.vstack(predictions))
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(np.vstack(predictions)))
     return result
 
 
@@ -4259,7 +4349,7 @@ def fit_persistence_baseline(task: Any) -> Any:
         [residuals.get(row.target_month, overall) + float(row.prediction_reference_value) for row in task.itertuples(index=False)]
     )
     result = prediction_identity(task, "persistence", "empirical_baseline")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(matrix)
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(matrix))
     return result
 
 
@@ -4320,7 +4410,7 @@ def fit_spline_candidate(task: Any, cfg: RunConfig) -> Any:
         ]
     )
     result = prediction_identity(task, "regularized_spline", "ridge_cubic_spline")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(matrix)
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(matrix))
     result["model_detail"] = f"ridge alpha={best_alpha:g}"
     return result
 
@@ -4372,7 +4462,7 @@ def fit_hgb_candidate(task: Any, cfg: RunConfig) -> Any:
     change_matrix = rearrange_quantiles(np.column_stack([model.predict(x_all) for model in best_models]))
     absolute = change_matrix + task["prediction_reference_value"].to_numpy(float)[:, None]
     result = prediction_identity(task, "histogram_gradient_boosting", "hist_gradient_boosting_quantile")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(absolute)
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(absolute))
     result["model_detail"] = canonical_json(best_params or {})
     return result
 
@@ -4423,7 +4513,7 @@ def fit_catboost_candidate(task: Any, cfg: RunConfig) -> Any:
         raise RuntimeError("CatBoost MultiQuantile returned a median-only prediction")
     absolute = rearrange_quantiles(change_matrix) + task["prediction_reference_value"].to_numpy(float)[:, None]
     result = prediction_identity(task, "catboost_multi_quantile", "catboost_multi_quantile")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(absolute)
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(absolute))
     result["model_detail"] = f"joint MultiQuantile; trees={int(model.tree_count_)}"
     return result
 
@@ -4644,7 +4734,7 @@ def fit_mlp_candidate(task: Any, cfg: RunConfig) -> tuple[Any, dict[str, Any]]:
     change_matrix = np.mean(np.stack(seed_predictions, axis=0), axis=0)
     absolute = rearrange_quantiles(change_matrix) + task["prediction_reference_value"].to_numpy(float)[:, None]
     result = prediction_identity(task, "pytorch_quantile_mlp", "direct_horizon_mlp")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(absolute)
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(absolute))
     result["model_detail"] = f"seed average n={cfg.final_neural_seeds}"
     return result, {"runs": run_details, "seed_count": cfg.final_neural_seeds}
 
@@ -5119,7 +5209,7 @@ def fit_ode_candidate(task: Any, cohorts: Any, measurements: Any, cfg: RunConfig
     order_map = {row_id: index for index, row_id in enumerate(frame["row_id"])}
     matrix = np.vstack([absolute[order_map[row_id]] for row_id in identity_rows["row_id"]])
     result = prediction_identity(identity_rows, "pytorch_ode_rnn", "context_conditioned_ode_rnn")
-    result[list(QUANTILE_COLUMNS)] = rearrange_quantiles(matrix)
+    result[list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(matrix))
     result["model_detail"] = f"seed average n={cfg.final_neural_seeds}; RK4 max step={cfg.max_ode_step:g} years"
     seed_crps = []
     observed_mask = frame["split"].isin(["validation", "temporal_test", "geographic_test"]).to_numpy()
@@ -5293,7 +5383,7 @@ def add_ensemble_candidates(predictions: Any, cfg: RunConfig) -> tuple[Any, Any]
         ensemble = identity.copy()
         ensemble["candidate"] = "validation_weighted_ensemble"
         ensemble["architecture"] = "architecture_ensemble"
-        ensemble[list(QUANTILE_COLUMNS)] = all_matrix
+        ensemble[list(QUANTILE_COLUMNS)] = stored_quantiles(all_matrix)
         ensemble["model_detail"] = " | ".join(
             f"{candidate}={weight:.4f}" for candidate, weight in zip(selected_candidates, best_weights, strict=False)
         )
@@ -5493,7 +5583,17 @@ def fit_candidate_roster(
     if not predictions:
         raise RuntimeError("Every model candidate failed")
     combined = pd.concat(predictions, ignore_index=True)
+    # The per-candidate prediction frames are collectively the largest object in the run;
+    # release the list before the ensemble concat so both do not coexist at production scale.
+    predictions.clear()
+    gc.collect()
     combined, ensemble_weights = add_ensemble_candidates(combined, cfg)
+    # candidate/architecture are low-cardinality labels repeated across every prediction row;
+    # store them as category to avoid duplicated object strings at production scale. This is
+    # done after the ensemble step so its new labels are part of the category universe.
+    for column in ("candidate", "architecture"):
+        if column in combined.columns:
+            combined[column] = combined[column].astype("category")
     return combined, pd.DataFrame(status_rows), {**neural_details, "ensemble_weights": ensemble_weights}
 
 
@@ -5507,7 +5607,10 @@ def finite_sample_quantile(values: Any, coverage: float) -> float:
 
 
 def conformal_calibrate(predictions: Any) -> tuple[Any, Any]:
-    calibrated = predictions.copy()
+    # Calibrate the quantile columns in place. The caller has already computed everything it
+    # needs from the uncalibrated frame (the validation leaderboard) and drops its reference
+    # afterwards, so mutating avoids holding a second full copy of the largest table in the run.
+    calibrated = predictions
     corrections: list[dict[str, Any]] = []
     group_columns = ["cohort", "outcome", "origin_month", "target_month", "candidate"]
     interval_pairs = ((0, 6, 0.90), (1, 5, 0.80), (2, 4, 0.50))
@@ -5540,7 +5643,10 @@ def conformal_calibrate(predictions: Any) -> tuple[Any, Any]:
         for (lower_index, upper_index), correction in group_corrections.items():
             values[:, lower_index] -= correction
             values[:, upper_index] += correction
-        calibrated.loc[indices, list(QUANTILE_COLUMNS)] = rearrange_quantiles(values)
+        # Cast to the stored dtype explicitly: pandas 3.0's .loc setitem raises
+        # LossySetitemError rather than silently downcasting a float64 array into the float32
+        # quantile columns when the values are not exactly representable.
+        calibrated.loc[indices, list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(values))
     return calibrated, pd.DataFrame(corrections)
 
 
@@ -6333,7 +6439,7 @@ def build_figure_data(
     cohorts: Any,
     split_metadata: Mapping[str, Any],
     leakage: Any,
-    weighted_rows: Any,
+    support: Any,
     weight_diagnostics: Any,
     predictions: Any,
     model_status: Any,
@@ -6394,7 +6500,7 @@ def build_figure_data(
         ),
         "exposure": exposure_summary(cohort_artifacts["exposure"], cohort_artifacts["medication_audit"]),
         "baseline": baseline_table,
-        "support": target_support_table(weighted_rows),
+        "support": support,
         "measurement_quality": measurement_quality_table(cohort_artifacts["measurement_quality"], cohort_artifacts["measurements"]),
         "split": {
             "metadata": dict(split_metadata),
@@ -9616,14 +9722,27 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     predictions = model_payload["predictions"]
     model_status = model_payload["status"]
     neural_details = model_payload["details"]
+    # weighted_rows (the prediction-row table) is the second-largest object in the run and is
+    # not needed past model fitting except for two cheap task-level reductions. Compute them
+    # now and release the frame - including the checkpoint payload's reference - so it does not
+    # occupy memory through evaluation and figure assembly at production scale.
+    development_iqr = development_iqr_by_task(weighted_rows)
+    support_table = target_support_table(weighted_rows)
+    del weighted_rows
+    weight_payload["rows"] = None
+    gc.collect()
     leaderboard = candidate_validation_scores(predictions)
     selected = select_models(leaderboard)
     calibrated, calibration = conformal_calibrate(predictions)
+    # conformal_calibrate mutates predictions in place, so the uncalibrated frame and its
+    # calibrated copy never coexist; the uncalibrated view (leaderboard) was already computed.
+    del predictions
+    model_payload["predictions"] = None
     print("[metabolic] evaluating protected tests and uncertainty", flush=True)
 
     def evaluation_stage() -> dict[str, Any]:
         metrics, pit_values = evaluate_predictions(calibrated, weight_diagnostics)
-        iqr = development_iqr_by_task(weighted_rows)
+        iqr = development_iqr
         bootstrap_ci, comparisons = bootstrap_uncertainty(calibrated, selected, cfg)
         gates = apply_success_gates(metrics, selected, iqr, comparisons)
         gates = apply_source_claim_limit(gates, bundle.metadata)
@@ -9660,7 +9779,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
             cohorts=cohorts,
             split_metadata=split_metadata,
             leakage=leakage,
-            weighted_rows=weighted_rows,
+            support=support_table,
             weight_diagnostics=weight_diagnostics,
             predictions=calibrated,
             model_status=model_status,
