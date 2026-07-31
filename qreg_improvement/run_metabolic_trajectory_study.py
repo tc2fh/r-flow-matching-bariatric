@@ -302,6 +302,58 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def process_peak_rss_bytes() -> int | None:
+    """Best-effort peak resident-set size of this process, in bytes; None if unavailable.
+
+    Cross-platform and dependency-free (no psutil): resource.getrusage on POSIX, the Win32
+    GetProcessMemoryInfo PeakWorkingSetSize on Windows. Used only for progress logging so an
+    operator running the study on the production VM can see how close each stage comes to the
+    machine's memory ceiling and decide whether further out-of-core work is warranted. Never
+    raises - memory reporting must not be able to fail a scientific run.
+    """
+    try:
+        import resource
+
+        maximum = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux reports kilobytes; macOS/BSD report bytes.
+        return int(maximum) * 1024 if sys.platform.startswith("linux") else int(maximum)
+    except Exception:
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = _PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(counters)
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+            return int(counters.PeakWorkingSetSize)
+    except Exception:
+        pass
+    return None
+
+
+def log_peak_rss(label: str) -> None:
+    """Emit the running peak RSS after a pipeline stage, if the platform can report it."""
+    peak = process_peak_rss_bytes()
+    if peak is not None:
+        print(f"[metabolic] peak memory after {label}: {peak / (1024 ** 3):.2f} GB", flush=True)
+
+
 def json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -9603,6 +9655,7 @@ def load_or_run_stage(
 ) -> tuple[Any, str]:
     loaded = context.load_checkpoint(stage, upstream)
     if loaded is not None:
+        log_peak_rss(f"stage {stage} (resumed)")
         return loaded, checkpoint_hash(context, stage)
     started = time.perf_counter()
     value = function()
@@ -9612,6 +9665,7 @@ def load_or_run_stage(
         upstream,
         elapsed_seconds=time.perf_counter() - started,
     )
+    log_peak_rss(f"stage {stage}")
     return value, artifact_hash
 
 
