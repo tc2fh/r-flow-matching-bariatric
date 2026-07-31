@@ -5224,10 +5224,18 @@ def fit_ode_candidate(task: Any, cohorts: Any, measurements: Any, cfg: RunConfig
 # ======================================================================================
 
 
-def prediction_development_iqr_map(predictions: Any) -> dict[tuple[str, str, int], float]:
-    development = predictions.loc[
-        predictions["split"].eq("train") & predictions["target_observed"]
-    ].drop_duplicates("row_id")
+def development_iqr_scale_map(weighted_rows: Any) -> dict[tuple[str, str, int], float]:
+    """Per-(cohort, outcome, target_month) development IQR used to standardize CRPS.
+
+    Computed from the prediction-row table (weighted_rows) rather than from the prediction
+    frame. It is numerically identical to the historical prediction_development_iqr_map (both
+    take the IQR of the same train+observed target values), but sourcing it here decouples the
+    scale map from train-split prediction rows, which are dropped from the stored predictions
+    because no evaluator ever reads them.
+    """
+    development = weighted_rows.loc[
+        weighted_rows["split"].eq("train") & weighted_rows["target_observed"]
+    ]
     scales: dict[tuple[str, str, int], float] = {}
     for keys, group in development.groupby(["cohort", "outcome", "target_month"], sort=True):
         values = pd.to_numeric(group["target_value"], errors="coerce").dropna().to_numpy(float)
@@ -5235,6 +5243,19 @@ def prediction_development_iqr_map(predictions: Any) -> dict[tuple[str, str, int
             q25, q75 = np.quantile(values, [0.25, 0.75])
             scales[(str(keys[0]), str(keys[1]), int(keys[2]))] = max(float(q75 - q25), 1e-8)
     return scales
+
+
+def drop_training_predictions(frame: Any) -> Any:
+    """Drop training-split prediction rows from a candidate's output frame.
+
+    No evaluator scores training-split predictions: the validation leaderboard uses the
+    validation split, conformal calibration uses the calibration split, and every test metric
+    uses the temporal/geographic test splits. Training is ~65% of patients, so removing these
+    rows shrinks the stored prediction table roughly threefold with no effect on any output.
+    The development IQR scale, the one quantity that read train-split predictions, now comes
+    from development_iqr_scale_map(weighted_rows) instead.
+    """
+    return frame.loc[frame["split"].ne("train")]
 
 
 def equal_horizon_standardized_crps(
@@ -5266,9 +5287,8 @@ def equal_horizon_standardized_crps(
     return float(np.mean(values)) if values else math.nan
 
 
-def candidate_validation_scores(predictions: Any) -> Any:
+def candidate_validation_scores(predictions: Any, scale_map: Mapping[tuple[str, str, int], float]) -> Any:
     rows: list[dict[str, Any]] = []
-    scale_map = prediction_development_iqr_map(predictions)
     observed = predictions.loc[predictions["split"].eq("validation") & predictions["target_observed"]].copy()
     group_columns = ["cohort", "outcome", "origin_month", "candidate", "architecture"]
     for keys, group in observed.groupby(group_columns, sort=True):
@@ -5294,13 +5314,12 @@ def candidate_validation_scores(predictions: Any) -> Any:
     return pd.DataFrame(rows)
 
 
-def add_ensemble_candidates(predictions: Any, cfg: RunConfig) -> tuple[Any, Any]:
-    leaderboard = candidate_validation_scores(predictions)
+def add_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Mapping[tuple[str, str, int], float]) -> tuple[Any, Any]:
+    leaderboard = candidate_validation_scores(predictions, scale_map)
     if leaderboard.empty:
         return predictions, pd.DataFrame()
     ensemble_predictions: list[Any] = []
     weight_rows: list[dict[str, Any]] = []
-    scale_map = prediction_development_iqr_map(predictions)
     group_columns = ["cohort", "outcome", "origin_month"]
     for keys, scores in leaderboard.groupby(group_columns, sort=True):
         scores = scores.sort_values(["validation_standardized_crps", "validation_crps"])
@@ -5410,6 +5429,7 @@ def fit_candidate_roster(
     cfg: RunConfig,
     dependencies: Mapping[str, Any],
     ode_gates: Any,
+    scale_map: Mapping[tuple[str, str, int], float],
     cohorts: Any | None = None,
     measurements: Any | None = None,
 ) -> tuple[Any, Any, dict[str, Any]]:
@@ -5479,7 +5499,7 @@ def fit_candidate_roster(
             started = time.perf_counter()
             try:
                 candidate_predictions = fit_function()
-                predictions.append(candidate_predictions)
+                predictions.append(drop_training_predictions(candidate_predictions))
                 status_rows.append(
                     {
                         **dict(zip(group_columns, keys, strict=False)),
@@ -5505,7 +5525,7 @@ def fit_candidate_roster(
             started = time.perf_counter()
             try:
                 mlp_predictions, details = fit_mlp_candidate(task, cfg)
-                predictions.append(mlp_predictions)
+                predictions.append(drop_training_predictions(mlp_predictions))
                 neural_details["mlp"][task_key] = details
                 status_rows.append(
                     {
@@ -5566,7 +5586,7 @@ def fit_candidate_roster(
         started = time.perf_counter()
         try:
             ode_predictions, details = fit_ode_candidate(task, cohorts, measurements, cfg)
-            predictions.append(ode_predictions)
+            predictions.append(drop_training_predictions(ode_predictions))
             neural_details["ode"][task_key] = details
             for status in status_rows:
                 if status["cohort"] == gate_row.cohort and status["outcome"] == gate_row.outcome and status["candidate"] == "pytorch_ode_rnn":
@@ -5587,7 +5607,7 @@ def fit_candidate_roster(
     # release the list before the ensemble concat so both do not coexist at production scale.
     predictions.clear()
     gc.collect()
-    combined, ensemble_weights = add_ensemble_candidates(combined, cfg)
+    combined, ensemble_weights = add_ensemble_candidates(combined, cfg, scale_map)
     # candidate/architecture are low-cardinality labels repeated across every prediction row;
     # store them as category to avoid duplicated object strings at production scale. This is
     # done after the ensemble step so its new labels are part of the category universe.
@@ -8688,7 +8708,10 @@ def run_embedded_self_tests() -> dict[str, Any]:
                 }
                 row.update({column: prediction for column in QUANTILE_COLUMNS})
                 scale_rows.append(row)
-    standardized_fixture = candidate_validation_scores(pd.DataFrame(scale_rows)).set_index("candidate")
+    scale_fixture = pd.DataFrame(scale_rows)
+    standardized_fixture = candidate_validation_scores(
+        scale_fixture, development_iqr_scale_map(scale_fixture)
+    ).set_index("candidate")
     check(
         "18d_equal_horizon_standardized_selection_score",
         standardized_fixture.loc["candidate_a", "validation_crps"]
@@ -9699,6 +9722,9 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     del prediction_rows
     gc.collect()
     ode_gates = ode_suitability_gates(cohorts, cohort_artifacts["measurements"], dependencies)
+    # Development IQR scale, sourced from the prediction-row table so the model roster and
+    # leaderboard no longer depend on train-split predictions (which are dropped from storage).
+    scale_map = development_iqr_scale_map(weighted_rows)
     print("[metabolic] fitting matched candidate roster", flush=True)
     model_payload, model_hash = load_or_run_stage(
         context,
@@ -9711,6 +9737,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
                     cfg,
                     dependencies,
                     ode_gates,
+                    scale_map,
                     cohorts=cohorts,
                     measurements=cohort_artifacts["measurements"],
                 ),
@@ -9731,7 +9758,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     del weighted_rows
     weight_payload["rows"] = None
     gc.collect()
-    leaderboard = candidate_validation_scores(predictions)
+    leaderboard = candidate_validation_scores(predictions, scale_map)
     selected = select_models(leaderboard)
     calibrated, calibration = conformal_calibrate(predictions)
     # conformal_calibrate mutates predictions in place, so the uncalibrated frame and its
