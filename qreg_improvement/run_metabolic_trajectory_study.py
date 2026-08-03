@@ -32,8 +32,10 @@ import pickle
 import platform
 import random
 import re
+import shutil
 import statistics
 import struct
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -173,7 +175,27 @@ OPTIONAL_PACKAGES = {
     "catboost": "catboost",
     "torch": "torch",
     "pyodbc": "pyodbc",
+    "pyarrow": "pyarrow",
 }
+
+# pyarrow powers the disk-backed prediction spill used by the modeling stage (Part B). It is an
+# OPTIONAL accelerator: when it is absent the spill transparently falls back to the historical
+# in-memory pd.concat, which is numerically identical but keeps the transient 2x memory spike.
+# Detect it once at import time so the modeling stage and the dependency manifest agree, and its
+# absence never fails a run on a VM that lacks the wheel.
+try:
+    import pyarrow  # noqa: F401
+    import pyarrow.dataset as _pa_dataset
+    _PYARROW_AVAILABLE = True
+except Exception:
+    _pa_dataset = None
+    _PYARROW_AVAILABLE = False
+
+# Escape hatch: force the in-memory fallback even when pyarrow is importable, so the fallback
+# path stays exercisable in tests and can be disabled on the VM without uninstalling pyarrow.
+_PARQUET_SPILL_ENABLED = _PYARROW_AVAILABLE and os.environ.get(
+    "METABOLIC_DISABLE_PARQUET_SPILL", ""
+).strip().lower() not in {"1", "true", "yes"}
 
 
 @dataclass(frozen=True)
@@ -514,6 +536,10 @@ def dependency_manifest(require_database: bool) -> tuple[dict[str, Any], list[st
         manifest[f"{distribution}_importable"] = importlib.util.find_spec(module) is not None
     if require_database and not manifest.get("pyodbc_importable"):
         issues.append("Production and preflight modes require pyodbc and a SQL Server ODBC driver")
+    # Record whether the modeling-stage parquet prediction spill is actually active (pyarrow
+    # present and not disabled via env). Purely informational: the fallback is numerically
+    # identical, so this never contributes an issue.
+    manifest["parquet_spill_enabled"] = _PARQUET_SPILL_ENABLED
     return manifest, issues
 
 
@@ -5378,10 +5404,14 @@ def candidate_validation_scores(predictions: Any, scale_map: Mapping[tuple[str, 
     return pd.DataFrame(rows)
 
 
-def add_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Mapping[tuple[str, str, int], float]) -> tuple[Any, Any]:
+def compute_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Mapping[tuple[str, str, int], float]) -> tuple[list[Any], Any]:
+    # Return the list of ensemble prediction frames WITHOUT concatenating them onto `predictions`;
+    # the caller appends them through the prediction spill so the combined frame is never doubled.
+    # An empty leaderboard means no ensemble is formed, so return an empty list (not `predictions`)
+    # to keep the caller's `if ensemble_frames:` a plain list truth-test.
     leaderboard = candidate_validation_scores(predictions, scale_map)
     if leaderboard.empty:
-        return predictions, pd.DataFrame()
+        return [], pd.DataFrame()
     ensemble_predictions: list[Any] = []
     weight_rows: list[dict[str, Any]] = []
     group_columns = ["cohort", "outcome", "origin_month"]
@@ -5483,9 +5513,67 @@ def add_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Mapping
                     "validation_standardized_crps": best_score,
                 }
             )
-    if ensemble_predictions:
-        predictions = pd.concat([predictions, *ensemble_predictions], ignore_index=True)
-    return predictions, pd.DataFrame(weight_rows)
+    return ensemble_predictions, pd.DataFrame(weight_rows)
+
+
+class PredictionSpill:
+    """Assemble the combined prediction frame without ever holding the per-candidate list and the
+    concatenated result in memory at the same time.
+
+    With pyarrow each added frame is written to its own numbered parquet file and then freed;
+    combine() reads every file back as one Arrow table in add-order and converts it with
+    self_destruct=True (Arrow buffers are released as the pandas frame is built), so the peak is
+    ~1x the combined frame instead of the ~2x that pd.concat holds transiently. Without pyarrow it
+    falls back to the historical in-memory list + pd.concat: numerically identical, and it frees
+    the per-candidate list as soon as the concat is built so it never regresses below the old
+    code's memory profile. The zero-padded filenames make add-order == read-order, which is what
+    keeps the result byte-for-byte identical to pd.concat(pieces, ignore_index=True).
+    """
+
+    def __init__(self) -> None:
+        self._parquet = _PARQUET_SPILL_ENABLED
+        self._dir = (
+            Path(tempfile.mkdtemp(prefix="metabolic-predspill-", dir=RUNTIME_CACHE))
+            if self._parquet
+            else None
+        )
+        self._paths: list[str] = []
+        self._frames: list[Any] = []
+        self.count = 0
+
+    def add(self, frame: Any) -> None:
+        # Mirror pd.concat semantics exactly: record EVERY piece, including empty frames, in the
+        # order added. count drives the zero-padded filename so lexical order == add order.
+        if self._parquet:
+            path = self._dir / f"{self.count:08d}.parquet"
+            frame.to_parquet(path, engine="pyarrow", index=False)
+            self._paths.append(str(path))
+        else:
+            self._frames.append(frame)
+        self.count += 1
+
+    def combine(self) -> Any:
+        if self._parquet:
+            if not self._paths:
+                return pd.DataFrame()
+            # dataset(paths).to_table() reads the listed files in order and builds a single table.
+            # Deliberately NOT pa.concat_tables([read_table(p) ...]), which would double Arrow
+            # memory. The parquet files stay on disk, so combine() may be called again after more
+            # pieces are spilled (the ensemble append rebuilds from candidates + ensembles).
+            table = _pa_dataset.dataset(self._paths, format="parquet").to_table()
+            return table.to_pandas(self_destruct=True, split_blocks=True)
+        if not self._frames:
+            return pd.DataFrame()
+        combined = pd.concat(self._frames, ignore_index=True)
+        # Release the per-candidate frames now that they live inside `combined`; the fallback
+        # never re-reads them, and this mirrors the old code's predictions.clear() so the
+        # pyarrow-absent path keeps at most one extra copy live, exactly as before.
+        self._frames = []
+        return combined
+
+    def close(self) -> None:
+        if self._dir is not None:
+            shutil.rmtree(self._dir, ignore_errors=True)
 
 
 def fit_candidate_roster(
@@ -5497,7 +5585,7 @@ def fit_candidate_roster(
     cohorts: Any | None = None,
     measurements: Any | None = None,
 ) -> tuple[Any, Any, dict[str, Any]]:
-    predictions: list[Any] = []
+    spill = PredictionSpill()
     status_rows: list[dict[str, Any]] = []
     neural_details: dict[str, Any] = {"mlp": {}, "ode": {}}
     group_columns = ["cohort", "outcome", "origin_month"]
@@ -5563,7 +5651,7 @@ def fit_candidate_roster(
             started = time.perf_counter()
             try:
                 candidate_predictions = fit_function()
-                predictions.append(drop_training_predictions(candidate_predictions))
+                spill.add(drop_training_predictions(candidate_predictions))
                 status_rows.append(
                     {
                         **dict(zip(group_columns, keys, strict=False)),
@@ -5589,7 +5677,7 @@ def fit_candidate_roster(
             started = time.perf_counter()
             try:
                 mlp_predictions, details = fit_mlp_candidate(task, cfg)
-                predictions.append(drop_training_predictions(mlp_predictions))
+                spill.add(drop_training_predictions(mlp_predictions))
                 neural_details["mlp"][task_key] = details
                 status_rows.append(
                     {
@@ -5650,7 +5738,7 @@ def fit_candidate_roster(
         started = time.perf_counter()
         try:
             ode_predictions, details = fit_ode_candidate(task, cohorts, measurements, cfg)
-            predictions.append(drop_training_predictions(ode_predictions))
+            spill.add(drop_training_predictions(ode_predictions))
             neural_details["ode"][task_key] = details
             for status in status_rows:
                 if status["cohort"] == gate_row.cohort and status["outcome"] == gate_row.outcome and status["candidate"] == "pytorch_ode_rnn":
@@ -5664,14 +5752,27 @@ def fit_candidate_roster(
                     status["status"] = "failed"
                     status["reason"] = f"{type(exc).__name__}: {exc}"
                     status["training_seconds"] = time.perf_counter() - started
-    if not predictions:
+    if spill.count == 0:
         raise RuntimeError("Every model candidate failed")
-    combined = pd.concat(predictions, ignore_index=True)
-    # The per-candidate prediction frames are collectively the largest object in the run;
-    # release the list before the ensemble concat so both do not coexist at production scale.
-    predictions.clear()
+    # Assemble the per-candidate pieces into one frame (~1x via the parquet spill; a single
+    # pd.concat in the fallback). These candidate frames are the largest object in the run.
+    combined = spill.combine()
     gc.collect()
-    combined, ensemble_weights = add_ensemble_candidates(combined, cfg, scale_map)
+    ensemble_frames, ensemble_weights = compute_ensemble_candidates(combined, cfg, scale_map)
+    if ensemble_frames:
+        if _PARQUET_SPILL_ENABLED:
+            # Spill the ensemble pieces next to the candidate pieces already on disk, drop the
+            # interim combined frame (an explicit del so the reference is actually released), then
+            # rebuild once from disk. The combined frame is never held in two copies.
+            for frame in ensemble_frames:
+                spill.add(frame)
+            del ensemble_frames, combined
+            gc.collect()
+            combined = spill.combine()
+        else:
+            # Fallback: reproduce the old pd.concat exactly (2x transient, needs no pyarrow).
+            combined = pd.concat([combined, *ensemble_frames], ignore_index=True)
+    spill.close()
     # candidate/architecture are low-cardinality labels repeated across every prediction row;
     # store them as category to avoid duplicated object strings at production scale. This is
     # done after the ensemble step so its new labels are part of the category universe.
