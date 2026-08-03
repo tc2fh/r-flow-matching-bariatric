@@ -25,7 +25,6 @@ import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
-import io
 import json
 import math
 import os
@@ -458,9 +457,22 @@ def atomic_json(path: Path, payload: Any) -> None:
 
 
 def atomic_pickle(path: Path, payload: Any) -> None:
-    stream = io.BytesIO()
-    pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
-    atomic_bytes(path, stream.getvalue())
+    # Stream the pickle straight into the temporary file instead of serializing into an
+    # in-memory BytesIO and copying it again with getvalue(). For the large prediction-frame
+    # checkpoints those two byte-buffers each transiently duplicated the entire frame; writing
+    # through a file descriptor keeps peak memory at roughly the live object alone. The atomic
+    # replace (mkstemp + fsync + bounded Windows/NAS retry) matches atomic_bytes exactly.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            pickle.dump(payload, stream, protocol=pickle.HIGHEST_PROTOCOL)
+            stream.flush()
+            os.fsync(stream.fileno())
+        replace_file(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def read_json(path: Path, default: Any = None) -> Any:
