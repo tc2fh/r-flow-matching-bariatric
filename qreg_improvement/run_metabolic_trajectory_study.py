@@ -9782,6 +9782,54 @@ def load_or_run_stage(
     return value, artifact_hash
 
 
+def load_run_context(cfg: RunConfig) -> RunContext:
+    """Reconstruct a RunContext for a mid-run worker subprocess from run_manifest.json alone.
+
+    The acquire stage already persisted the run fingerprint and payload; a downstream worker does
+    not have (and must not rebuild) the raw data bundle, so it reads them back here. This attaches
+    to the existing run directory - it only ensures the four run subdirectories exist and reloads
+    run_state.json - and deliberately does NOT call context.initialize(), whose "exports already
+    exist" guard and manifest rewrite are for the run's first, bundle-holding process only.
+    """
+    run_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else timestamped_default_output_dir()
+    manifest = read_json(run_dir / "run_manifest.json", {}) or {}
+    if not manifest.get("fingerprint"):
+        raise RuntimeError(f"No verified run_manifest.json in {run_dir}; the acquire_cohorts stage must run first")
+    context = RunContext(cfg, run_dir, manifest["fingerprint"], manifest.get("fingerprint_payload", {}))
+    for directory in (context.run_dir, context.internal, context.checkpoints, context.aggregate, context.export):
+        directory.mkdir(parents=True, exist_ok=True)
+    context.state = read_json(run_dir / "run_state.json", {}) or {
+        "status": "running", "stages": {}, "errors": [], "resumed_stages": []
+    }
+    return context
+
+
+def require_checkpoint(context: RunContext, stage: str) -> Any:
+    """Load a completed checkpoint UNCONDITIONALLY (unlike load_checkpoint, which returns None
+    unless resume/plot-only). Validates the same invariants load_checkpoint does - completion
+    marker, stage fingerprint (against the upstream recorded at save time), artifact sha256, and
+    payload manifest - and raises a clear, stage-named error if the checkpoint is missing, stale,
+    or corrupt so an orchestrated run fails loudly at the exact broken dependency.
+    """
+    meta_path = context.checkpoints / f"{stage}.json"
+    body_path = context.checkpoints / f"{stage}.pkl"
+    metadata = read_json(meta_path, {}) or {}
+    if metadata.get("completion_marker") != "COMPLETE":
+        raise RuntimeError(f"Required checkpoint '{stage}' is missing or incomplete ({meta_path})")
+    if not body_path.exists():
+        raise RuntimeError(f"Required checkpoint '{stage}' body is missing ({body_path})")
+    upstream = metadata.get("upstream", {})
+    if metadata.get("stage_fingerprint") != context.stage_fingerprint(stage, upstream):
+        raise RuntimeError(f"Required checkpoint '{stage}' has a stale stage fingerprint")
+    if sha256_file(body_path) != metadata.get("artifact_sha256"):
+        raise RuntimeError(f"Required checkpoint '{stage}' failed its artifact hash check (corrupt)")
+    with body_path.open("rb") as stream:
+        payload = pickle.load(stream)
+    if payload_manifest(payload) != metadata.get("payload_manifest"):
+        raise RuntimeError(f"Required checkpoint '{stage}' payload manifest does not match its completion record")
+    return payload
+
+
 def use_real_smoke_source(dependencies: Mapping[str, Any]) -> bool:
     forced_synthetic = os.environ.get("METABOLIC_FORCE_SYNTHETIC_SMOKE", "").strip().lower() in {"1", "true", "yes"}
     return bool(dependencies.get("pyodbc_importable")) and not forced_synthetic
@@ -10009,6 +10057,274 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     return context.run_dir
 
 
+STAGE_SEQUENCE = (
+    "acquire_cohorts",
+    "global_splits",
+    "prediction_rows",
+    "weights",
+    "models_and_predictions",
+    "calibration",
+    "evaluation",
+    "figure_data",
+)
+
+
+def bundle_for_light_checkpoint(bundle: DataBundle) -> DataBundle:
+    """A minimal copy of the data bundle for the stages that run after cohort construction. Only
+    medications (gap-rule sensitivity) and metadata (figure identity + source-claim limits) are
+    read downstream, so every large event frame is replaced by an empty same-schema frame. This is
+    what lets the evaluation and figure workers run without ever reloading the raw bundle."""
+    empty = lambda frame: frame.iloc[0:0].copy()
+    return DataBundle(
+        patients=empty(bundle.patients),
+        procedures=empty(bundle.procedures),
+        medications=bundle.medications,
+        measurements=empty(bundle.measurements),
+        encounters=empty(bundle.encounters),
+        diagnoses=empty(bundle.diagnoses),
+        metadata=bundle.metadata,
+    )
+
+
+def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str) -> None:
+    """Execute exactly one pipeline stage in its own process and persist its checkpoint(s).
+
+    Each stage loads only the direct upstream checkpoints it needs, recomputes the cheap inline
+    intermediates (ode gates), and saves its outputs, so total peak RSS is bounded by the single
+    worst stage rather than accumulating across the run - and every stage's memory is returned to
+    the OS on process exit, the behavior Windows does not provide within one long-lived process.
+    The stage bodies mirror run_study exactly; determinism holds because every stochastic step
+    reseeds from cfg.seed (or a task-local generator) rather than the shared global RNG stream.
+    """
+    # Fault-injection hook (inert unless the env var names this stage): lets a test confirm the
+    # driver reports the failing stage and writes a preflight_failure, without editing the pipeline.
+    if os.environ.get("METABOLIC_FAIL_STAGE", "").strip() == stage:
+        raise RuntimeError(f"Injected failure at stage '{stage}' via METABOLIC_FAIL_STAGE")
+    set_deterministic_seed(cfg.seed, include_torch=bool(dependencies.get("torch_importable")))
+
+    if stage == "acquire_cohorts":
+        if cfg.smoke and not use_real_smoke_source(dependencies):
+            bundle = synthetic_data_bundle(cfg)
+            print("[metabolic] smoke source: deterministic raw-event fixture", flush=True)
+        else:
+            bundle = query_cosmos(cfg, preflight_only=False)
+            print("[metabolic] source: bounded Cosmos query" if cfg.smoke else "[metabolic] source: Cosmos production query", flush=True)
+        context = make_run_context(cfg, bundle, dependencies)
+        timing_label = bundle.metadata.get("measurement_timing", "exact-day")
+        print(f"[metabolic] constructing cohorts and outcomes ({timing_label})", flush=True)
+        context.save_checkpoint("cohorts", construct_cohorts(bundle))
+        # Cohort construction has consumed the raw patient/procedure/measurement frames; keep only
+        # medications + metadata for the downstream stages, mirroring run_study's in-process release.
+        bundle.patients = bundle.patients.iloc[0:0].copy()
+        bundle.procedures = bundle.procedures.iloc[0:0].copy()
+        bundle.measurements = bundle.measurements.iloc[0:0].copy()
+        context.save_checkpoint("bundle_light", bundle_for_light_checkpoint(bundle))
+        log_peak_rss("worker acquire_cohorts")
+        return
+
+    context = load_run_context(cfg)
+
+    if stage == "global_splits":
+        cohort_artifacts = require_checkpoint(context, "cohorts")
+        cohort_hash = checkpoint_hash(context, "cohorts")
+        payload = dict(zip(("cohorts", "metadata"), assign_global_splits(cohort_artifacts["cohorts"]), strict=True))
+        context.save_checkpoint("global_splits", payload, {"cohorts": cohort_hash})
+
+    elif stage == "prediction_rows":
+        cohort_artifacts = require_checkpoint(context, "cohorts")
+        cohort_hash = checkpoint_hash(context, "cohorts")
+        split_payload = require_checkpoint(context, "global_splits")
+        split_hash = checkpoint_hash(context, "global_splits")
+        cohorts = split_payload["cohorts"]
+        split_metadata = split_payload["metadata"]
+        rows = build_prediction_rows(cohorts, cohort_artifacts["measurements"])
+        row_hash = context.save_checkpoint("prediction_rows", rows, {"cohorts": cohort_hash, "splits": split_hash})
+        # The leakage audit is a guard that must pass before weighting/modeling. Persist its small
+        # result so the figure stage never reloads the full prediction-row table just to read it.
+        try:
+            leakage = leakage_audit(rows, split_metadata)
+        except LeakageError as exc:
+            render_preflight_failure(cfg, "Leakage invariant failed", [str(exc)], ["Model fitting was not started."])
+            raise
+        context.save_checkpoint("leakage", leakage, {"prediction_rows": row_hash})
+
+    elif stage == "weights":
+        rows = require_checkpoint(context, "prediction_rows")
+        row_hash = checkpoint_hash(context, "prediction_rows")
+        weight_payload = dict(zip(("rows", "diagnostics"), estimate_cross_fitted_weights(rows, cfg.seed), strict=True))
+        weight_hash = context.save_checkpoint("weights", weight_payload, {"prediction_rows": row_hash})
+        del rows
+        gc.collect()
+        weighted_rows = weight_payload["rows"]
+        # Small reductions of weighted_rows that downstream stages need; persisting them here is
+        # what lets calibration/evaluation/figure avoid ever reloading the weighted-row table.
+        derived = {
+            "scale_map": development_iqr_scale_map(weighted_rows),
+            "development_iqr": development_iqr_by_task(weighted_rows),
+            "support": target_support_table(weighted_rows),
+            "diagnostics": weight_payload["diagnostics"],
+        }
+        context.save_checkpoint("weights_derived", derived, {"weights": weight_hash})
+
+    elif stage == "models_and_predictions":
+        weight_payload = require_checkpoint(context, "weights")
+        weight_hash = checkpoint_hash(context, "weights")
+        weighted_rows = weight_payload["rows"]
+        derived = require_checkpoint(context, "weights_derived")
+        scale_map = derived["scale_map"]
+        cohort_artifacts = require_checkpoint(context, "cohorts")
+        split_payload = require_checkpoint(context, "global_splits")
+        cohorts = split_payload["cohorts"]
+        measurements = cohort_artifacts["measurements"]
+        ode_gates = ode_suitability_gates(cohorts, measurements, dependencies)
+        print("[metabolic] fitting matched candidate roster", flush=True)
+        payload = dict(
+            zip(
+                ("predictions", "status", "details"),
+                fit_candidate_roster(
+                    weighted_rows, cfg, dependencies, ode_gates, scale_map, cohorts=cohorts, measurements=measurements
+                ),
+                strict=True,
+            )
+        )
+        context.save_checkpoint("models_and_predictions", payload, {"weights": weight_hash})
+
+    elif stage == "calibration":
+        model_payload = require_checkpoint(context, "models_and_predictions")
+        model_hash = checkpoint_hash(context, "models_and_predictions")
+        derived = require_checkpoint(context, "weights_derived")
+        scale_map = derived["scale_map"]
+        predictions = model_payload["predictions"]
+        leaderboard = candidate_validation_scores(predictions, scale_map)
+        selected = select_models(leaderboard)
+        calibrated, calibration = conformal_calibrate(predictions)
+        payload = {
+            "calibrated": calibrated,
+            "calibration": calibration,
+            "leaderboard": leaderboard,
+            "selected": selected,
+            "model_status": model_payload["status"],
+            "model_details": model_payload["details"],
+        }
+        context.save_checkpoint("calibration", payload, {"models": model_hash})
+
+    elif stage == "evaluation":
+        calibration_payload = require_checkpoint(context, "calibration")
+        calibration_hash = checkpoint_hash(context, "calibration")
+        derived = require_checkpoint(context, "weights_derived")
+        bundle = require_checkpoint(context, "bundle_light")
+        calibrated = calibration_payload["calibrated"]
+        selected = calibration_payload["selected"]
+        weight_diagnostics = derived["diagnostics"]
+        development_iqr = derived["development_iqr"]
+        print("[metabolic] evaluating protected tests and uncertainty", flush=True)
+        metrics, pit_values = evaluate_predictions(calibrated, weight_diagnostics)
+        bootstrap_ci, comparisons = bootstrap_uncertainty(calibrated, selected, cfg)
+        gates = apply_success_gates(metrics, selected, development_iqr, comparisons)
+        gates = apply_source_claim_limit(gates, bundle.metadata)
+        gates = apply_smoke_claim_limit(gates, cfg)
+        sensitivity = weight_sensitivity_table(calibrated, selected)
+        gap_sensitivity = gap_rule_sensitivity(bundle)
+        examples, joint_scores = build_synthetic_trajectory_examples(calibrated, selected, cfg)
+        payload = {
+            "metrics": metrics,
+            "pit_values": pit_values,
+            "iqr": development_iqr,
+            "gates": gates,
+            "bootstrap_ci": bootstrap_ci,
+            "comparisons": comparisons,
+            "sensitivity": sensitivity,
+            "gap_sensitivity": gap_sensitivity,
+            "examples": examples,
+            "joint_scores": joint_scores,
+        }
+        context.save_checkpoint("evaluation", payload, {"calibration": calibration_hash})
+
+    elif stage == "figure_data":
+        cohort_artifacts = require_checkpoint(context, "cohorts")
+        split_payload = require_checkpoint(context, "global_splits")
+        leakage = require_checkpoint(context, "leakage")
+        derived = require_checkpoint(context, "weights_derived")
+        calibration_payload = require_checkpoint(context, "calibration")
+        evaluation = require_checkpoint(context, "evaluation")
+        evaluation_hash = checkpoint_hash(context, "evaluation")
+        bundle = require_checkpoint(context, "bundle_light")
+        cohorts = split_payload["cohorts"]
+        split_metadata = split_payload["metadata"]
+        ode_gates = ode_suitability_gates(cohorts, cohort_artifacts["measurements"], dependencies)
+        figure_payload = build_figure_data(
+            context=context,
+            dependencies=dependencies,
+            bundle=bundle,
+            cohort_artifacts=cohort_artifacts,
+            cohorts=cohorts,
+            split_metadata=split_metadata,
+            leakage=leakage,
+            support=derived["support"],
+            weight_diagnostics=derived["diagnostics"],
+            predictions=calibration_payload["calibrated"],
+            model_status=calibration_payload["model_status"],
+            neural_details=calibration_payload["model_details"],
+            leaderboard=calibration_payload["leaderboard"],
+            selected=calibration_payload["selected"],
+            calibration=calibration_payload["calibration"],
+            metrics=evaluation["metrics"],
+            iqr=evaluation["iqr"],
+            pit_values=evaluation["pit_values"],
+            bootstrap_ci=evaluation["bootstrap_ci"],
+            comparisons=evaluation["comparisons"],
+            gates=evaluation["gates"],
+            ode_gates=ode_gates,
+            sensitivity=evaluation["sensitivity"],
+            gap_sensitivity=evaluation["gap_sensitivity"],
+            examples=evaluation["examples"],
+            joint_scores=evaluation["joint_scores"],
+        )
+        context.save_checkpoint("figure_data", figure_payload, {"evaluation": evaluation_hash})
+
+    else:
+        raise RuntimeError(f"Unknown worker stage: {stage}")
+
+    log_peak_rss(f"worker {stage}")
+
+
+def run_study_orchestrated(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
+    """Run the full study as a sequence of single-stage subprocesses, then render from the final
+    checkpoint. The driver never holds a large frame: it spawns one worker per stage (each bounded
+    to its own peak and freed on exit) and only loads the small figure_data payload at the end.
+    Every worker shares one run directory, which the first (acquire_cohorts) stage creates.
+    """
+    run_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else timestamped_default_output_dir()
+    worker_env = os.environ.copy()
+    for stage in STAGE_SEQUENCE:
+        argv = [sys.executable, str(SCRIPT_PATH), "--worker", stage, "--output-dir", str(run_dir)]
+        if cfg.smoke:
+            argv.append("--smoke")
+        print(f"[metabolic] orchestrated stage: {stage}", flush=True)
+        completed = subprocess.run(argv, env=worker_env, check=False)
+        if completed.returncode != 0:
+            # Surface the failing stage as a PreflightError so main renders one clear, stage-named
+            # failure report (its generic handler would otherwise overwrite a report rendered here).
+            # A non-zero exit at a single stage is, at production scale, most often an OOM kill.
+            raise PreflightError(
+                "Orchestrated stage failed",
+                [f"Stage '{stage}' exited with code {completed.returncode}"],
+                [
+                    f"The run stopped at stage '{stage}'. Review that stage's console output inside "
+                    "the secure VM; a non-zero exit here is typically an out-of-memory kill."
+                ],
+            )
+    context = load_run_context(cfg)
+    figure_data = require_checkpoint(context, "figure_data")
+    print(f"[metabolic] rendering {len(PAGE_FILES)}-page disclosure-controlled figure book", flush=True)
+    rendered = render_figure_book(figure_data, context.export)
+    context.state["status"] = "completed"
+    context.state["completed_utc"] = utc_now()
+    context.state["export_files"] = [path.name for path in rendered]
+    atomic_json(context.run_dir / "run_state.json", context.state)
+    return context.run_dir
+
+
 def verified_plot_only(cfg: RunConfig) -> Path:
     if not cfg.output_dir:
         raise PreflightError("Plot-only mode requires a run directory", ["Pass --output-dir PATH for the matching completed run"])
@@ -10081,6 +10397,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=r"Override the default .\results\metabolic_trajectory_YYYYMMDD_HHMMSS run directory",
     )
     parser.add_argument("--resume", action="store_true", help="Resume only verified fingerprint-compatible checkpoints")
+    parser.add_argument("--worker", choices=STAGE_SEQUENCE, default=None, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--orchestrate",
+        action="store_true",
+        help="Force process-per-stage orchestration (the default for production; use it to exercise orchestration under --smoke)",
+    )
+    parser.add_argument(
+        "--single-process",
+        action="store_true",
+        help="Run the whole study in one process, disabling production orchestration",
+    )
     return parser
 
 
@@ -10110,8 +10437,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         failure = render_preflight_failure(cfg, "Runtime dependency preflight failed", dependency_issues)
         print(f"preflight failed: {failure}", file=sys.stderr)
         return 2
+    # Process-per-stage orchestration bounds peak memory to the single worst stage and returns
+    # freed memory to the OS between stages. It is the default for full production runs and opt-in
+    # for smoke (via --orchestrate) so local smoke/self-test stay single-process and fast. A worker
+    # subprocess (args.worker set) is itself a single stage and must never re-orchestrate.
+    single_process_forced = args.single_process or os.environ.get(
+        "METABOLIC_SINGLE_PROCESS", ""
+    ).strip().lower() in {"1", "true", "yes"}
+    orchestrate_run = (
+        not args.worker
+        and mode in {"production", "smoke"}
+        and not single_process_forced
+        and (mode == "production" or args.orchestrate)
+    )
     try:
         load_runtime_packages()
+        if args.worker:
+            run_stage_worker(cfg, dependencies, args.worker)
+            return 0
         if mode == "self-test":
             report = run_embedded_self_tests()
             for item in report["tests"]:
@@ -10122,6 +10465,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             run_dir = verified_plot_only(cfg)
         elif mode == "schema-discovery":
             run_dir = run_schema_discovery(cfg, dependencies)
+        elif orchestrate_run:
+            run_dir = run_study_orchestrated(cfg, dependencies)
         else:
             run_dir = run_study(cfg, dependencies)
         print(f"[metabolic] completed: {run_dir}")
