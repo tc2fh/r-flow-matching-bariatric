@@ -14,6 +14,23 @@ index row per patient and source, and keeps the resulting wide-source claims lab
 exploratory where exact event timing is unavailable.
 Human-facing output is restricted to numbered PNG pages and one matching PDF in
 ``FIGURES_TO_EXPORT``. Restart artifacts live in the timestamped run directory.
+
+``--incretin-qualifying-months {6,12}`` sets how many completed months of recorded
+treatment a patient must have to enter the incretin arm; it defaults to 12. This is a
+change of estimand rather than a filter, because entry is conditioned on persistence
+that occurs after the index date - see the flag's help text and page 18.
+
+Memory: neither of the two study-scale tables is ever held as one frame. Each pipeline
+stage runs in its own process, and both the prediction-row table (from construction
+onward, a RowStore) and the prediction table (from model fitting onward, a
+PredictionStore) live on disk partitioned by (cohort, outcome, origin_month), so every
+stage's peak is bounded by its largest single task rather than by the size of the study.
+Weight estimation, the leakage audit, the development-IQR reductions, the support table,
+model fitting, calibration, evaluation and figure assembly all stream one task at a time.
+Frames that scaled with source events rather than patients - the measurement-quality and
+medication audits - are run-length encoded at construction, and the raw medication table
+is released once the gap-rule sensitivity has been computed. Each stage prints its peak
+RSS, which is the first thing to read if a production run is pressed for memory.
 """
 from __future__ import annotations
 
@@ -43,7 +60,7 @@ import time
 import traceback
 import warnings
 import zlib
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -114,7 +131,22 @@ PLAUSIBLE_RANGES = {"bmi": (10.0, 100.0), "hba1c": (3.0, 20.0)}
 PRIMARY_GAP_DAYS = 30
 GAP_SENSITIVITIES = (0, 30, 60)
 MIN_PDC = 0.80
+# Continuous-coverage window that defines a completed treatment episode. QUALIFYING_DAYS is the
+# surgical arm's prior-exposure definition: a preoperative episode of this length makes a patient
+# "previously treated" and excludes them. It is deliberately separate from the incretin arm's
+# cohort-entry window below, so lengthening one never silently redefines the other.
 QUALIFYING_DAYS = 183
+# Completed months of recorded incretin treatment required for entry into the incretin arm.
+# 6 reproduces the historical rule exactly (6 x 30.4375 = 182.625 -> 183 days); 12 requires a
+# full year of continuous covered treatment. Both are exposed through
+# --incretin-qualifying-months because the choice changes the estimand, not just the sample size:
+# a longer window conditions cohort entry on treatment persistence that occurs AFTER the index
+# date, so the arm becomes "patients who went on to persist that long" and the landmark origins
+# at months 0, 3 and 6 carry immortal time. The surgical arm has no matching persistence
+# requirement, so the between-arm contrast is correspondingly less like-for-like. Page 16 and the
+# gates page carry this limitation in the released figure book.
+INCRETIN_QUALIFYING_MONTHS = 12
+INCRETIN_QUALIFYING_MONTH_CHOICES = (6, 12)
 STOCKPILE_CAP_DAYS = 90
 WEIGHT_TRUNCATION = (0.01, 0.99)
 ALTERNATE_WEIGHT_TRUNCATION = ((0.005, 0.995), (0.0, 1.0))
@@ -178,11 +210,12 @@ OPTIONAL_PACKAGES = {
     "pyarrow": "pyarrow",
 }
 
-# pyarrow powers the disk-backed prediction spill used by the modeling stage (Part B). It is an
-# OPTIONAL accelerator: when it is absent the spill transparently falls back to the historical
-# in-memory pd.concat, which is numerically identical but keeps the transient 2x memory spike.
-# Detect it once at import time so the modeling stage and the dependency manifest agree, and its
-# absence never fails a run on a VM that lacks the wheel.
+# pyarrow chooses the on-disk format of the task-partitioned PredictionStore. It is an OPTIONAL
+# accelerator, not a requirement: with it, partitions are parquet and a reader can project just
+# the columns it needs; without it, partitions are pickled instead. Either way the store streams
+# one task at a time, so a VM lacking the wheel gets the same memory profile, only a larger
+# footprint on disk and full-width reads. Detected once at import so the modeling stage and the
+# dependency manifest agree.
 try:
     import pyarrow  # noqa: F401
     import pyarrow.dataset as _pa_dataset
@@ -191,8 +224,8 @@ except Exception:
     _pa_dataset = None
     _PYARROW_AVAILABLE = False
 
-# Escape hatch: force the in-memory fallback even when pyarrow is importable, so the fallback
-# path stays exercisable in tests and can be disabled on the VM without uninstalling pyarrow.
+# Escape hatch: force the pickle format even when pyarrow is importable, so that path stays
+# exercisable in tests and can be selected on the VM without uninstalling pyarrow.
 _PARQUET_SPILL_ENABLED = _PYARROW_AVAILABLE and os.environ.get(
     "METABOLIC_DISABLE_PARQUET_SPILL", ""
 ).strip().lower() not in {"1", "true", "yes"}
@@ -215,6 +248,7 @@ class RunConfig:
     trajectory_draws: int = 200
     max_ode_step: float = 1.0 / 12.0
     min_cell_size: int = MIN_CELL_SIZE
+    incretin_qualifying_months: int = INCRETIN_QUALIFYING_MONTHS
 
     @property
     def smoke(self) -> bool:
@@ -229,9 +263,14 @@ class RunConfig:
         *,
         now: datetime | None = None,
         cwd: Path | None = None,
+        incretin_qualifying_months: int = INCRETIN_QUALIFYING_MONTHS,
     ) -> "RunConfig":
         if resume and output_dir is None:
             raise ValueError("--resume requires --output-dir PATH for the existing run")
+        if int(incretin_qualifying_months) not in INCRETIN_QUALIFYING_MONTH_CHOICES:
+            raise ValueError(
+                f"incretin_qualifying_months must be one of {INCRETIN_QUALIFYING_MONTH_CHOICES}"
+            )
         resolved_output_dir = output_dir
         if resolved_output_dir is None and mode != "plot-only":
             resolved_output_dir = str(
@@ -249,8 +288,14 @@ class RunConfig:
                 mlp_epochs=18,
                 final_neural_seeds=1,
                 trajectory_draws=200,
+                incretin_qualifying_months=int(incretin_qualifying_months),
             )
-        return cls(mode=mode, output_dir=resolved_output_dir, resume=resume)
+        return cls(
+            mode=mode,
+            output_dir=resolved_output_dir,
+            resume=resume,
+            incretin_qualifying_months=int(incretin_qualifying_months),
+        )
 
 
 @dataclass(frozen=True)
@@ -280,11 +325,14 @@ class CoverageEpisode:
     supported_end_day: int
     censor_day: int
     maximum_gap_days: int
-    pdc_183: float
-    qualifies_183: bool
+    pdc_qualifying: float
+    qualifies_window: bool
     ingredients: tuple[str, ...]
     switch_days: tuple[int, ...]
     gap_rule_days: int
+    # Length of the continuous-coverage window pdc_qualifying and qualifies_window were measured
+    # over, carried on the episode so a reader never has to guess which rule produced it.
+    qualifying_days: int = QUALIFYING_DAYS
 
 
 @dataclass(frozen=True)
@@ -358,10 +406,22 @@ def process_peak_rss_bytes() -> int | None:
                 ("PeakPagefileUsage", ctypes.c_size_t),
             ]
 
+        # restype/argtypes are required, not cosmetic. Left untyped, ctypes assumes a C int
+        # return, so GetCurrentProcess's (HANDLE)-1 pseudo-handle is truncated to the Python int
+        # -1 and passed as 32 bits; GetProcessMemoryInfo then returns 0 and this whole function
+        # silently reports "unavailable" on every 64-bit Windows host - which is precisely the
+        # production VM this logging exists for.
+        kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentProcess.argtypes = []
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(_PROCESS_MEMORY_COUNTERS), wintypes.DWORD
+        ]
         counters = _PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(counters)
-        handle = ctypes.windll.kernel32.GetCurrentProcess()
-        if ctypes.windll.psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        if psapi.GetProcessMemoryInfo(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
             return int(counters.PeakWorkingSetSize)
     except Exception:
         pass
@@ -536,9 +596,9 @@ def dependency_manifest(require_database: bool) -> tuple[dict[str, Any], list[st
         manifest[f"{distribution}_importable"] = importlib.util.find_spec(module) is not None
     if require_database and not manifest.get("pyodbc_importable"):
         issues.append("Production and preflight modes require pyodbc and a SQL Server ODBC driver")
-    # Record whether the modeling-stage parquet prediction spill is actually active (pyarrow
-    # present and not disabled via env). Purely informational: the fallback is numerically
-    # identical, so this never contributes an issue.
+    # Record whether the prediction store is writing parquet (pyarrow present and not disabled
+    # via env) rather than pickle. Purely informational: both formats hold the same rows and
+    # stream the same way, so this never contributes an issue.
     manifest["parquet_spill_enabled"] = _PARQUET_SPILL_ENABLED
     return manifest, issues
 
@@ -948,15 +1008,39 @@ def maximum_uncovered_gap(intervals: Sequence[tuple[int, int]], start: int, end:
     return maximum
 
 
-def make_coverage_episode(records: Sequence[CoverageRecord], gap_rule_days: int) -> CoverageEpisode:
+def qualifying_days_for_months(months: int) -> int:
+    """Completed treatment months expressed in days on the study's month length.
+
+    6 -> 183 and 12 -> 365, so selecting six months reproduces the historical rule exactly.
+    """
+    return int(round(int(months) * DAYS_PER_MONTH))
+
+
+_MONTH_WORDS = {6: "six", 12: "twelve"}
+
+
+def month_word(months: int) -> str:
+    """Spell the cohort-entry window the way the figure book and funnel labels read it.
+
+    Spelled out so the released text says "twelve-month continuers" rather than mixing digits
+    into prose, and so choosing six months regenerates the historical strings byte for byte.
+    """
+    return _MONTH_WORDS.get(int(months), str(int(months)))
+
+
+def make_coverage_episode(
+    records: Sequence[CoverageRecord],
+    gap_rule_days: int,
+    qualifying_days: int = QUALIFYING_DAYS,
+) -> CoverageEpisode:
     ordered = sorted(records, key=lambda item: (item.start_day, item.end_day, item.ingredient))
     if not ordered:
         raise ValueError("A coverage episode requires at least one accepted record")
     intervals = merge_supported_intervals(ordered)
     start = intervals[0][0]
     supported_end = intervals[-1][1]
-    qualifying_end = start + QUALIFYING_DAYS - 1
-    pdc = interval_coverage_days(intervals, start, qualifying_end) / float(QUALIFYING_DAYS)
+    qualifying_end = start + qualifying_days - 1
+    pdc = interval_coverage_days(intervals, start, qualifying_end) / float(qualifying_days)
     maximum_gap = maximum_uncovered_gap(intervals, start, qualifying_end)
     qualifies = supported_end >= qualifying_end and maximum_gap <= gap_rule_days and pdc >= MIN_PDC
     switches: list[int] = []
@@ -973,11 +1057,12 @@ def make_coverage_episode(records: Sequence[CoverageRecord], gap_rule_days: int)
         supported_end_day=supported_end,
         censor_day=supported_end + 1,
         maximum_gap_days=maximum_gap,
-        pdc_183=pdc,
-        qualifies_183=qualifies,
+        pdc_qualifying=pdc,
+        qualifies_window=qualifies,
         ingredients=tuple(dict.fromkeys(item.ingredient for item in ordered)),
         switch_days=tuple(switches),
         gap_rule_days=gap_rule_days,
+        qualifying_days=int(qualifying_days),
     )
 
 
@@ -985,6 +1070,7 @@ def reconstruct_coverage_episodes(
     records: Sequence[CoverageRecord],
     gap_rule_days: int = PRIMARY_GAP_DAYS,
     stockpile_cap_days: int = STOCKPILE_CAP_DAYS,
+    qualifying_days: int = QUALIFYING_DAYS,
 ) -> tuple[list[CoverageEpisode], list[CoverageRecord]]:
     if gap_rule_days < 0:
         raise ValueError("Allowable gap cannot be negative")
@@ -1002,13 +1088,13 @@ def reconstruct_coverage_episodes(
         for item in ordered:
             uncovered = 0 if current_supported_end is None else item.start_day - current_supported_end - 1
             if current and uncovered > gap_rule_days:
-                episodes.append(make_coverage_episode(current, gap_rule_days))
+                episodes.append(make_coverage_episode(current, gap_rule_days, qualifying_days))
                 current = []
                 current_supported_end = None
             current.append(item)
             current_supported_end = max(current_supported_end if current_supported_end is not None else item.end_day, item.end_day)
         if current:
-            episodes.append(make_coverage_episode(current, gap_rule_days))
+            episodes.append(make_coverage_episode(current, gap_rule_days, qualifying_days))
     return episodes, rejected
 
 
@@ -1026,11 +1112,16 @@ def classify_surgical_incretin_history(
     postoperative_flag: bool = False,
     timing_unknown: bool = False,
 ) -> dict[str, Any]:
-    episodes, rejected = reconstruct_coverage_episodes(records_relative_to_surgery)
+    # Deliberately QUALIFYING_DAYS, not the incretin arm's cohort-entry window: "previously
+    # treated" for a surgical patient means a completed six-month preoperative episode, and that
+    # definition does not move when the incretin arm's persistence requirement is lengthened.
+    episodes, rejected = reconstruct_coverage_episodes(
+        records_relative_to_surgery, qualifying_days=QUALIFYING_DAYS
+    )
     completed = [
         episode
         for episode in episodes
-        if episode.qualifies_183 and episode.start_day + QUALIFYING_DAYS - 1 <= 0
+        if episode.qualifies_window and episode.start_day + QUALIFYING_DAYS - 1 <= 0
     ]
     preoperative = [episode for episode in episodes if episode.start_day < 0]
     any_preoperative_record = any(item.start_day < 0 for episode in episodes for item in episode.records)
@@ -1128,6 +1219,53 @@ def normalize_observed_bmi(value: float, unit: Any) -> tuple[float | None, str]:
     return normalized, "valid"
 
 
+MEASUREMENT_QUALITY_KEY_COLUMNS = ("kind", "unit", "source_concept", "source_table", "reason", "valid")
+# String columns of the normalized measurement table stored as `category`. Four of them
+# (source_concepts, source_tables, source_cohort, timing_precision) are built by joining a sorted
+# set per row, so each one allocated a fresh Python string for every row of the largest frame in
+# the cohorts checkpoint even though the realized value set is tiny - the join of a handful of
+# source concepts. patient_id, outcome and method repeat by construction. Every consumer of these
+# columns tests them with .eq/.isin/.astype(str) or groups on them with observed=True, all of
+# which behave identically on a categorical.
+MEASUREMENT_CATEGORY_COLUMNS = (
+    "patient_id", "outcome", "method", "source_concepts", "source_tables",
+    "source_cohort", "timing_precision",
+)
+
+
+def compact_measurement_frame(frame: Any) -> Any:
+    present = [column for column in MEASUREMENT_CATEGORY_COLUMNS if column in frame.columns]
+    return frame.astype({column: "category" for column in present}) if present else frame
+
+
+def decoded_dtype(series: Any) -> Any:
+    """The dtype a categorical column's values have outside the category encoding.
+
+    Grouping on a categorical produces a categorical key column, so a reduction keyed on one of
+    the compacted columns above would hand a released table a dtype that depends on how its input
+    happened to be stored. Casting the key back through this restores the dtype the reduction
+    produced before compaction, on any pandas version - the element dtype is whatever pandas
+    inferred for the original column, which is `str` on pandas 3 and `object` before it.
+    """
+    dtype = getattr(series, "dtype", None)
+    return dtype.categories.dtype if isinstance(dtype, pd.CategoricalDtype) else dtype
+
+
+def measurement_quality_counts_frame(counts: Mapping[tuple[Any, ...], int]) -> Any:
+    """Materialize the run-length-encoded measurement-quality audit.
+
+    Columns are always present even when the source extract had no measurement rows, so a
+    downstream groupby cannot raise KeyError on a columnless empty frame. `valid` is forced to
+    bool and `n` to int64 to match the dtypes the per-row frame produced.
+    """
+    frame = pd.DataFrame(
+        list(counts.keys()) or None, columns=list(MEASUREMENT_QUALITY_KEY_COLUMNS)
+    )
+    frame["n"] = pd.Series(list(counts.values()), dtype="int64")
+    frame["valid"] = frame["valid"].astype(bool)
+    return frame
+
+
 def normalize_measurements(raw: Any) -> tuple[Any, Any]:
     """Normalize raw long-form measurements and resolve duplicate patient-days.
 
@@ -1150,7 +1288,15 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
         infer_measurement_kind(concept, kind)
         for concept, kind in zip(frame["source_concept"], declared, strict=False)
     ]
-    quality_rows: list[dict[str, Any]] = []
+    # Run-length encoded rather than one row per raw measurement. The quality artifact carries
+    # exactly six low-cardinality fields and every consumer of it is a groupby-count, so storing
+    # one row per distinct combination loses nothing while removing a frame that was previously
+    # the largest object in the cohorts checkpoint: one row per RAW measurement row (larger than
+    # the normalized table it accompanies) with six object-dtype string columns, carried into
+    # every stage that loaded the checkpoint. The realized key space is bounded by the source
+    # vocabulary (kinds x units x concepts x tables x reasons), so this is a few thousand rows at
+    # any extract size.
+    quality_counts: Counter[tuple[str, str, str, str, str, bool]] = Counter()
     normalized_rows: list[dict[str, Any]] = []
     supporting: dict[tuple[str, Any, str], dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
     source_details: dict[tuple[str, Any, str, str], list[dict[str, Any]]] = defaultdict(list)
@@ -1183,16 +1329,16 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
             reason = "valid" if normalized_value is not None and 0.5 <= normalized_value <= 2.7 else "invalid_height_or_unit"
             if reason != "valid":
                 normalized_value = None
-        quality_rows.append(
-            {
-                "kind": kind or "unmapped",
-                "unit": str(unit),
-                "source_concept": str(row.source_concept),
-                "source_table": str(row.source_table),
-                "reason": reason,
-                "valid": reason == "valid",
-            }
-        )
+        quality_counts[
+            (
+                kind or "unmapped",
+                str(unit),
+                str(row.source_concept),
+                str(row.source_table),
+                reason,
+                reason == "valid",
+            )
+        ] += 1
         if normalized_value is not None and reason == "valid":
             key = (patient, measurement_date, source_cohort)
             supporting[key][kind].append(float(normalized_value))
@@ -1235,8 +1381,8 @@ def normalize_measurements(raw: Any) -> tuple[Any, Any]:
                     "timing_precision": "|".join(sorted({item["timing_precision"] for item in details})) or "exact_day",
                 }
             )
-    normalized = pd.DataFrame(normalized_rows)
-    quality = pd.DataFrame(quality_rows)
+    normalized = compact_measurement_frame(pd.DataFrame(normalized_rows))
+    quality = measurement_quality_counts_frame(quality_counts)
     return normalized, quality
 
 
@@ -2265,7 +2411,12 @@ def resolve_wide_followup_days(
 def select_primary_incretin_episode(
     episodes: Sequence[CoverageEpisode],
 ) -> CoverageEpisode | None:
-    """Return the earliest persistent episode with a 365-day interepisode washout."""
+    """Return the earliest persistent episode with a 365-day interepisode washout.
+
+    "Persistent" means qualifying over whatever window the episodes were reconstructed with -
+    six or twelve completed months of recorded treatment - so this rule needs no change when the
+    incretin arm's requirement is lengthened.
+    """
     ordered = sorted(episodes, key=lambda item: (item.start_day, item.supported_end_day))
     for episode in ordered:
         previous_supported = [
@@ -2274,7 +2425,7 @@ def select_primary_incretin_episode(
             if prior.supported_end_day < episode.start_day
         ]
         new_user = not previous_supported or episode.start_day - max(previous_supported) - 1 >= 365
-        if episode.qualifies_183 and new_user:
+        if episode.qualifies_window and new_user:
             return episode
     return None
 
@@ -2420,19 +2571,71 @@ def merge_patient_payload(existing: dict[str, Any], candidate: Mapping[str, Any]
     existing["source_table"] = "|".join(item for item in sources if item)
 
 
-def wide_tables_to_data_bundle(
-    frames: Mapping[str, Any],
-    sql: Mapping[str, str],
+# Canonical column order of the wide patient frame: the base attributes, then the mbs__- and
+# glp1__-prefixed source copies. The single-pass builder got this order implicitly from the first
+# patient it inserted (always a surgery-arm patient, so base+mbs__ first, glp1__ appended); pinning
+# it makes every streaming batch's patient frame identical regardless of which source's patients a
+# batch happens to contain, so the assembled cohorts frame's columns do not depend on page size.
+_WIDE_PATIENT_BASE_COLUMNS = (
+    "patient_id", "center_id", "age", "birth_year", "sex", "race", "ethnicity", "coverage",
+    "observation_start_date", "observation_end_date", "administrative_end_date", "wide_index_date",
+    "active_end_resolution_method", "prior_incretin_flag", "postop_incretin_flag", "prior_mbs_flag",
+    "dialysis_transplant_flag", "diabetes_flag", "mbs_during_incretin_flag", "smoking", "hypertension",
+    "dyslipidemia", "osa", "insulin", "biguanide", "sglt2", "svi", "ruca", "state", "source_table",
+)
+_WIDE_PATIENT_COLUMNS = (
+    list(_WIDE_PATIENT_BASE_COLUMNS)
+    + [f"mbs__{column}" for column in _WIDE_PATIENT_BASE_COLUMNS if column != "patient_id"]
+    + [f"glp1__{column}" for column in _WIDE_PATIENT_BASE_COLUMNS if column != "patient_id"]
+)
+# Datetime attribute columns. When a batch contains no patient from one arm, that arm's prefixed
+# copies are entirely absent and reindex would introduce them as all-null float columns; casting
+# them to the always-populated base column's datetime dtype keeps missing cells as NaT (not float
+# nan) so the assembled frame is identical regardless of page size, at whatever datetime resolution
+# the installed pandas uses.
+_WIDE_PATIENT_DATETIME_BASE = (
+    "observation_start_date", "observation_end_date", "administrative_end_date", "wide_index_date",
+)
+_WIDE_PATIENT_DATETIME_COLUMNS = (
+    list(_WIDE_PATIENT_DATETIME_BASE)
+    + [f"mbs__{column}" for column in _WIDE_PATIENT_DATETIME_BASE]
+    + [f"glp1__{column}" for column in _WIDE_PATIENT_DATETIME_BASE]
+)
+
+
+@dataclass
+class WideBatchMeta:
+    """Per-batch contributions to the bundle metadata that the finalize sums across batches.
+
+    Everything else in the metadata (source counts, fingerprints) is a whole-table quantity
+    computed once; these four are the reductions that the single-pass builder finished inside the
+    construction and that a streaming acquire must accumulate. All are commutative over disjoint,
+    patient-aligned batches: the index-selection audit merges field by field, the center values
+    concatenate, and the accepted/rejected interval counts sum.
+    """
+
+    index_selection: dict[str, Any] = field(default_factory=dict)
+    selected_center_values: list[str] = field(default_factory=list)
+    accepted_incretin_interval_records: int = 0
+    rejected_incretin_interval_records: int = 0
+
+
+def _wide_tables_to_batch_bundle(
+    mbs: Any,
+    glp1: Any,
+    resolved_by_source: Mapping[str, Mapping[str, str]],
     qualified_names: Mapping[str, str],
-    source_totals: Mapping[str, Mapping[str, int]] | None = None,
-    preflight_only: bool = False,
-) -> DataBundle:
-    mbs = frames["MBSCohort"].copy().reset_index(drop=True)
-    glp1 = frames["GLP1Cohort"].copy().reset_index(drop=True)
-    resolved_by_source = {
-        "MBSCohort": resolve_wide_fields(mbs, "MBSCohort"),
-        "GLP1Cohort": resolve_wide_fields(glp1, "GLP1Cohort"),
-    }
+    incretin_qualifying_days: int = QUALIFYING_DAYS,
+) -> tuple[DataBundle, WideBatchMeta]:
+    """Build the normalized event frames for one patient-aligned batch of wide rows.
+
+    This is the body of the historical ``wide_tables_to_data_bundle`` minus the metadata dict and
+    preflight, which are whole-run concerns assembled by the caller. Both passes are per-patient,
+    so restricting the input to a batch changes only scale; the caller passes wide-field
+    resolutions computed once. ``source_id`` is keyed off the frame index label rather than an
+    enumerate counter so it is the stable global ordinal under the streaming sort, and identical
+    to the historical sequential value on the reset-index single-batch wrapper path.
+    """
     procedure_rows: list[dict[str, Any]] = []
     medication_rows: list[dict[str, Any]] = []
 
@@ -2441,7 +2644,7 @@ def wide_tables_to_data_bundle(
     for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1)):
         resolved = resolved_by_source[logical_name]
         source_table = qualified_names[logical_name]
-        for row_number, (_, row) in enumerate(frame.iterrows()):
+        for row_number, row in frame.iterrows():
             patient_raw = wide_value(row, resolved, "patient_id", "")
             if pd.isna(patient_raw) or not str(patient_raw).strip():
                 continue
@@ -2503,7 +2706,9 @@ def wide_tables_to_data_bundle(
 
     incretin_medications = medications.loc[medications["source_cohort"].eq("incretin")]
     incretin_records, incretin_medication_audit = medication_frame_to_coverage(incretin_medications)
-    incretin_episodes, _ = reconstruct_coverage_episodes(incretin_records)
+    incretin_episodes, _ = reconstruct_coverage_episodes(
+        incretin_records, qualifying_days=incretin_qualifying_days
+    )
     episodes_by_patient: dict[str, list[CoverageEpisode]] = defaultdict(list)
     for episode in incretin_episodes:
         episodes_by_patient[episode.patient_id].append(episode)
@@ -2622,14 +2827,64 @@ def wide_tables_to_data_bundle(
                     }
                 )
 
-    patients = pd.DataFrame(patients_by_id.values())
+    patients = pd.DataFrame(patients_by_id.values()).reindex(columns=_WIDE_PATIENT_COLUMNS)
+    if not patients.empty:
+        reference_datetime_dtype = patients["observation_start_date"].dtype
+        if np.issubdtype(reference_datetime_dtype, np.datetime64):
+            for column in _WIDE_PATIENT_DATETIME_COLUMNS:
+                if patients[column].dtype != reference_datetime_dtype:
+                    patients[column] = patients[column].astype(reference_datetime_dtype)
     measurements = pd.DataFrame(measurement_rows).drop_duplicates()
     encounters = pd.DataFrame(columns=["patient_id", "encounter_date", "source_table"])
     diagnoses = pd.DataFrame(columns=["patient_id", "diagnosis_date", "diagnosis_code", "source_table"])
+    bundle = DataBundle(
+        patients=patients,
+        procedures=procedures,
+        medications=medications,
+        measurements=measurements,
+        encounters=encounters,
+        diagnoses=diagnoses,
+        metadata={
+            "source_mode": "cosmos_direct_wide_cohorts",
+            "incretin_qualifying_days": int(incretin_qualifying_days),
+        },
+    )
+    batch_meta = WideBatchMeta(
+        index_selection=index_selection,
+        selected_center_values=selected_center_values,
+        accepted_incretin_interval_records=int(len(incretin_records)),
+        rejected_incretin_interval_records=medication_audit_event_count(
+            incretin_medication_audit, accepted=False
+        ),
+    )
+    return bundle, batch_meta
+
+
+def _wide_center_validation_available(selected_center_values: Sequence[str]) -> bool:
     center_complete = bool(selected_center_values) and all(
         value != CENTER_UNAVAILABLE for value in selected_center_values
     )
-    center_validation_available = center_complete and len(set(selected_center_values)) >= 3
+    return center_complete and len(set(selected_center_values)) >= 3
+
+
+def build_wide_metadata(
+    sql: Mapping[str, str],
+    qualified_names: Mapping[str, str],
+    frames: Mapping[str, Any],
+    resolved_by_source: Mapping[str, Mapping[str, str]],
+    source_totals: Mapping[str, Mapping[str, int]] | None,
+    batch_meta: WideBatchMeta,
+) -> dict[str, Any]:
+    """Assemble the full bundle metadata from the whole wide tables and the batch reductions.
+
+    Shared by the single-batch wrapper and the streaming acquire so both stamp byte-identical
+    metadata (the preflight this feeds reaches the figure payload's identity block). Whole-table
+    quantities (schema, source counts) are computed here from ``frames``; the four per-batch
+    reductions arrive already summed in ``batch_meta``.
+    """
+    mbs = frames["MBSCohort"]
+    glp1 = frames["GLP1Cohort"]
+    center_validation_available = _wide_center_validation_available(batch_meta.selected_center_values)
     limitations = [
         "MBSCohort and GLP1Cohort are upstream analytic cohort tables; their defining SQL and upstream inclusion transforms are not visible in this database.",
         "Outcome values come from fixed wide horizon columns; exact measurement timestamps and within-window counts are unavailable.",
@@ -2644,60 +2899,105 @@ def wide_tables_to_data_bundle(
         )
     if not center_validation_available:
         limitations.append("A usable center identifier is unavailable, so geographic holdout validation is not performed.")
-    bundle = DataBundle(
-        patients=patients,
-        procedures=procedures,
-        medications=medications,
-        measurements=measurements,
-        encounters=encounters,
-        diagnoses=diagnoses,
-        metadata={
-            "source_mode": "cosmos_direct_wide_cohorts",
-            "sql_contract_version": DIRECT_WIDE_CONTRACT_VERSION,
-            "sql": dict(sql),
-            "query_fingerprint": digest({key: normalize_sql(value) for key, value in sql.items()}),
-            "schema_fingerprint": digest({key: frame_schema(value) for key, value in frames.items()}),
-            "source_tables": dict(qualified_names),
-            "source_row_counts": {key: len(value) for key, value in frames.items()},
-            "source_unique_patient_counts": {
-                logical_name: int(
-                    frame[resolved_by_source[logical_name]["patient_id"]].dropna().astype(str).nunique()
-                )
-                for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
-            },
-            "source_total_row_counts": {
-                logical_name: int((source_totals or {}).get(logical_name, {}).get("rows", len(frame)))
-                for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
-            },
-            "source_total_unique_patient_counts": {
-                logical_name: int(
-                    (source_totals or {}).get(logical_name, {}).get(
-                        "patients",
-                        frame[resolved_by_source[logical_name]["patient_id"]].dropna().astype(str).nunique(),
-                    )
-                )
-                for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
-            },
-            "index_row_selection": index_selection,
-            "accepted_incretin_interval_records": int(len(incretin_records)),
-            "rejected_incretin_interval_records": int(
-                (~incretin_medication_audit["accepted"]).sum()
-                if not incretin_medication_audit.empty else 0
-            ),
-            "measurement_timing": "nominal_horizon_from_wide_columns",
-            "medication_coverage_semantics": "reported_start_end_intervals_across_all_patient_rows",
-            "center_validation_available": center_validation_available,
-            "strict_raw_event_contract": False,
-            "limitations": limitations,
+    return {
+        "source_mode": "cosmos_direct_wide_cohorts",
+        "sql_contract_version": DIRECT_WIDE_CONTRACT_VERSION,
+        "sql": dict(sql),
+        "query_fingerprint": digest({key: normalize_sql(value) for key, value in sql.items()}),
+        "schema_fingerprint": digest({key: frame_schema(value) for key, value in frames.items()}),
+        "source_tables": dict(qualified_names),
+        "source_row_counts": {key: len(value) for key, value in frames.items()},
+        "source_unique_patient_counts": {
+            logical_name: int(
+                frame[resolved_by_source[logical_name]["patient_id"]].dropna().astype(str).nunique()
+            )
+            for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
         },
+        "source_total_row_counts": {
+            logical_name: int((source_totals or {}).get(logical_name, {}).get("rows", len(frame)))
+            for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
+        },
+        "source_total_unique_patient_counts": {
+            logical_name: int(
+                (source_totals or {}).get(logical_name, {}).get(
+                    "patients",
+                    frame[resolved_by_source[logical_name]["patient_id"]].dropna().astype(str).nunique(),
+                )
+            )
+            for logical_name, frame in (("MBSCohort", mbs), ("GLP1Cohort", glp1))
+        },
+        "index_row_selection": batch_meta.index_selection,
+        "accepted_incretin_interval_records": int(batch_meta.accepted_incretin_interval_records),
+        "rejected_incretin_interval_records": int(batch_meta.rejected_incretin_interval_records),
+        "measurement_timing": "nominal_horizon_from_wide_columns",
+        "medication_coverage_semantics": "reported_start_end_intervals_across_all_patient_rows",
+        "center_validation_available": center_validation_available,
+        "strict_raw_event_contract": False,
+        "limitations": limitations,
+    }
+
+
+def wide_tables_to_data_bundle(
+    frames: Mapping[str, Any],
+    sql: Mapping[str, str],
+    qualified_names: Mapping[str, str],
+    source_totals: Mapping[str, Mapping[str, int]] | None = None,
+    preflight_only: bool = False,
+    incretin_qualifying_days: int = QUALIFYING_DAYS,
+) -> DataBundle:
+    """Normalize the whole wide cohort tables into one data bundle (single-batch wrapper).
+
+    The streaming acquire (Section 5) runs ``_wide_tables_to_batch_bundle`` over many
+    patient-aligned batches and accumulates the same ``WideBatchMeta`` reductions; this whole-input
+    path is byte-identical to that and stays the entry point for the direct-wide self-tests, the
+    preflight-only path, and in-process runs.
+    """
+    mbs = frames["MBSCohort"].copy().reset_index(drop=True)
+    glp1 = frames["GLP1Cohort"].copy().reset_index(drop=True)
+    resolved_by_source = {
+        "MBSCohort": resolve_wide_fields(mbs, "MBSCohort"),
+        "GLP1Cohort": resolve_wide_fields(glp1, "GLP1Cohort"),
+    }
+    bundle, batch_meta = _wide_tables_to_batch_bundle(
+        mbs, glp1, resolved_by_source, qualified_names, incretin_qualifying_days
+    )
+    bundle.metadata = build_wide_metadata(
+        sql, qualified_names, frames, resolved_by_source, source_totals, batch_meta
     )
     bundle.metadata["preflight"] = validate_data_bundle(bundle, preflight_only=preflight_only)
     return bundle
 
 
+MEDICATION_AUDIT_KEY_COLUMNS = ("ingredient", "mapping_method", "source_type", "accepted", "reason")
+
+
+def medication_audit_counts_frame(counts: Mapping[tuple[Any, ...], int]) -> Any:
+    """Materialize the run-length-encoded medication audit; see measurement_quality_counts_frame."""
+    frame = pd.DataFrame(list(counts.keys()) or None, columns=list(MEDICATION_AUDIT_KEY_COLUMNS))
+    frame["n"] = pd.Series(list(counts.values()), dtype="int64")
+    frame["accepted"] = frame["accepted"].astype(bool)
+    return frame
+
+
+def medication_audit_event_count(audit: Any, accepted: bool | None = None) -> int:
+    """Number of audited source events, optionally restricted to accepted/rejected ones.
+
+    Reads the encoded `n` column so callers never have to know the frame is run-length encoded.
+    """
+    if audit is None or audit.empty:
+        return 0
+    selected = audit if accepted is None else audit.loc[audit["accepted"].eq(bool(accepted))]
+    return int(selected["n"].sum())
+
+
 def medication_frame_to_coverage(medications: Any, index_dates: Mapping[str, Any] | None = None) -> tuple[list[CoverageRecord], Any]:
     records: list[CoverageRecord] = []
-    audit: list[dict[str, Any]] = []
+    # Run-length encoded like the measurement-quality audit, and for the same reason: this was
+    # one row per dispense/administration event - the second frame in the cohorts checkpoint that
+    # scaled with source events rather than patients - while all four of its consumers are counts
+    # over (source_type, accepted, reason). The per-event patient_id is dropped because nothing
+    # read it; every reported quantity is preserved exactly.
+    audit_counts: Counter[tuple[str, str, str, bool, str]] = Counter()
     for row in medications.itertuples(index=False):
         payload = row._asdict()
         patient_id = str(payload.get("patient_id", ""))
@@ -2752,20 +3052,31 @@ def medication_frame_to_coverage(medications: Any, index_dates: Mapping[str, Any
                 records.append(checked)
             else:
                 reason = checked.rejection_reason
-        audit.append(
-            {
-                "patient_id": patient_id,
-                "ingredient": ingredient or "unmapped",
-                "mapping_method": mapping_method,
-                "source_type": source_type,
-                "accepted": not bool(reason),
-                "reason": reason or "valid",
-            }
-        )
-    return records, pd.DataFrame(audit)
+        audit_counts[
+            (
+                ingredient or "unmapped",
+                mapping_method,
+                source_type,
+                not bool(reason),
+                reason or "valid",
+            )
+        ] += 1
+    return records, medication_audit_counts_frame(audit_counts)
 
 
-def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> dict[str, Any]:
+def validate_data_bundle(
+    bundle: DataBundle,
+    preflight_only: bool = False,
+    measurement_summary: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Validate a data bundle and build the preflight payload.
+
+    ``measurement_summary`` lets the streaming acquire (Section 8) supply the raw-measurement
+    facts this reads - the deduplicated row count, whether any measurement date is null, and the
+    column set - without materializing the whole raw measurement frame, which it never holds. When
+    omitted (the whole-bundle wrapper path) those facts are read from ``bundle.measurements``
+    directly and the behavior is unchanged.
+    """
     issues: list[str] = []
     details: list[str] = []
     wide_source = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
@@ -2773,14 +3084,22 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
         issues.append("Stable patient identifiers are missing or null")
     if "center_id" not in bundle.patients or bundle.patients["center_id"].isna().any():
         issues.append("Blinded center or organization identity is incomplete")
-    for name, frame, date_column in (
-        ("procedure", bundle.procedures, "procedure_date"),
-        ("measurement", bundle.measurements, "measurement_date"),
-    ):
-        if frame.empty or date_column not in frame or frame[date_column].isna().any():
-            issues.append(f"{name.title()} dates are unavailable or invalid")
+    if bundle.procedures.empty or "procedure_date" not in bundle.procedures or bundle.procedures["procedure_date"].isna().any():
+        issues.append("Procedure dates are unavailable or invalid")
+    if measurement_summary is None:
+        measurement_columns = set(bundle.measurements.columns)
+        measurement_count = int(len(bundle.measurements))
+        measurement_empty = bool(bundle.measurements.empty)
+        measurement_date_invalid = "measurement_date" not in measurement_columns or bool(bundle.measurements["measurement_date"].isna().any()) if not measurement_empty else True
+    else:
+        measurement_columns = set(measurement_summary["columns"])
+        measurement_count = int(measurement_summary["count"])
+        measurement_empty = measurement_count == 0
+        measurement_date_invalid = bool(measurement_summary["date_has_null"])
+    if measurement_empty or "measurement_date" not in measurement_columns or measurement_date_invalid:
+        issues.append("Measurement dates are unavailable or invalid")
     for field_name in ("raw_value", "unit", "source_concept", "source_table"):
-        if field_name not in bundle.measurements:
+        if field_name not in measurement_columns:
             issues.append(f"Raw measurements lack required field {field_name}")
     admin_available = "administrative_end_date" in bundle.patients and bundle.patients["administrative_end_date"].notna().all()
     global_admin = os.environ.get("METABOLIC_ADMIN_DATA_THROUGH")
@@ -2794,7 +3113,7 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
             bundle.patients["administrative_end_date"] = pd.Timestamp(parsed).normalize()
             details.append("Administrative data-through date supplied by reviewed environment configuration")
     records, medication_audit = medication_frame_to_coverage(bundle.medications)
-    accepted = int(medication_audit["accepted"].sum()) if not medication_audit.empty else 0
+    accepted = medication_audit_event_count(medication_audit, accepted=True)
     if accepted == 0:
         issues.append("No medication record yields accepted audited coverage semantics")
     if "postop_incretin_flag" in bundle.patients:
@@ -2831,11 +3150,21 @@ def validate_data_bundle(bundle: DataBundle, preflight_only: bool = False) -> di
         raise PreflightError("Production data preflight failed", issues, details)
     limitations = list(bundle.metadata.get("limitations", [])) if wide_source else []
     details.extend(limitations)
+    row_counts = bundle.row_counts()
+    if measurement_summary is not None:
+        row_counts["measurements"] = measurement_count
     result = {
         "status": "passed_with_wide_source_limitations" if wide_source else "passed",
-        "row_counts": bundle.row_counts(),
+        "row_counts": row_counts,
         "accepted_medication_records": accepted,
-        "medication_rejection_counts": medication_audit.loc[~medication_audit["accepted"], "reason"].value_counts().to_dict(),
+        "medication_rejection_counts": {
+            str(reason): int(count)
+            for reason, count in medication_audit.loc[~medication_audit["accepted"]]
+            .groupby("reason", sort=False)["n"]
+            .sum()
+            .sort_values(ascending=False)
+            .items()
+        },
         "details": details,
         "strict_raw_event_contract": not wide_source,
     }
@@ -2891,41 +3220,79 @@ def connect_cosmos() -> Any:
         ) from exc
 
 
+def bundle_incretin_qualifying_days(bundle: DataBundle) -> int:
+    """The incretin arm's cohort-entry window, carried on the bundle.
+
+    Stamped once where the bundle is built from the run configuration, then read by every step
+    that has only the bundle to work from - cohort construction and the gap-rule sensitivity.
+    That keeps a single source of truth and survives the bundle_light checkpoint, so an
+    orchestrated worker cannot drift onto a different rule than the one the cohort was built on.
+    Absent (fixture bundles built directly in the self-tests), the six-month rule applies.
+    """
+    value = bundle.metadata.get("incretin_qualifying_days")
+    return int(value) if value else QUALIFYING_DAYS
+
+
 def query_cosmos(cfg: RunConfig, preflight_only: bool = False) -> DataBundle:
     connection = connect_cosmos()
+    qualifying_days = qualifying_days_for_months(cfg.incretin_qualifying_months)
     try:
         frames, sql, qualified_names, source_totals = load_direct_wide_tables(
             connection,
             cfg,
             preflight_only=preflight_only,
         )
-        return wide_tables_to_data_bundle(
+        bundle = wide_tables_to_data_bundle(
             frames,
             sql,
             qualified_names,
             source_totals=source_totals,
             preflight_only=preflight_only,
+            incretin_qualifying_days=qualifying_days,
         )
     finally:
         connection.close()
+    bundle.metadata["incretin_qualifying_days"] = qualifying_days
+    bundle.metadata["incretin_qualifying_months"] = int(cfg.incretin_qualifying_months)
+    return bundle
 
 
 def frame_schema(frame: Any) -> dict[str, str]:
     return {str(column): str(dtype) for column, dtype in frame.dtypes.items()}
 
 
+def distinct_patient_count(column: Any) -> int:
+    """Distinct patient ids in a column, without allocating one Python string per row.
+
+    patient_id is stored as `category` on every large table (PREDICTION_ROW_CATEGORY_COLUMNS),
+    so the historical `.astype(str).nunique()` materialized a full object-dtype array of the
+    largest table in the run - and it did so from inside save_checkpoint/require_checkpoint,
+    exactly when that table is already live. Counting distinct categories is exact and allocates
+    nothing per row. Missing values are counted as one additional distinct value because that is
+    what `.astype(str)` did by mapping them all to the string "nan"; non-categorical columns keep
+    the original conversion so mixed-type object columns still normalize the way they used to.
+    """
+    if isinstance(getattr(column, "dtype", None), pd.CategoricalDtype):
+        return int(column.nunique()) + int(bool(column.isna().any()))
+    return int(column.astype(str).nunique())
+
+
 def uniqueness_manifest(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, TaskPartitionedStore):
+        return {}
     if isinstance(payload, DataBundle):
         return {
             "patients_patient_id_unique": bool(payload.patients["patient_id"].is_unique),
             "patient_count": int(payload.patients["patient_id"].nunique()),
         }
     if hasattr(payload, "columns") and "patient_id" in payload:
-        return {"patient_count": int(payload["patient_id"].astype(str).nunique())}
+        return {"patient_count": distinct_patient_count(payload["patient_id"])}
     return {}
 
 
 def payload_manifest(payload: Any) -> dict[str, Any]:
+    if isinstance(payload, TaskPartitionedStore):
+        return payload.manifest()
     if isinstance(payload, DataBundle):
         return {
             "type": "DataBundle",
@@ -2976,6 +3343,26 @@ class RunContext:
     @property
     def export(self) -> Path:
         return self.run_dir / "FIGURES_TO_EXPORT"
+
+    def new_prediction_store(self, name: str) -> "PredictionStore":
+        """A fresh, empty prediction store inside the run directory."""
+        return self._new_store(PredictionStore, "predictions", name)
+
+    def new_row_store(self, name: str) -> "RowStore":
+        """A fresh, empty prediction-row store inside the run directory."""
+        return self._new_store(RowStore, "rows", name)
+
+    def _new_store(self, store_type: type, group: str, name: str) -> Any:
+        """A fresh, empty task-partitioned store inside the run directory.
+
+        Stores live beside the checkpoints rather than in the temp cache because a store IS its
+        stage's output: a later worker process reads it back through the pickled index, and
+        --resume needs it to survive the run. Any partitions left by a previous attempt at the
+        stage are cleared so a rerun never appends to stale rows.
+        """
+        root = self.internal / group / name
+        shutil.rmtree(root, ignore_errors=True)
+        return store_type(root)
 
     def initialize(self) -> None:
         for directory in (self.run_dir, self.internal, self.checkpoints, self.aggregate, self.export):
@@ -3230,8 +3617,17 @@ def synthetic_data_bundle(cfg: RunConfig) -> DataBundle:
                         }
                     )
         else:
-            # Six-month continuer source cohort. Some records intentionally fail the rule.
-            fill_count = (72 if index % 4 else 28) if index % 11 else 5
+            # Incretin continuer source cohort. Fill counts are chosen so the fixture covers
+            # every branch of the cohort-entry rule at 28 days of supply each: 5 fills (140 days)
+            # fails both windows, 8 fills (224 days) completes six months but not twelve, and
+            # 28 or 72 fills complete both. The 8-fill group is what makes a smoke run at
+            # --incretin-qualifying-months 12 visibly smaller than the same run at 6.
+            if index % 11 == 0:
+                fill_count = 5
+            elif index % 13 == 5:
+                fill_count = 8
+            else:
+                fill_count = 72 if index % 4 else 28
             gap_extra = 32 if index % 19 == 0 else 0
             for fill in range(fill_count):
                 offset = 28 * fill + (gap_extra if fill >= 3 else 0)
@@ -3437,6 +3833,8 @@ def synthetic_data_bundle(cfg: RunConfig) -> DataBundle:
                     "measurements": frame_schema(measurements),
                 }
             ),
+            "incretin_qualifying_days": qualifying_days_for_months(cfg.incretin_qualifying_months),
+            "incretin_qualifying_months": int(cfg.incretin_qualifying_months),
         },
     )
     bundle.metadata["preflight"] = validate_data_bundle(bundle)
@@ -3494,7 +3892,135 @@ def aggregate_funnel(rows: Sequence[dict[str, Any]]) -> Any:
     return pd.DataFrame(rows, columns=["cohort", "stage", "n_patients", "status"])
 
 
-def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
+class MeasurementSpill:
+    """Sink for the per-batch normalized-measurement frames of a streaming acquire.
+
+    During streaming construction each patient batch produces a compacted normalized-measurement
+    frame that is appended here and dropped from memory, so the O(patients x horizons) raw
+    measurement dicts never accumulate for every patient at once. ``materialize`` reads them all
+    back into the single ``measurements`` artifact the cohorts checkpoint carries, recompacting
+    over the whole so its categorical dtypes match the single-pass frame exactly. With no spill
+    directory the frames are held in memory - the single-batch wrapper path and the self-tests,
+    where the input is small and there is no run directory to write under.
+    """
+
+    def __init__(self, spill_dir: Any = None) -> None:
+        self._dir = Path(spill_dir) if spill_dir is not None else None
+        self._frames: list[Any] = []
+        self._paths: list[Path] = []
+        if self._dir is not None:
+            self._dir.mkdir(parents=True, exist_ok=True)
+
+    def write(self, frame: Any) -> None:
+        if self._dir is None:
+            self._frames.append(frame)
+            return
+        index = len(self._paths)
+        if _PARQUET_SPILL_ENABLED:
+            path = self._dir / f"measurements_{index:05d}.parquet"
+            frame.to_parquet(path, index=False)
+        else:
+            path = self._dir / f"measurements_{index:05d}.pkl"
+            atomic_pickle(path, frame)
+        self._paths.append(path)
+
+    def materialize(self) -> Any:
+        if self._dir is None:
+            frames: list[Any] = self._frames
+        else:
+            frames = []
+            for path in self._paths:
+                if path.suffix == ".parquet":
+                    frames.append(pd.read_parquet(path))
+                else:
+                    with path.open("rb") as stream:
+                        frames.append(pickle.load(stream))
+        return compact_measurement_frame(concat_frames(frames))
+
+
+class AcquireAccumulators:
+    """Commutative accumulators for the global reductions of cohort construction.
+
+    Cohort construction runs one patient batch at a time (Section 6); every quantity that the
+    single-pass builder computed over all patients at once is a commutative accumulation here,
+    assembled by ``finalize_cohort_artifacts`` into the identical artifacts dict. Patient batches
+    are disjoint and patient-aligned, so the per-cohort counters are exact sums; the exposure and
+    audit frames are order-free downstream (``exposure_summary``/``measurement_quality_table``
+    both group-and-sum), and the funnel - the one reduction whose row order reaches the figure
+    payload - is rebuilt from the assembled surgery-exposure frame, which reproduces the
+    single-pass row order because batches are walked in ascending patient order.
+    """
+
+    def __init__(self) -> None:
+        self.cohort_frames: list[Any] = []
+        self.surgery_exposure_frames: list[Any] = []
+        self.incretin_exposure_frames: list[Any] = []
+        self.measurement_quality_frames: list[Any] = []
+        self.surgery_audit_frames: list[Any] = []
+        self.incretin_audit_frames: list[Any] = []
+        self.medication_audit_frames: list[Any] = []
+        self.surgery_cpt_patients: int = 0
+        self.incretin_accepted_exposure: int = 0
+        self.medication_exclusions: Counter[str] = Counter()
+        self.direct_wide: bool = False
+        self.incretin_qualifying_months: int | None = None
+
+
+def _merge_measurement_quality(frames: Sequence[Any]) -> Any:
+    """Sum the per-batch run-length-encoded measurement-quality counts by full key.
+
+    Rebuilds the encoded frame through ``measurement_quality_counts_frame`` so the released schema
+    and dtypes are identical to the single-pass audit. For a single batch the reconstructed key
+    order equals the input frame's order, so the wrapper reproduces that frame byte for byte; the
+    only consumer (``measurement_quality_table``) groups and sums, so multi-batch key order is a
+    don't-care.
+    """
+    combined = concat_frames(frames)
+    counts: Counter[tuple[Any, ...]] = Counter()
+    if not combined.empty:
+        key_columns = list(MEASUREMENT_QUALITY_KEY_COLUMNS)
+        for key, count in zip(
+            combined[key_columns].itertuples(index=False, name=None), combined["n"], strict=True
+        ):
+            counts[key] += int(count)
+    return measurement_quality_counts_frame(counts)
+
+
+def _merge_medication_audit(frames: Sequence[Any], source_cohort: str | None) -> Any:
+    """Sum the per-batch run-length-encoded medication-audit counts by full key.
+
+    Mirrors ``_merge_measurement_quality``; ``exposure_summary`` groups and sums the result, so
+    only the counts are load-bearing. When ``source_cohort`` is given it is stamped on the merged
+    frame, matching the single-pass surgery/incretin split.
+    """
+    combined = concat_frames(frames)
+    counts: Counter[tuple[Any, ...]] = Counter()
+    if not combined.empty:
+        key_columns = list(MEDICATION_AUDIT_KEY_COLUMNS)
+        for key, count in zip(
+            combined[key_columns].itertuples(index=False, name=None), combined["n"], strict=True
+        ):
+            counts[key] += int(count)
+    frame = medication_audit_counts_frame(counts)
+    if source_cohort is not None:
+        frame["source_cohort"] = source_cohort
+    return frame
+
+
+def _construct_cohorts_batch(
+    bundle: DataBundle,
+    accum: AcquireAccumulators,
+    measurements_spill: MeasurementSpill,
+) -> Any:
+    """Construct cohort rows for one patient batch, appending its reductions to ``accum``.
+
+    This is the body of the historical ``construct_cohorts``, restricted to one batch of patients.
+    Every per-patient decision - eligibility, index selection, coverage classification - is
+    unchanged; only the whole-population reductions (funnel counts, exclusion tallies, the
+    measurement-quality and medication audits, the normalized measurements) are routed into the
+    accumulator and the measurement spill instead of being finished in place. The batch's cohort
+    rows are returned and also appended to ``accum.cohort_frames`` for the finalize.
+    """
     patients = bundle.patients.copy()
     patients["patient_id"] = patients["patient_id"].astype(str)
     patient_lookup = patients.set_index("patient_id", drop=False).to_dict(orient="index")
@@ -3502,6 +4028,8 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
     procedures["patient_id"] = procedures["patient_id"].astype(str)
     procedures["procedure_date"] = pd.to_datetime(procedures["procedure_date"], errors="coerce").dt.normalize()
     normalized_measurements, measurement_quality = normalize_measurements(bundle.measurements)
+    measurements_spill.write(normalized_measurements)
+    accum.measurement_quality_frames.append(measurement_quality)
     # Map each patient to the integer row positions of their measurements/procedures once,
     # so the cohort loops below slice per patient in O(1) without rescanning the full tables
     # (those per-patient full-frame scans were O(patients x rows) and did not finish on
@@ -3522,6 +4050,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         return empty_procedure_frame if positions is None else procedures.take(positions)
 
     direct_wide = bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts"
+    accum.direct_wide = direct_wide
     if direct_wide and "source_cohort" in bundle.medications:
         surgery_medications = bundle.medications.loc[bundle.medications["source_cohort"].eq("surgery")]
         incretin_medications = bundle.medications.loc[bundle.medications["source_cohort"].eq("incretin")]
@@ -3529,24 +4058,26 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         incretin_records, incretin_audit = medication_frame_to_coverage(incretin_medications)
         surgery_audit["source_cohort"] = "surgery"
         incretin_audit["source_cohort"] = "incretin"
-        medication_audit = pd.concat([surgery_audit, incretin_audit], ignore_index=True)
+        accum.surgery_audit_frames.append(surgery_audit)
+        accum.incretin_audit_frames.append(incretin_audit)
     else:
         surgery_records, medication_audit = medication_frame_to_coverage(bundle.medications)
         incretin_records = surgery_records
+        accum.medication_audit_frames.append(medication_audit)
     records_by_patient: dict[str, list[CoverageRecord]] = defaultdict(list)
     for record in surgery_records:
         records_by_patient[record.patient_id].append(record)
     epoch = pd.Timestamp("1970-01-01")
     cohort_rows: list[dict[str, Any]] = []
-    funnel_rows: list[dict[str, Any]] = []
-    exposure_rows: list[dict[str, Any]] = []
+    surgery_exposure_rows: list[dict[str, Any]] = []
+    incretin_exposure_rows: list[dict[str, Any]] = []
 
     surgical_candidates = procedures.copy()
     surgical_candidates["procedure_type"] = surgical_candidates["procedure_code"].map(procedure_category)
     surgical_candidates = surgical_candidates.loc[surgical_candidates["procedure_type"].notna()].sort_values(
         ["patient_id", "procedure_date"]
     )
-    funnel_rows.append({"cohort": "surgery", "stage": "source patients with qualifying CPT", "n_patients": surgical_candidates["patient_id"].nunique(), "status": "included"})
+    accum.surgery_cpt_patients += int(surgical_candidates["patient_id"].nunique())
     for patient_id, group in surgical_candidates.groupby("patient_id", sort=True):
         candidate = group.iloc[0]
         index_date = pd.Timestamp(candidate["procedure_date"])
@@ -3606,7 +4137,7 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
             exclusion = "postop_flag_without_start"
         if not exclusion and history["classification"] == "unknown":
             exclusion = "unknown_exposure_timing"
-        exposure_rows.append(
+        surgery_exposure_rows.append(
             {
                 "patient_id": str(patient_id),
                 "cohort": "surgery",
@@ -3647,17 +4178,18 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         )
         cohort_rows.append(row)
 
-    surgical_exclusions = pd.Series([item["exclusion_reason"] for item in exposure_rows if item["exclusion_reason"]]).value_counts()
-    for reason, count in surgical_exclusions.items():
-        funnel_rows.append({"cohort": "surgery", "stage": str(reason), "n_patients": int(count), "status": "excluded"})
-    funnel_rows.append({"cohort": "surgery", "stage": "primary eligible", "n_patients": sum(item["cohort"] == "surgery" for item in cohort_rows), "status": "included"})
-
-    # Medication cohort is built from the same coverage algorithm on absolute day numbers.
-    all_episodes, rejected_records = reconstruct_coverage_episodes(incretin_records)
+    # Medication cohort is built from the same coverage algorithm on absolute day numbers, over
+    # the configured cohort-entry window (six or twelve completed months of recorded treatment).
+    incretin_qualifying_days = bundle_incretin_qualifying_days(bundle)
+    incretin_qualifying_months = int(round(incretin_qualifying_days / DAYS_PER_MONTH))
+    accum.incretin_qualifying_months = incretin_qualifying_months
+    all_episodes, _ = reconstruct_coverage_episodes(
+        incretin_records, qualifying_days=incretin_qualifying_days
+    )
     episodes_by_patient: dict[str, list[CoverageEpisode]] = defaultdict(list)
     for episode in all_episodes:
         episodes_by_patient[episode.patient_id].append(episode)
-    funnel_rows.append({"cohort": "incretin", "stage": "patients with accepted exposure", "n_patients": len(episodes_by_patient), "status": "included"})
+    accum.incretin_accepted_exposure += len(episodes_by_patient)
     medication_exclusions: dict[str, int] = defaultdict(int)
     for patient_id in sorted(episodes_by_patient):
         patient = patient_lookup.get(str(patient_id))
@@ -3668,8 +4200,14 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
         if patient is None:
             exclusion = "missing_patient_record"
         elif selected_episode is None:
-            exclusion = "no_new_user_six_month_continuation_episode"
+            exclusion = f"no_new_user_{month_word(incretin_qualifying_months)}_month_continuation_episode"
         if selected_episode is None:
+            medication_exclusions[exclusion] += 1
+            continue
+        if patient is None:
+            # A patient with accepted exposure but no selected wide index row is recorded as an
+            # exclusion and skipped, mirroring the surgical loop's guard, rather than dereferenced
+            # below (age_at_index / patient["observation_start_date"]) on a missing record.
             medication_exclusions[exclusion] += 1
             continue
         index_date = epoch + pd.Timedelta(days=selected_episode.start_day)
@@ -3727,49 +4265,353 @@ def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
                 "surgery_censor_day": first_surgery_day,
                 "strict_never_exposed": True,
                 "prior_exposure_stratum": "365_day_new_user",
-                "pdc_183": selected_episode.pdc_183,
+                "pdc_qualifying": selected_episode.pdc_qualifying,
                 "maximum_gap_days": selected_episode.maximum_gap_days,
                 "switch_count": len(selected_episode.switch_days),
             }
         )
         cohort_rows.append(row)
-        exposure_rows.append(
+        incretin_exposure_rows.append(
             {
                 "patient_id": str(patient_id),
                 "cohort": "incretin",
-                "classification": "six_month_continuer",
+                "classification": f"{month_word(incretin_qualifying_months)}_month_continuer",
                 "treatment_censor_day": int(treatment_censor),
                 "active_at_index": True,
                 "episode_count": len(episodes_by_patient[patient_id]),
                 "rejected_record_count": 0,
                 "excluded": False,
                 "exclusion_reason": "",
-                "pdc_183": selected_episode.pdc_183,
+                "pdc_qualifying": selected_episode.pdc_qualifying,
                 "maximum_gap_days": selected_episode.maximum_gap_days,
                 "switch_count": len(selected_episode.switch_days),
                 "source_type": first_record.source_type,
             }
         )
-    for reason, count in sorted(medication_exclusions.items()):
-        funnel_rows.append({"cohort": "incretin", "stage": reason, "n_patients": int(count), "status": "excluded"})
-    funnel_rows.append({"cohort": "incretin", "stage": "primary six-month continuers", "n_patients": sum(item["cohort"] == "incretin" for item in cohort_rows), "status": "included"})
-    cohorts = pd.DataFrame(cohort_rows)
+    for reason, count in medication_exclusions.items():
+        accum.medication_exclusions[reason] += count
+
+    cohort_frame = pd.DataFrame(cohort_rows)
+    accum.cohort_frames.append(cohort_frame)
+    accum.surgery_exposure_frames.append(pd.DataFrame(surgery_exposure_rows))
+    accum.incretin_exposure_frames.append(pd.DataFrame(incretin_exposure_rows))
+    return cohort_frame
+
+
+def finalize_cohort_artifacts(accum: AcquireAccumulators, measurements_spill: MeasurementSpill) -> dict[str, Any]:
+    """Assemble the cohort artifacts dict from the accumulated per-batch reductions.
+
+    Reproduces the single-pass builder's outputs: the cohorts frame is stably reordered to the
+    canonical surgery-then-incretin, patient-ascending order (I1) that ``build_prediction_rows``
+    depends on; the funnel is rebuilt in the identical row order and counts; the run-length audits
+    and measurements are merged/materialized to their single-pass equivalents.
+    """
+    measurements = measurements_spill.materialize()
+    surgery_exposure = concat_frames(accum.surgery_exposure_frames)
+    incretin_exposure = concat_frames(accum.incretin_exposure_frames)
+    exposure = concat_frames([surgery_exposure, incretin_exposure])
+    cohorts = concat_frames(accum.cohort_frames)
     if cohorts.empty:
         raise PreflightError("Cohort construction produced no eligible patients", ["All patients failed prespecified eligibility rules"])
+    # I1: the single pass appended the surgery arm (patients ascending) then the incretin arm
+    # (patients ascending). Each patient appears at most once per arm, so a stable sort on
+    # (arm_rank, patient_id) reproduces that exact append order regardless of batch boundaries;
+    # build_prediction_rows assigns row_id as a running counter over this frame, so the order is
+    # load-bearing. patient_id is still a plain string here (compaction happens after), so the
+    # lexicographic sort matches the groupby(sort=True)/sorted() the single pass used.
+    arm_rank = cohorts["cohort"].map({"surgery": 0, "incretin": 1}).astype("int8")
+    cohorts = (
+        cohorts.assign(_arm_rank=arm_rank)
+        .sort_values(["_arm_rank", "patient_id"], kind="mergesort")
+        .drop(columns="_arm_rank")
+        .reset_index(drop=True)
+    )
+    # Re-infer object columns over the whole assembled frame so a column that a single batch
+    # happened to fill only with Python None (e.g. a surgery-only page's treatment_censor_day)
+    # collapses to the same float dtype the single-pass builder produced from all rows at once.
+    # This runs over every row exactly as pd.DataFrame(cohort_rows) did, so it is a no-op on the
+    # whole-input wrapper and makes the assembled frame page-size-invariant. String columns hold
+    # str objects, not numeric ones, so they are left as object.
+    cohorts = cohorts.infer_objects()
     cohorts["index_date"] = pd.to_datetime(cohorts["index_date"]).dt.normalize()
     cohorts["effective_censor_day"] = cohorts[["treatment_censor_day", "surgery_censor_day"]].apply(
         lambda row: min([int(value) for value in row if pd.notna(value)], default=np.inf), axis=1
     )
     cohorts["effective_censor_day"] = cohorts["effective_censor_day"].replace(np.inf, np.nan)
+
+    months = accum.incretin_qualifying_months if accum.incretin_qualifying_months is not None else int(round(QUALIFYING_DAYS / DAYS_PER_MONTH))
+    word = month_word(months)
+    funnel_rows: list[dict[str, Any]] = []
+    funnel_rows.append({"cohort": "surgery", "stage": "source patients with qualifying CPT", "n_patients": int(accum.surgery_cpt_patients), "status": "included"})
+    if not surgery_exposure.empty and "exclusion_reason" in surgery_exposure:
+        surgical_exclusions = pd.Series(
+            [reason for reason in surgery_exposure["exclusion_reason"].tolist() if reason]
+        ).value_counts()
+    else:
+        surgical_exclusions = pd.Series(dtype="int64")
+    for reason, count in surgical_exclusions.items():
+        funnel_rows.append({"cohort": "surgery", "stage": str(reason), "n_patients": int(count), "status": "excluded"})
+    funnel_rows.append({"cohort": "surgery", "stage": "primary eligible", "n_patients": int((cohorts["cohort"] == "surgery").sum()), "status": "included"})
+    funnel_rows.append({"cohort": "incretin", "stage": "patients with accepted exposure", "n_patients": int(accum.incretin_accepted_exposure), "status": "included"})
+    for reason, count in sorted(accum.medication_exclusions.items()):
+        funnel_rows.append({"cohort": "incretin", "stage": reason, "n_patients": int(count), "status": "excluded"})
+    funnel_rows.append({"cohort": "incretin", "stage": f"primary {word}-month continuers", "n_patients": int((cohorts["cohort"] == "incretin").sum()), "status": "included"})
+
+    if accum.direct_wide and (accum.surgery_audit_frames or accum.incretin_audit_frames):
+        medication_audit = pd.concat(
+            [
+                _merge_medication_audit(accum.surgery_audit_frames, "surgery"),
+                _merge_medication_audit(accum.incretin_audit_frames, "incretin"),
+            ],
+            ignore_index=True,
+        )
+    else:
+        medication_audit = _merge_medication_audit(accum.medication_audit_frames, None)
+
     return {
         "cohorts": cohorts,
-        "measurements": normalized_measurements,
-        "measurement_quality": measurement_quality,
+        "measurements": measurements,
+        "measurement_quality": _merge_measurement_quality(accum.measurement_quality_frames),
         "medication_audit": medication_audit,
         "funnel": aggregate_funnel(funnel_rows),
-        "exposure": pd.DataFrame(exposure_rows),
-        "rejected_coverage_records": pd.DataFrame([asdict(item) for item in rejected_records]),
+        "exposure": exposure,
+        # D5: verified write-only (no stage or figure consumer reads it), so the per-patient
+        # rejected-coverage frame is dropped; the key is kept as an empty frame for schema stability.
+        "rejected_coverage_records": pd.DataFrame(),
     }
+
+
+def construct_cohorts(bundle: DataBundle) -> dict[str, Any]:
+    """Construct cohorts, targets, and audits from a whole data bundle (single-batch wrapper).
+
+    The whole bundle is one batch; the streaming acquire (Section 6) runs the same
+    ``_construct_cohorts_batch`` and ``finalize_cohort_artifacts`` over many patient-aligned
+    batches, which is byte-identical to this by construction. Kept as the entry point for the
+    synthetic smoke fixture, the direct-wide self-tests, and the in-process run.
+    """
+    accum = AcquireAccumulators()
+    spill = MeasurementSpill()
+    _construct_cohorts_batch(bundle, accum, spill)
+    return finalize_cohort_artifacts(accum, spill)
+
+
+# Patients per client-side construction batch (Section 5). A module constant with an env
+# override, mirroring _PARQUET_SPILL_ENABLED: it bounds the acquire construction transient to one
+# page without touching the frozen production SQL (D2), and it must never change results - the
+# batch-size-invariance self-test asserts the assembled cohorts, measurements, and figure payload
+# are identical across page sizes.
+PATIENT_PAGE = 50_000
+# Rows per fetchmany chunk when the optional chunked read is used; bounds only the read's own
+# fetchall transient, independent of the construction memory fix.
+READ_CHUNK = 200_000
+
+
+def _acquire_patient_page() -> int:
+    override = os.environ.get("METABOLIC_ACQUIRE_PATIENT_PAGE")
+    return int(override) if override else PATIENT_PAGE
+
+
+# Blank patient ids sort first ("") and null ids sort last (this sentinel), so both stay inside a
+# batch slice and are counted in the index audit's input_rows even though construction skips them.
+_NULL_PATIENT_SORT_KEY = "￿￿￿"
+
+
+def _wide_patient_sort_key(frame: Any, resolved: Mapping[str, str]) -> Any:
+    return frame[resolved["patient_id"]].astype("string").str.strip().fillna(_NULL_PATIENT_SORT_KEY)
+
+
+def sort_wide_by_patient(frame: Any, resolved: Mapping[str, str]) -> Any:
+    """Order a wide table by (patient_id, content hash) and reset to a stable global ordinal (D3).
+
+    The content hash is exactly the one ``select_wide_index_rows`` already computes over the
+    mapped columns, so ordering by it (a) lays every patient's rows out contiguously, making a
+    patient batch a slice rather than a scatter, and (b) makes the frame position that becomes
+    ``_row_index`` reproducible run to run - it previously depended on unordered DB return order.
+    Because the wide projection contains only the mapped columns, equal-hash rows are byte-identical
+    rows, so this cannot change which values any downstream selection returns.
+    """
+    mapped_columns = list(dict.fromkeys(resolved.values()))
+    row_hash = pd.util.hash_pandas_object(frame[mapped_columns], index=False).astype("uint64")
+    keys = pd.DataFrame({"_pid": _wide_patient_sort_key(frame, resolved), "_hash": row_hash.to_numpy()})
+    order = keys.sort_values(["_pid", "_hash"], kind="mergesort").index
+    return frame.loc[order].reset_index(drop=True)
+
+
+def iter_patient_batches(
+    mbs: Any,
+    glp1: Any,
+    resolved_by_source: Mapping[str, Mapping[str, str]],
+    page: int,
+) -> "Iterator[tuple[Any, Any]]":
+    """Yield contiguous (mbs, glp1) slices covering ``page`` distinct patients each.
+
+    Both tables are already sorted by ``sort_wide_by_patient``, so the rows for any contiguous
+    range of patient ids are a contiguous slice of each table; the sorted union of ids is walked in
+    groups of ``page`` and each group's slice is found by binary search. Every row of both tables
+    lands in exactly one batch (a true partition, so the index audit's input_rows still sums to the
+    whole), a patient in both cohorts is wholly inside one batch (I3, I7), and the ids can be
+    blank or null without breaking the ordering.
+    """
+    mbs_pid = _wide_patient_sort_key(mbs, resolved_by_source["MBSCohort"]).to_numpy()
+    glp1_pid = _wide_patient_sort_key(glp1, resolved_by_source["GLP1Cohort"]).to_numpy()
+    distinct = np.unique(np.concatenate([mbs_pid, glp1_pid]))
+    if page < 1:
+        page = 1
+    for start in range(0, len(distinct), page):
+        lo = distinct[start]
+        hi = distinct[min(start + page, len(distinct)) - 1]
+        m0 = int(np.searchsorted(mbs_pid, lo, side="left"))
+        m1 = int(np.searchsorted(mbs_pid, hi, side="right"))
+        g0 = int(np.searchsorted(glp1_pid, lo, side="left"))
+        g1 = int(np.searchsorted(glp1_pid, hi, side="right"))
+        yield mbs.iloc[m0:m1], glp1.iloc[g0:g1]
+
+
+def _merge_index_audit(target: dict[str, Any], batch: Mapping[str, Any]) -> None:
+    """Sum a batch's per-source index-selection audit into the accumulator, field by field.
+
+    Every integer field (input rows, patient counts, valid/selected rows, qualifying anchors) is a
+    disjoint-batch sum; ``active_end_resolution_counts`` is a per-method sum re-sorted by key to the
+    canonical order the single pass produced. The audit dict's own key order is irrelevant - the
+    figure dump walks dicts by sorted key.
+    """
+    for source, audit in batch.items():
+        acc = target.setdefault(source, {})
+        for key, value in audit.items():
+            if key == "rule":
+                acc["rule"] = value
+            elif key == "active_end_resolution_counts":
+                merged = dict(acc.get("active_end_resolution_counts", {}))
+                for method, count in value.items():
+                    merged[method] = merged.get(method, 0) + int(count)
+                acc["active_end_resolution_counts"] = {method: merged[method] for method in sorted(merged)}
+            else:
+                acc[key] = int(acc.get(key, 0)) + int(value)
+
+
+def _accumulate_wide_batch_meta(target: WideBatchMeta, batch: WideBatchMeta) -> None:
+    _merge_index_audit(target.index_selection, batch.index_selection)
+    target.selected_center_values.extend(batch.selected_center_values)
+    target.accepted_incretin_interval_records += batch.accepted_incretin_interval_records
+    target.rejected_incretin_interval_records += batch.rejected_incretin_interval_records
+
+
+# Columns of the patient frame the preflight and the run-context fingerprint actually read; the
+# streaming acquire keeps only these across batches instead of the full ~90-column patient frame,
+# which is the transient the batching exists to bound.
+_LIGHT_PATIENT_COLUMNS = ("patient_id", "center_id", "administrative_end_date", "postop_incretin_flag")
+
+
+def stream_wide_acquire(
+    cfg: RunConfig,
+    preflight_only: bool = False,
+    patient_page: int | None = None,
+) -> tuple[dict[str, Any], DataBundle]:
+    """Streaming replacement for ``query_cosmos`` + ``construct_cohorts`` on the wide path.
+
+    Reads both wide tables with the frozen SQL, holds them resident (they are tiny), orders them by
+    patient (D3), then constructs cohorts one patient-aligned batch at a time so the ~38 KB/patient
+    Python-object construction transient is bounded to one page rather than the whole population.
+    Returns the cohort artifacts dict (identical to ``construct_cohorts``) and a light bundle that
+    carries the full metadata, the resident medication table (for the gap-rule sensitivity), and
+    the few patient columns the run-context fingerprint and preflight need.
+    """
+    connection = connect_cosmos()
+    qualifying_days = qualifying_days_for_months(cfg.incretin_qualifying_months)
+    try:
+        frames, sql, qualified_names, source_totals = load_direct_wide_tables(
+            connection, cfg, preflight_only=preflight_only
+        )
+    finally:
+        connection.close()
+    resolved_by_source = {
+        "MBSCohort": resolve_wide_fields(frames["MBSCohort"], "MBSCohort"),
+        "GLP1Cohort": resolve_wide_fields(frames["GLP1Cohort"], "GLP1Cohort"),
+    }
+    mbs = sort_wide_by_patient(frames["MBSCohort"], resolved_by_source["MBSCohort"])
+    glp1 = sort_wide_by_patient(frames["GLP1Cohort"], resolved_by_source["GLP1Cohort"])
+    page = int(patient_page) if patient_page is not None else _acquire_patient_page()
+
+    accum = AcquireAccumulators()
+    batch_meta = WideBatchMeta()
+    light_patient_frames: list[Any] = []
+    procedure_frames: list[Any] = []
+    medication_frames: list[Any] = []
+    raw_measurement_count = 0
+    raw_measurement_date_null = False
+    raw_measurement_columns: set[str] = set()
+    light_columns = list(_LIGHT_PATIENT_COLUMNS)
+    spill_dir = Path(tempfile.mkdtemp(prefix="metabolic-acquire-meas-"))
+    spill = MeasurementSpill(spill_dir)
+    try:
+        for batch_index, (mbs_batch, glp1_batch) in enumerate(
+            iter_patient_batches(mbs, glp1, resolved_by_source, page)
+        ):
+            bundle_batch, meta_batch = _wide_tables_to_batch_bundle(
+                mbs_batch, glp1_batch, resolved_by_source, qualified_names, qualifying_days
+            )
+            _accumulate_wide_batch_meta(batch_meta, meta_batch)
+            _construct_cohorts_batch(bundle_batch, accum, spill)
+            light_patient_frames.append(bundle_batch.patients[light_columns].copy())
+            procedure_frames.append(bundle_batch.procedures)
+            medication_frames.append(bundle_batch.medications)
+            raw_measurement_count += int(len(bundle_batch.measurements))
+            raw_measurement_columns.update(str(column) for column in bundle_batch.measurements.columns)
+            if "measurement_date" in bundle_batch.measurements and bundle_batch.measurements["measurement_date"].isna().any():
+                raw_measurement_date_null = True
+            del bundle_batch, meta_batch, mbs_batch, glp1_batch
+            log_peak_rss(f"acquire batch {batch_index}")
+        cohort_artifacts = finalize_cohort_artifacts(accum, spill)
+    finally:
+        shutil.rmtree(spill_dir, ignore_errors=True)
+
+    metadata = build_wide_metadata(
+        sql, qualified_names, frames, resolved_by_source, source_totals, batch_meta
+    )
+    metadata["incretin_qualifying_days"] = qualifying_days
+    metadata["incretin_qualifying_months"] = int(cfg.incretin_qualifying_months)
+
+    light_patients = concat_frames(light_patient_frames)
+    procedures_whole = concat_frames(procedure_frames)
+    medications_whole = concat_frames(medication_frames)
+    empty_encounters = pd.DataFrame(columns=["patient_id", "encounter_date", "source_table"])
+    empty_diagnoses = pd.DataFrame(columns=["patient_id", "diagnosis_date", "diagnosis_code", "source_table"])
+
+    # The preflight is a whole-bundle validation whose result reaches the figure payload's identity
+    # block, so it runs once here over the resident light patient frame, the resident procedure and
+    # medication tables, and the materialized measurements - the exact frames it reads.
+    validation_bundle = DataBundle(
+        patients=light_patients,
+        procedures=procedures_whole,
+        medications=medications_whole,
+        measurements=cohort_artifacts["measurements"],
+        encounters=empty_encounters,
+        diagnoses=empty_diagnoses,
+        metadata=metadata,
+    )
+    metadata["preflight"] = validate_data_bundle(
+        validation_bundle,
+        preflight_only=preflight_only,
+        measurement_summary={
+            "count": raw_measurement_count,
+            "date_has_null": raw_measurement_date_null,
+            "columns": raw_measurement_columns,
+        },
+    )
+
+    # The bundle handed back is metadata-plus-medications: the run-context fingerprint reads the
+    # patient administrative-end dates, the gap-rule sensitivity reads the medication table, and the
+    # light checkpoint keeps only metadata. Every large event frame is already consumed.
+    light_bundle = DataBundle(
+        patients=light_patients,
+        procedures=procedures_whole.iloc[0:0].copy(),
+        medications=medications_whole,
+        measurements=cohort_artifacts["measurements"].iloc[0:0].copy(),
+        encounters=empty_encounters,
+        diagnoses=empty_diagnoses,
+        metadata=metadata,
+    )
+    return cohort_artifacts, light_bundle
 
 
 def stable_hash_fraction(value: str, seed: int) -> float:
@@ -3809,7 +4651,7 @@ def assign_global_splits(cohorts: Any, seed: int = SEED) -> tuple[Any, dict[str,
     manifest["split"] = manifest["patient_id"].astype(str).map(labels)
     if manifest["split"].isna().any():
         raise LeakageError("At least one cohort row lacks a global patient split")
-    patient_split_counts = manifest.groupby("patient_id")["split"].nunique()
+    patient_split_counts = manifest.groupby("patient_id", observed=True)["split"].nunique()
     if int(patient_split_counts.max()) != 1:
         raise LeakageError("A patient was assigned to more than one split")
     development_center_overlap = set(
@@ -3857,6 +4699,12 @@ PREDICTION_ROW_CHUNK = 250_000
 # from ~40-60 bytes/row (a pointer plus str object) to 1-4 bytes/row, and the reduction is
 # exactly lossless. patient_id is included because, although high-cardinality, every id is
 # repeated across ~20-45 origin/target rows, so category codes still roughly halve it.
+#
+# Every groupby keyed on these columns passes observed=True explicitly. pandas only made that
+# the default in 3.0; on older versions the default emits the full cartesian product of the
+# category levels, so the six-key metrics groupby would yield thousands of empty groups that
+# become nan-filled rows in the released metrics table. Pinning it keeps one behavior across
+# every supported pandas rather than making results depend on the VM's installed version.
 PREDICTION_ROW_CATEGORY_COLUMNS = (
     "patient_id", "cohort", "outcome", "support_status", "split", "center_id",
     "treatment", "procedure", "index_ingredient", "index_route", "therapy_class",
@@ -3916,26 +4764,56 @@ def compact_prediction_chunk(frame: Any, category_dtypes: Mapping[str, Any]) -> 
     return converted
 
 
-def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
+def assign_chunk_row_ids(frame: Any, offset: int) -> Any:
+    """Stamp a chunk with its slice of the study-wide row identifier.
+
+    row_id used to be assigned during weight estimation as one arange over the assembled table.
+    Assigning it here, as a running counter over the chunks in the order they are built, produces
+    exactly the same values - the assembled table was the chunks concatenated in this order - and
+    is what allows the table to be written straight out to task partitions without ever existing
+    as one frame. Everything that joins predictions back together depends on these values being
+    unique study-wide: the ensemble intersects candidates on row_id, the paired bootstrap merges
+    on it, and the ODE candidate scatters its predictions back by it.
+    """
+    if offset + len(frame) > np.iinfo(np.int32).max:
+        raise PreflightError(
+            "Prediction-row table exceeds the row-identifier range",
+            [f"more than {np.iinfo(np.int32).max:,} prediction rows exceed the int32 row_id limit"],
+        )
+    # int32 rather than the platform default: row_id is carried on every stored prediction row of
+    # every candidate, so the four bytes per row it saves are multiplied by the candidate count.
+    frame["row_id"] = np.arange(offset, offset + len(frame), dtype=np.int32)
+    return frame
+
+
+def build_prediction_rows(cohorts_with_splits: Any, measurements: Any, store: "RowStore") -> "RowStore":
+    """Build the prediction-row table straight into its task partitions.
+
+    Chunks are flushed at patient boundaries and routed to partitions by task, so neither the
+    list of per-row dicts nor the assembled table ever exists in full. A chunk spans every task
+    the patients in it contribute to, so the store splits it rather than taking a single key.
+    """
     rows: list[dict[str, Any]] = []
-    # Flush accumulated rows into compact frames at patient boundaries so the full list of
-    # per-row dicts (several times the size of the final table) never coexists with it at
-    # production scale; concatenating the chunks is identical to one DataFrame(rows).
-    frames: list[Any] = []
+    row_id_offset = 0
     chunk_rows = PREDICTION_ROW_CHUNK
-    # Fixed categorical dtypes applied to every flushed chunk so the assembled table stores
-    # its many repeated string columns as small integer codes rather than object-dtype
-    # Python strings. Derived once up front because pd.concat only preserves `category`
-    # across chunks whose dtypes match exactly.
+    # Fixed categorical dtypes applied to every flushed chunk so the table stores its many
+    # repeated string columns as small integer codes rather than object-dtype Python strings.
+    # Derived once up front rather than per chunk: every file in a partition must share one
+    # schema, both because the parquet dataset reader infers the dataset schema from the first
+    # fragment it opens and because pd.concat only preserves `category` across frames whose
+    # dtypes match exactly - a differing category set silently upcasts back to object on read.
     category_dtypes = prediction_row_category_dtypes(cohorts_with_splits)
     # Map each patient to integer row positions once (instead of materializing one
     # sub-frame per patient), so peak memory stays low at production scale.
-    measurement_positions = measurements.groupby("patient_id", sort=False).indices
+    measurement_positions = measurements.groupby("patient_id", sort=False, observed=True).indices
     empty_measurements = measurements.iloc[0:0]
     for patient in cohorts_with_splits.itertuples(index=False):
         if len(rows) >= chunk_rows:
-            frames.append(compact_prediction_chunk(pd.DataFrame(rows), category_dtypes))
+            chunk = assign_chunk_row_ids(compact_prediction_chunk(pd.DataFrame(rows), category_dtypes), row_id_offset)
+            row_id_offset += len(chunk)
+            store.add(chunk)
             rows = []
+            del chunk
         payload = patient._asdict()
         positions = measurement_positions.get(str(patient.patient_id))
         patient_measurements = empty_measurements if positions is None else measurements.take(positions)
@@ -4012,7 +4890,11 @@ def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
                         "last_measurement_day": last_day,
                         "measurement_recency_days": origin_day - last_day,
                         "change_from_baseline_at_origin": last_value - float(baseline_value),
-                        "percent_change_from_baseline_at_origin": 100.0 * (last_value - float(baseline_value)) / float(baseline_value),
+                        "percent_change_from_baseline_at_origin": (
+                            100.0 * (last_value - float(baseline_value)) / float(baseline_value)
+                            if float(baseline_value) != 0
+                            else np.nan
+                        ),
                         "robust_slope_per_year": robust_slope(history_days, history_values),
                         "within_patient_variability": float(np.std(history_values, ddof=0)),
                         "history_measurement_count": int(len(history)),
@@ -4045,48 +4927,122 @@ def build_prediction_rows(cohorts_with_splits: Any, measurements: Any) -> Any:
                     }
                     rows.append(row)
     if rows:
-        frames.append(compact_prediction_chunk(pd.DataFrame(rows), category_dtypes))
-    if not frames:
+        chunk = assign_chunk_row_ids(compact_prediction_chunk(pd.DataFrame(rows), category_dtypes), row_id_offset)
+        row_id_offset += len(chunk)
+        store.add(chunk)
+        del chunk, rows
+    if not store.row_count:
         raise PreflightError("Prediction-row construction produced no rows", ["No eligible origin and future-target combinations remain"])
-    return frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
+    return store
+
+
+# Columns the leakage audit reads, so a store-backed audit projects eight of the fifty-five.
+LEAKAGE_AUDIT_COLUMNS = (
+    "patient_id", "split", "center_id", "feature_max_day", "origin_day",
+    "target_day", "target_observed", "effective_censor_day",
+)
+DEVELOPMENT_SPLITS = ("train", "validation", "calibration")
+FINAL_TEST_SPLITS = ("temporal_test", "geographic_test")
+
+
+class LeakageAccumulator:
+    """Running state for the leakage audit, so it can be evaluated over a partitioned table.
+
+    Three of the seven assertions are study-wide by construction - a patient must not appear in
+    two splits, held-out centers must not appear in development, and calibration patients must
+    not appear in the final tests - and their whole point is to catch a patient or center labeled
+    one way under one task and another way under another. Evaluated per task they would pass
+    trivially, so the audit is a real invariant only if the state crosses partitions.
+
+    All three are carried by one deduplicated frame of the distinct (patient_id, split) pairs
+    seen so far, plus a set of development center ids. Deduplicating after every partition keeps
+    that frame at roughly one row per patient rather than one per table row - splits are assigned
+    per patient, so a patient contributes the same pair from every task it appears in - which is
+    what makes it affordable to carry across the whole table. The two patient-level assertions
+    are then evaluated with the same expressions the unpartitioned audit used.
+    """
+
+    def __init__(self) -> None:
+        self.patient_splits = pd.DataFrame({"patient_id": [], "split": []}, dtype=object)
+        self.development_centers: set[str] = set()
+        self.saw_geographic_test = False
+        self.feature_violations = 0
+        self.target_violations = 0
+        self.censor_violations = 0
+
+    def update(self, frame: Any) -> None:
+        if frame is None or frame.empty:
+            return
+        pairs = frame[["patient_id", "split"]].astype(object).drop_duplicates()
+        self.patient_splits = pd.concat([self.patient_splits, pairs], ignore_index=True).drop_duplicates()
+        development = frame["split"].isin(DEVELOPMENT_SPLITS)
+        self.development_centers.update(str(value) for value in frame.loc[development, "center_id"].unique())
+        self.saw_geographic_test = self.saw_geographic_test or bool(frame["split"].eq("geographic_test").any())
+        self.feature_violations += int((frame["feature_max_day"] > frame["origin_day"]).sum())
+        self.target_violations += int((frame["target_day"] <= frame["origin_day"]).sum())
+        observed = frame.loc[frame["target_observed"] & frame["effective_censor_day"].notna()]
+        self.censor_violations += int((observed["target_day"] >= observed["effective_censor_day"]).sum())
+
+    @property
+    def max_splits_per_patient(self) -> int:
+        if self.patient_splits.empty:
+            return 0
+        return int(self.patient_splits.groupby("patient_id", observed=True)["split"].nunique().max())
+
+    @property
+    def calibration_leaks_into_tests(self) -> bool:
+        pairs = self.patient_splits
+        calibration = set(pairs.loc[pairs["split"].eq("calibration"), "patient_id"])
+        tests = set(pairs.loc[pairs["split"].isin(FINAL_TEST_SPLITS), "patient_id"])
+        return bool(calibration.intersection(tests))
+
+    def result(self, split_metadata: Mapping[str, Any]) -> Any:
+        checks: list[dict[str, Any]] = []
+
+        def record(name: str, passed: bool, detail: str) -> None:
+            checks.append({"assertion": name, "passed": bool(passed), "detail": detail})
+
+        maximum_splits = self.max_splits_per_patient
+        record("Patient IDs never overlap splits", maximum_splits == 1, f"max split count per patient = {maximum_splits}")
+        heldout = set(split_metadata.get("heldout_centers", []))
+        overlap = heldout.intersection(self.development_centers)
+        if split_metadata.get("center_validation_available", True):
+            record("Held-out centers absent from development", not bool(overlap), f"overlap count = {len(overlap)}")
+        else:
+            record(
+                "Geographic validation is explicitly unavailable",
+                not self.saw_geographic_test,
+                "no usable center identifiers and no geographic-test rows",
+            )
+        record("Every feature timestamp is at or before origin", self.feature_violations == 0, f"violations = {self.feature_violations}")
+        record("Every target is strictly after origin", self.target_violations == 0, f"violations = {self.target_violations}")
+        record("No observed target is on or after treatment or surgery censoring", self.censor_violations == 0, f"violations = {self.censor_violations}")
+        record("Outcome processing is frozen before test scoring", True, "Window and plausibility constants are module-level protocol values")
+        record("Calibration patients are separate from final tests", not self.calibration_leaks_into_tests, "patient-level set intersection checked")
+        audit = pd.DataFrame(checks)
+        if not bool(audit["passed"].all()):
+            failures = audit.loc[~audit["passed"], "assertion"].tolist()
+            raise LeakageError("Leakage audit failed: " + "; ".join(failures))
+        return audit
 
 
 def leakage_audit(rows: Any, split_metadata: Mapping[str, Any]) -> Any:
-    checks: list[dict[str, Any]] = []
+    """Audit a single in-memory prediction-row frame."""
+    accumulator = LeakageAccumulator()
+    accumulator.update(rows)
+    return accumulator.result(split_metadata)
 
-    def record(name: str, passed: bool, detail: str) -> None:
-        checks.append({"assertion": name, "passed": bool(passed), "detail": detail})
 
-    patient_split = rows.groupby("patient_id")["split"].nunique()
-    record("Patient IDs never overlap splits", bool(patient_split.max() == 1), f"max split count per patient = {int(patient_split.max())}")
-    heldout = set(split_metadata.get("heldout_centers", []))
-    development_centers = set(rows.loc[rows["split"].isin(["train", "validation", "calibration"]), "center_id"])
-    if split_metadata.get("center_validation_available", True):
-        record(
-            "Held-out centers absent from development",
-            not bool(heldout.intersection(development_centers)),
-            f"overlap count = {len(heldout.intersection(development_centers))}",
-        )
-    else:
-        record(
-            "Geographic validation is explicitly unavailable",
-            not bool(rows["split"].eq("geographic_test").any()),
-            "no usable center identifiers and no geographic-test rows",
-        )
-    feature_ok = bool(rows["feature_max_day"].le(rows["origin_day"]).all())
-    record("Every feature timestamp is at or before origin", feature_ok, f"violations = {int((rows['feature_max_day'] > rows['origin_day']).sum())}")
-    target_ok = bool(rows["target_day"].gt(rows["origin_day"]).all())
-    record("Every target is strictly after origin", target_ok, f"violations = {int((rows['target_day'] <= rows['origin_day']).sum())}")
-    observed = rows.loc[rows["target_observed"] & rows["effective_censor_day"].notna()]
-    censor_ok = bool(observed["target_day"].lt(observed["effective_censor_day"]).all())
-    record("No observed target is on or after treatment or surgery censoring", censor_ok, f"violations = {int((observed['target_day'] >= observed['effective_censor_day']).sum())}")
-    record("Outcome processing is frozen before test scoring", True, "Window and plausibility constants are module-level protocol values")
-    record("Calibration patients are separate from final tests", not bool(set(rows.loc[rows['split'].eq('calibration'), 'patient_id']).intersection(set(rows.loc[rows['split'].isin(['temporal_test', 'geographic_test']), 'patient_id']))), "patient-level set intersection checked")
-    audit = pd.DataFrame(checks)
-    if not bool(audit["passed"].all()):
-        failures = audit.loc[~audit["passed"], "assertion"].tolist()
-        raise LeakageError("Leakage audit failed: " + "; ".join(failures))
-    return audit
+def leakage_audit_over_store(store: "RowStore", split_metadata: Mapping[str, Any]) -> Any:
+    """Audit the partitioned prediction-row table, one task at a time.
+
+    Shares LeakageAccumulator with the single-frame entry point so the two can never disagree
+    about what the invariant is or how a violation is described.
+    """
+    accumulator = LeakageAccumulator()
+    for key in store.keys():
+        accumulator.update(store.read(key, columns=LEAKAGE_AUDIT_COLUMNS))
+    return accumulator.result(split_metadata)
 
 
 # ======================================================================================
@@ -4247,19 +5203,27 @@ def max_weighted_smd(frame: Any, weight_column: str, group_column: str) -> float
 
 
 def estimate_cross_fitted_weights(rows: Any, seed: int = SEED) -> tuple[Any, Any]:
-    # No defensive .copy(): weight estimation only writes newly-created columns (row_id,
-    # probabilities, weights) and reads the rest, so copy-on-write leaves the existing columns
-    # shared with the caller's frame, which is released immediately after this stage. This
-    # avoids duplicating the full prediction-row table at production scale.
+    """Estimate censoring/observation weights for one task's prediction rows.
+
+    Every quantity here is derived within a (cohort, outcome, origin_month, target_month) group -
+    the encoder, the cross-fitting folds, the nuisance models, and the truncation quantiles - so
+    running this over one task at a time is identical to running it over the assembled table.
+    row_id is assigned at construction (see assign_chunk_row_ids) rather than here, because it is
+    the one quantity that must be unique study-wide.
+    """
+    # No defensive .copy(): weight estimation only writes newly-created columns (probabilities,
+    # weights) and reads the rest, so copy-on-write leaves the existing columns shared with the
+    # caller's frame, which is released immediately after this stage.
     weighted = rows.reset_index(drop=True)
-    weighted["row_id"] = np.arange(len(weighted), dtype=int)
-    weighted["treatment_probability"] = np.nan
-    weighted["observation_probability"] = np.nan
-    weighted["analysis_weight_untruncated"] = np.nan
+    # Only analysis_weight is materialized. The nuisance probabilities and the untruncated weight
+    # were carried as three more float64 columns on the second-largest table in the run and read
+    # by nothing: every quantity reported from them - the positivity gate, the effective sample
+    # size, the weight quantiles, the balance SMD - is computed below from the loop's own arrays
+    # and lands in the small per-group diagnostics frame.
     weighted["analysis_weight"] = np.nan
     diagnostics: list[dict[str, Any]] = []
     group_columns = ["cohort", "outcome", "origin_month", "target_month"]
-    for keys, group in weighted.groupby(group_columns, sort=True):
+    for keys, group in weighted.groupby(group_columns, sort=True, observed=True):
         mature = group.loc[group["administratively_mature"]].copy()
         train = mature.loc[mature["split"].eq("train")].copy()
         if train.empty:
@@ -4320,9 +5284,6 @@ def estimate_cross_fitted_weights(rows: Any, seed: int = SEED) -> tuple[Any, Any
         else:
             low, high = np.nan, np.nan
             truncated = raw_weight
-        weighted.loc[group.index, "treatment_probability"] = all_treatment_prob
-        weighted.loc[group.index, "observation_probability"] = all_observation_prob
-        weighted.loc[group.index, "analysis_weight_untruncated"] = raw_weight
         weighted.loc[group.index, "analysis_weight"] = truncated
         observed_weights = truncated[np.isfinite(truncated)]
         ess = effective_sample_size(observed_weights)
@@ -4360,15 +5321,73 @@ def estimate_cross_fitted_weights(rows: Any, seed: int = SEED) -> tuple[Any, Any
     return weighted, pd.DataFrame(diagnostics)
 
 
+def estimate_weights_over_store(source: "RowStore", target: "RowStore", seed: int = SEED) -> tuple[Any, Any]:
+    """Weight the prediction-row table one task at a time, writing a weighted store.
+
+    Tasks are visited in sorted key order and each task's groups are visited in sorted
+    target_month order, which together is exactly the order the single study-wide groupby on
+    (cohort, outcome, origin_month, target_month) visited them - so the concatenated diagnostics
+    frame is row-for-row what the unpartitioned estimator produced.
+    """
+    diagnostics_frames: list[Any] = []
+    for key in source.keys():
+        task = source.read(key)
+        weighted, diagnostics = estimate_cross_fitted_weights(task, seed)
+        target.add(weighted, key=key)
+        diagnostics_frames.append(diagnostics)
+        del task, weighted, diagnostics
+        gc.collect()
+    return target, concat_frames(diagnostics_frames)
+
+
+# The complete candidate and architecture rosters, listed in sorted order. Both are stored as
+# `category`, and pandas orders a categorical by its category sequence rather than
+# lexicographically - so keeping these sorted is what makes groupby(sort=True) and the
+# `candidate` tiebreaker in select_models behave exactly as they did when the columns were plain
+# object-dtype strings. Any new candidate must be inserted in sorted position.
+CANDIDATE_LEVELS = (
+    "catboost_multi_quantile", "histogram_gradient_boosting", "persistence", "population_change",
+    "pytorch_ode_rnn", "pytorch_quantile_mlp", "regularized_spline", "validation_weighted_ensemble",
+)
+ARCHITECTURE_LEVELS = (
+    "architecture_ensemble", "catboost_multi_quantile", "context_conditioned_ode_rnn",
+    "direct_horizon_mlp", "empirical_baseline", "hist_gradient_boosting_quantile",
+    "ridge_cubic_spline",
+)
+
+
+def constant_label_column(value: str, levels: Sequence[str], length: int) -> Any:
+    """A length-`length` categorical column holding `value` on every row.
+
+    Built from codes so labelling a candidate's predictions allocates one int8 array rather than
+    one Python string reference per row. These two labels are repeated across every prediction
+    row of every candidate, which at production scale is the difference between a few bytes and
+    ~60 bytes per row per column.
+    """
+    if value not in levels:
+        raise RuntimeError(f"Label {value!r} is not in its declared roster {tuple(levels)!r}")
+    dtype = pd.CategoricalDtype(categories=list(levels))
+    return pd.Categorical.from_codes(np.full(length, levels.index(value), dtype=np.int8), dtype=dtype)
+
+
+PREDICTION_IDENTITY_COLUMNS = (
+    "row_id", "patient_id", "cohort", "outcome", "origin_month", "target_month", "split",
+    "target_value", "target_observed", "analysis_weight", "support_status", "treatment",
+    "center_id", "prediction_reference_value",
+)
+# The exact schema of the stored prediction table. Every frame is projected onto it on the way
+# into the prediction store, which drops the per-candidate `model_detail` string (written by
+# several fitters, read by nothing - the ensemble's weights are reported through
+# details["ensemble_weights"] instead) and guarantees one identical schema across partitions.
+STORED_PREDICTION_COLUMNS = PREDICTION_IDENTITY_COLUMNS + ("candidate", "architecture") + QUANTILE_COLUMNS
+# The task triple every downstream reduction groups within.
+TASK_COLUMNS = ("cohort", "outcome", "origin_month")
+
+
 def prediction_identity(frame: Any, candidate: str, architecture: str) -> Any:
-    columns = [
-        "row_id", "patient_id", "cohort", "outcome", "origin_month", "target_month", "split",
-        "target_value", "target_observed", "analysis_weight", "support_status", "treatment",
-        "center_id", "prediction_reference_value",
-    ]
-    result = frame[columns].copy()
-    result["candidate"] = candidate
-    result["architecture"] = architecture
+    result = frame[list(PREDICTION_IDENTITY_COLUMNS)].copy()
+    result["candidate"] = constant_label_column(candidate, CANDIDATE_LEVELS, len(result))
+    result["architecture"] = constant_label_column(architecture, ARCHITECTURE_LEVELS, len(result))
     return result
 
 
@@ -5001,21 +6020,23 @@ def build_ode_rnn(
 
 def ode_suitability_gates(cohorts: Any, measurements: Any, dependencies: Mapping[str, Any]) -> Any:
     rows: list[dict[str, Any]] = []
-    development_patients = set(cohorts.loc[cohorts["split"].isin(["train", "validation"]), "patient_id"].astype(str))
+    # Both id columns are converted once. Each was previously re-converted inside the loop -
+    # measurements four times over - and each conversion allocates one Python string per row of
+    # the measurement table, the largest frame this stage touches.
+    cohort_patient_ids = cohorts["patient_id"].astype(str)
+    measurement_patient_ids = measurements["patient_id"].astype(str)
+    development_patients = set(cohort_patient_ids.loc[cohorts["split"].isin(["train", "validation"])])
     for cohort_name in ("surgery", "incretin"):
-        cohort_patients = set(
-            cohorts.loc[
-                cohorts["cohort"].eq(cohort_name) & cohorts["patient_id"].astype(str).isin(development_patients), "patient_id"
-            ].astype(str)
-        )
+        in_cohort = cohorts["cohort"].eq(cohort_name)
+        cohort_patients = set(cohort_patient_ids.loc[in_cohort & cohort_patient_ids.isin(development_patients)])
         for outcome in ("bmi", "hba1c"):
             subset = measurements.loc[
-                measurements["patient_id"].astype(str).isin(cohort_patients) & measurements["outcome"].eq(outcome)
+                measurement_patient_ids.isin(cohort_patients) & measurements["outcome"].eq(outcome)
             ].copy()
-            counts = subset.groupby("patient_id").size()
+            counts = subset.groupby("patient_id", observed=True).size()
             repeated_fraction = float((counts >= 3).mean()) if len(counts) else 0.0
-            task_cohorts = cohorts.loc[cohorts["cohort"].eq(cohort_name) & cohorts["patient_id"].astype(str).isin(cohort_patients)]
-            strata_counts = task_cohorts.groupby("treatment")["patient_id"].nunique()
+            task_cohorts = cohorts.loc[in_cohort & cohort_patient_ids.isin(cohort_patients)]
+            strata_counts = task_cohorts.groupby("treatment", observed=True)["patient_id"].nunique()
             exact_dates = "measurement_date" in subset and subset["measurement_date"].notna().all()
             if exact_dates and "timing_precision" in subset:
                 exact_labels = {"exact", "exact_day", "index_event_date"}
@@ -5025,14 +6046,17 @@ def ode_suitability_gates(cohorts: Any, measurements: Any, dependencies: Mapping
             early_late = False
             if not subset.empty and exact_dates:
                 index_map = task_cohorts.drop_duplicates("patient_id").set_index("patient_id")["index_date"]
-                days = subset.apply(
-                    lambda row: (
-                        pd.Timestamp(row["measurement_date"])
-                        - pd.Timestamp(index_map.get(str(row["patient_id"]), row["measurement_date"]))
-                    ).days,
-                    axis=1,
+                # Vectorized rather than a row-wise apply, which ran one Python call per row of
+                # the measurement table for each of the four (cohort, outcome) pairs. Patients
+                # absent from the index map fall back to their own measurement date, giving a
+                # zero-day offset, exactly as the per-row lookup default did.
+                patients = subset["patient_id"].astype(str)
+                measurement_dates = pd.to_datetime(subset["measurement_date"])
+                reference = pd.to_datetime(patients.map(index_map)).where(
+                    patients.isin(index_map.index), measurement_dates
                 )
-                early_late = bool((days.between(0, 365)).any() and (days >= 730).any())
+                days = (measurement_dates - reference).dt.days
+                early_late = bool(days.between(0, 365).any() and (days >= 730).any())
             gates = {
                 "exact_day_timestamps": bool(exact_dates),
                 "development_patients_at_least_5000": len(cohort_patients) >= 5000,
@@ -5114,7 +6138,7 @@ def prepare_ode_examples(task: Any, cohorts: Any, measurements: Any, split: str 
     index_map = cohorts.drop_duplicates(["patient_id", "cohort"]).set_index(["patient_id", "cohort"])["index_date"].to_dict()
     measurement_groups = {
         (str(patient_id), str(outcome)): group
-        for (patient_id, outcome), group in measurements.groupby(["patient_id", "outcome"], sort=False)
+        for (patient_id, outcome), group in measurements.groupby(["patient_id", "outcome"], sort=False, observed=True)
     }
     sequence_times: list[list[float]] = []
     sequence_values: list[list[float]] = []
@@ -5314,6 +6338,71 @@ def fit_ode_candidate(task: Any, cohorts: Any, measurements: Any, cfg: RunConfig
 # ======================================================================================
 
 
+# Columns the two development-IQR reductions and the support table read off a partition.
+DEVELOPMENT_IQR_COLUMNS = ("cohort", "outcome", "target_month", "target_value", "split", "target_observed")
+SUPPORT_TABLE_COLUMNS = (
+    "cohort", "outcome", "origin_month", "target_month",
+    "support_status", "administratively_mature", "target_observed",
+)
+
+
+def development_target_values(store: "RowStore") -> dict[tuple[str, str, int], Any]:
+    """Train-split observed target values per (cohort, outcome, target_month), pooled over origins.
+
+    This is the one reduction in the study whose grouping key is not nested inside the task
+    triple: a target at month 12 is predicted from origin 0, 3 and 6, and the development IQR
+    that standardizes CRPS deliberately pools all of them. Streaming therefore has to accumulate
+    rather than reduce per task - but it accumulates a single float column restricted to observed
+    training rows, which is a small fraction of one column of the table, not the table.
+
+    The IQR is a function of the multiset of values, so pooling the per-task pieces in task order
+    rather than in original row order does not change it.
+    """
+    buckets: dict[tuple[str, str, int], list[Any]] = defaultdict(list)
+    for key in store.keys():
+        frame = store.read(key, columns=DEVELOPMENT_IQR_COLUMNS)
+        development = frame.loc[frame["split"].eq("train") & frame["target_observed"]]
+        for keys, group in development.groupby(["cohort", "outcome", "target_month"], sort=True, observed=True):
+            buckets[(str(keys[0]), str(keys[1]), int(keys[2]))].append(group["target_value"].to_numpy())
+        del frame, development
+    return {key: np.concatenate(pieces) for key, pieces in buckets.items() if len(pieces)}
+
+
+def development_iqr_scale_map_from_values(values_by_key: Mapping[tuple[str, str, int], Any]) -> dict[tuple[str, str, int], float]:
+    """See development_iqr_scale_map; coerces and drops non-numeric values as that path does."""
+    scales: dict[tuple[str, str, int], float] = {}
+    for key in sorted(values_by_key):
+        values = pd.to_numeric(pd.Series(values_by_key[key]), errors="coerce").dropna().to_numpy(float)
+        if len(values):
+            q25, q75 = np.quantile(values, [0.25, 0.75])
+            scales[key] = max(float(q75 - q25), 1e-8)
+    return scales
+
+
+def development_iqr_by_task_from_values(values_by_key: Mapping[tuple[str, str, int], Any]) -> Any:
+    """See development_iqr_by_task; deliberately does not drop non-numeric values, as that path
+    does not either, so the two keep their historical difference in the presence of missing
+    target values."""
+    rows = []
+    for key in sorted(values_by_key):
+        q25, q75 = np.quantile(values_by_key[key], [0.25, 0.75])
+        rows.append(
+            {
+                "cohort": key[0], "outcome": key[1], "target_month": key[2],
+                "development_iqr": max(float(q75 - q25), 1e-8),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def target_support_table_over_store(store: "RowStore") -> Any:
+    """See target_support_table; its grouping key refines the task triple, so it decomposes
+    exactly and the per-task pieces concatenate in the order the single groupby produced."""
+    return concat_frames([
+        target_support_table(store.read(key, columns=SUPPORT_TABLE_COLUMNS)) for key in store.keys()
+    ])
+
+
 def development_iqr_scale_map(weighted_rows: Any) -> dict[tuple[str, str, int], float]:
     """Per-(cohort, outcome, target_month) development IQR used to standardize CRPS.
 
@@ -5327,7 +6416,7 @@ def development_iqr_scale_map(weighted_rows: Any) -> dict[tuple[str, str, int], 
         weighted_rows["split"].eq("train") & weighted_rows["target_observed"]
     ]
     scales: dict[tuple[str, str, int], float] = {}
-    for keys, group in development.groupby(["cohort", "outcome", "target_month"], sort=True):
+    for keys, group in development.groupby(["cohort", "outcome", "target_month"], sort=True, observed=True):
         values = pd.to_numeric(group["target_value"], errors="coerce").dropna().to_numpy(float)
         if len(values):
             q25, q75 = np.quantile(values, [0.25, 0.75])
@@ -5340,10 +6429,14 @@ def drop_training_predictions(frame: Any) -> Any:
 
     No evaluator scores training-split predictions: the validation leaderboard uses the
     validation split, conformal calibration uses the calibration split, and every test metric
-    uses the temporal/geographic test splits. Training is ~65% of patients, so removing these
-    rows shrinks the stored prediction table roughly threefold with no effect on any output.
-    The development IQR scale, the one quantity that read train-split predictions, now comes
-    from development_iqr_scale_map(weighted_rows) instead.
+    uses the temporal/geographic test splits. The development IQR scale, the one quantity that
+    read train-split predictions, now comes from development_iqr_scale_map(weighted_rows).
+
+    The 0.65 train fraction in assign_global_splits applies only to the development pool, which
+    is itself what remains after the ~20% geographic and ~20% temporal holdouts - so train is
+    ~42% of all rows, not 65%, and dropping it shrinks the stored table by a little under half.
+    Worth stating plainly because the earlier "roughly threefold" estimate understated every
+    downstream frame by ~1.75x.
     """
     return frame.loc[frame["split"].ne("train")]
 
@@ -5379,9 +6472,9 @@ def equal_horizon_standardized_crps(
 
 def candidate_validation_scores(predictions: Any, scale_map: Mapping[tuple[str, str, int], float]) -> Any:
     rows: list[dict[str, Any]] = []
-    observed = predictions.loc[predictions["split"].eq("validation") & predictions["target_observed"]].copy()
+    scored = predictions.loc[predictions["split"].eq("validation") & predictions["target_observed"]].copy()
     group_columns = ["cohort", "outcome", "origin_month", "candidate", "architecture"]
-    for keys, group in observed.groupby(group_columns, sort=True):
+    for keys, group in scored.groupby(group_columns, sort=True, observed=True):
         matrix = group[list(QUANTILE_COLUMNS)].to_numpy(float)
         y = group["target_value"].to_numpy(float)
         weights = group["analysis_weight"].to_numpy(float)
@@ -5405,10 +6498,10 @@ def candidate_validation_scores(predictions: Any, scale_map: Mapping[tuple[str, 
 
 
 def compute_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Mapping[tuple[str, str, int], float]) -> tuple[list[Any], Any]:
-    # Return the list of ensemble prediction frames WITHOUT concatenating them onto `predictions`;
-    # the caller appends them through the prediction spill so the combined frame is never doubled.
-    # An empty leaderboard means no ensemble is formed, so return an empty list (not `predictions`)
-    # to keep the caller's `if ensemble_frames:` a plain list truth-test.
+    # `predictions` is one task's partition. Return the ensemble frames WITHOUT concatenating them
+    # onto it; the caller appends them to that same partition in the store, so the task is never
+    # held twice. An empty leaderboard means no ensemble is formed, so return an empty list (not
+    # `predictions`) to keep the caller's `if ensemble_frames:` a plain list truth-test.
     leaderboard = candidate_validation_scores(predictions, scale_map)
     if leaderboard.empty:
         return [], pd.DataFrame()
@@ -5439,8 +6532,16 @@ def compute_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Map
             candidate: task.loc[task["candidate"].eq(candidate)].sort_values("row_id")
             for candidate in selected_candidates
         }
-        shared_ids = set.intersection(*(set(frame["row_id"]) for frame in candidate_frames.values()))
-        if not shared_ids:
+        # Intersect on numpy arrays rather than Python sets: row_id is unique within a candidate
+        # frame, so a set of boxed ints cost ~60 bytes per row per candidate for a result that a
+        # sorted int array gives in a few bytes per row. np.intersect1d returns sorted unique
+        # values, which is the same membership the set produced.
+        shared_ids = candidate_frames[selected_candidates[0]]["row_id"].to_numpy()
+        for candidate in selected_candidates[1:]:
+            shared_ids = np.intersect1d(
+                shared_ids, candidate_frames[candidate]["row_id"].to_numpy(), assume_unique=True
+            )
+        if not len(shared_ids):
             continue
         matrices = []
         identity: Any | None = None
@@ -5494,12 +6595,11 @@ def compute_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Map
             sum(weight * item for weight, item in zip(best_weights, matrices, strict=False))
         )
         ensemble = identity.copy()
-        ensemble["candidate"] = "validation_weighted_ensemble"
-        ensemble["architecture"] = "architecture_ensemble"
+        # Assigning a scalar would replace these with object-dtype columns; keep the fixed
+        # categorical dtype so every stored partition shares one schema.
+        ensemble["candidate"] = constant_label_column("validation_weighted_ensemble", CANDIDATE_LEVELS, len(ensemble))
+        ensemble["architecture"] = constant_label_column("architecture_ensemble", ARCHITECTURE_LEVELS, len(ensemble))
         ensemble[list(QUANTILE_COLUMNS)] = stored_quantiles(all_matrix)
-        ensemble["model_detail"] = " | ".join(
-            f"{candidate}={weight:.4f}" for candidate, weight in zip(selected_candidates, best_weights, strict=False)
-        )
         ensemble_predictions.append(ensemble)
         for candidate, architecture_weight in zip(selected_candidates, best_weights, strict=False):
             weight_rows.append(
@@ -5516,80 +6616,250 @@ def compute_ensemble_candidates(predictions: Any, cfg: RunConfig, scale_map: Map
     return ensemble_predictions, pd.DataFrame(weight_rows)
 
 
-class PredictionSpill:
-    """Assemble the combined prediction frame without ever holding the per-candidate list and the
-    concatenated result in memory at the same time.
+def concat_frames(frames: Sequence[Any]) -> Any:
+    """Concatenate the per-task pieces of a reduction, ignoring empty ones.
 
-    With pyarrow each added frame is written to its own numbered parquet file and then freed;
-    combine() reads every file back as one Arrow table in add-order and converts it with
-    self_destruct=True (Arrow buffers are released as the pandas frame is built), so the peak is
-    ~1x the combined frame instead of the ~2x that pd.concat holds transiently. Without pyarrow it
-    falls back to the historical in-memory list + pd.concat: numerically identical, and it frees
-    the per-candidate list as soon as the concat is built so it never regresses below the old
-    code's memory profile. The zero-padded filenames make add-order == read-order, which is what
-    keeps the result byte-for-byte identical to pd.concat(pieces, ignore_index=True).
+    Every streamed reduction builds one small frame per task and joins them here. Dropping the
+    empties keeps the result identical to the single pd.DataFrame(rows) the unstreamed code
+    built - including the columnless empty frame it returned when there were no rows at all.
+    """
+    kept = [frame for frame in frames if frame is not None and not frame.empty]
+    if not kept:
+        return pd.DataFrame()
+    if len(kept) == 1:
+        return kept[0].reset_index(drop=True)
+    return pd.concat(kept, ignore_index=True)
+
+
+# Column projections for the streamed reductions. Reading six of twenty-three columns off a
+# partition costs six, so each consumer declares exactly what it touches.
+EVALUATION_COLUMNS = TASK_COLUMNS + (
+    "target_month", "candidate", "split", "target_observed", "target_value", "analysis_weight",
+) + QUANTILE_COLUMNS
+BOOTSTRAP_COLUMNS = EVALUATION_COLUMNS + ("row_id", "patient_id", "center_id")
+SUBGROUP_COLUMNS = EVALUATION_COLUMNS + ("prediction_reference_value", "treatment")
+TRAJECTORY_COLUMNS = EVALUATION_COLUMNS + ("patient_id",)
+
+
+class TaskPartitionedStore:
+    """A study-scale table held on disk, partitioned by the (cohort, outcome, origin_month) task.
+
+    Two tables in this study are large enough that holding either one whole is what decides
+    whether the run fits in memory: the prediction table (every candidate's quantiles for every
+    scored row) and the prediction-row table itself (one row per patient-origin-target, ~53
+    columns). Neither is ever genuinely needed in full. Every reduction in the study groups by
+    keys nested inside the task triple - the ensemble, the validation leaderboard, conformal
+    calibration, the test metrics, both bootstraps, weight sensitivity, subgroups, trajectory
+    examples, weight estimation, and the support table - and the few that are not nested either
+    pool a single narrow column across origins (the development IQR) or run on a table with one
+    row per task (Benjamini-Hochberg). So both tables live here, and each pipeline stage's peak
+    is bounded by its largest single task rather than by the size of the study.
+
+    Each partition is a set of numbered files, one per frame added, read back in add order, so a
+    task's row order is exactly the order a pd.concat of the same frames would have produced.
+    Frames are projected onto a fixed column list on the way in so every file shares one schema;
+    subclasses either declare that list (STORED_COLUMNS) or adopt it from the first frame added.
+
+    A store lives inside the run directory and pickles as just its root path plus the partition
+    index, so an orchestrated worker hands it to the next stage without the payload ever
+    carrying table rows. Parquet is used when pyarrow is present, for its column projection on
+    read; otherwise partitions are pickled, which keeps the same streaming memory profile on a
+    VM without the wheel rather than falling back to one giant in-memory frame.
     """
 
-    def __init__(self) -> None:
-        self._parquet = _PARQUET_SPILL_ENABLED
-        self._dir = (
-            Path(tempfile.mkdtemp(prefix="metabolic-predspill-", dir=RUNTIME_CACHE))
-            if self._parquet
-            else None
+    # Declared by subclasses with a fixed schema; None means "adopt the first frame's columns".
+    STORED_COLUMNS: tuple[str, ...] | None = None
+    # Categorical columns trimmed to the values actually present before a partition file is
+    # written. Parquet embeds the entire category universe in every file it writes, so leaving
+    # the study-wide patient dictionary attached costs ~1.5 MB per file at 300k patients and
+    # rebuilds that whole dictionary in memory on every read - exactly the cost this store
+    # exists to avoid. Only the identifier columns are trimmed. Every low-cardinality column
+    # deliberately keeps its fixed roster: pandas orders a groupby by category order, and
+    # unifying trimmed dictionaries across a partition's files would order them by first
+    # appearance rather than by the fixed roster, silently changing grouped output row order.
+    TRIMMED_CATEGORY_COLUMNS: tuple[str, ...] = ("patient_id", "center_id")
+
+    def __init__(self, root: Path) -> None:
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.parquet = _PARQUET_SPILL_ENABLED
+        # partition name -> {"key": [cohort, outcome, origin_month], "files": [...], "rows": n}
+        self.partitions: dict[str, dict[str, Any]] = {}
+        # Counts every frame handed to add(), including empty ones, so callers can still
+        # distinguish "no candidate produced anything" from "every candidate failed".
+        self.frames_added = 0
+        # Set on first write for subclasses that adopt their schema; see _project.
+        self.columns: tuple[str, ...] | None = self.STORED_COLUMNS
+
+    @staticmethod
+    def partition_name(key: Sequence[Any]) -> str:
+        cohort, outcome, origin_month = key
+        safe = lambda value: re.sub(r"[^A-Za-z0-9]+", "-", str(value))
+        return f"{safe(cohort)}__{safe(outcome)}__origin{int(origin_month):03d}"
+
+    def keys(self) -> list[tuple[str, str, int]]:
+        """Task keys in sorted order - the order groupby(sort=True) visited them."""
+        return sorted(
+            (str(item["key"][0]), str(item["key"][1]), int(item["key"][2]))
+            for item in self.partitions.values()
         )
-        self._paths: list[str] = []
-        self._frames: list[Any] = []
-        self.count = 0
 
-    def add(self, frame: Any) -> None:
-        # Mirror pd.concat semantics exactly: record EVERY piece, including empty frames, in the
-        # order added. count drives the zero-padded filename so lexical order == add order.
-        if self._parquet:
-            path = self._dir / f"{self.count:08d}.parquet"
-            frame.to_parquet(path, engine="pyarrow", index=False)
-            self._paths.append(str(path))
-        else:
-            self._frames.append(frame)
-        self.count += 1
+    @property
+    def row_count(self) -> int:
+        return int(sum(item["rows"] for item in self.partitions.values()))
 
-    def combine(self) -> Any:
-        if self._parquet:
-            if not self._paths:
-                return pd.DataFrame()
-            # dataset(paths).to_table() reads the listed files in order and builds a single table.
-            # Deliberately NOT pa.concat_tables([read_table(p) ...]), which would double Arrow
-            # memory. The parquet files stay on disk, so combine() may be called again after more
-            # pieces are spilled (the ensemble append rebuilds from candidates + ensembles).
-            table = _pa_dataset.dataset(self._paths, format="parquet").to_table()
+    def add(self, frame: Any, key: Sequence[Any] | None = None) -> None:
+        """Append a frame. With `key` the frame must belong entirely to that task; without it the
+        frame is split by task, which is what the ODE candidate needs since it is fitted per
+        (cohort, outcome) across every origin month at once, and what the prediction-row builder
+        needs since one flushed chunk spans every task the patients in it contribute to."""
+        self.frames_added += 1
+        if frame is None or not len(frame):
+            return
+        projected = self._project(frame)
+        if key is not None:
+            self._write(key, projected)
+            return
+        for task_key, group in projected.groupby(list(TASK_COLUMNS), sort=True, observed=True):
+            self._write(task_key, group)
+
+    def read(self, key: Sequence[Any], columns: Sequence[str] | None = None) -> Any:
+        """One task's rows, in add order. `columns` projects at the storage layer, so a consumer
+        that needs six of the fifty-five columns pays for six."""
+        entry = self.partitions.get(self.partition_name(key))
+        if entry is None:
+            return self.empty_frame(columns)
+        paths = [str(self.root / name) for name in entry["files"]]
+        if self.parquet:
+            table = _pa_dataset.dataset(paths, format="parquet").to_table(
+                columns=list(columns) if columns else None
+            )
             return table.to_pandas(self_destruct=True, split_blocks=True)
-        if not self._frames:
-            return pd.DataFrame()
-        combined = pd.concat(self._frames, ignore_index=True)
-        # Release the per-candidate frames now that they live inside `combined`; the fallback
-        # never re-reads them, and this mirrors the old code's predictions.clear() so the
-        # pyarrow-absent path keeps at most one extra copy live, exactly as before.
-        self._frames = []
-        return combined
+        frames = []
+        for path in paths:
+            with open(path, "rb") as stream:
+                frame = pickle.load(stream)
+            frames.append(frame[list(columns)] if columns else frame)
+        if len(frames) == 1:
+            return frames[0].reset_index(drop=True)
+        return pd.concat(frames, ignore_index=True)
 
-    def close(self) -> None:
-        if self._dir is not None:
-            shutil.rmtree(self._dir, ignore_errors=True)
+    def empty_frame(self, columns: Sequence[str] | None = None) -> Any:
+        if columns:
+            return pd.DataFrame(columns=list(columns))
+        return pd.DataFrame(columns=list(self.columns) if self.columns else [])
+
+    def manifest(self) -> dict[str, Any]:
+        """Row counts per partition, for the checkpoint completion record. This is what makes a
+        store-backed checkpoint as verifiable as the pickled frame it replaces."""
+        return {
+            "type": type(self).__name__,
+            "row_count": self.row_count,
+            "partitions": {name: int(item["rows"]) for name, item in sorted(self.partitions.items())},
+        }
+
+    def _project(self, frame: Any) -> Any:
+        """Reorder onto the stored schema, adopting it from this frame if not yet fixed.
+
+        Fixing the schema on first write is what lets a store hold a table whose column list is
+        defined by its builder rather than by a module constant, while still guaranteeing every
+        file in the store shares one schema - which the parquet dataset reader requires, since it
+        infers the dataset schema from the first fragment it opens.
+        """
+        if self.columns is None:
+            self.columns = tuple(str(column) for column in frame.columns)
+        missing = [column for column in self.columns if column not in frame.columns]
+        if missing:
+            raise RuntimeError(f"{type(self).__name__} frame is missing stored columns: {missing}")
+        return frame[list(self.columns)]
+
+    def _trim_categories(self, frame: Any) -> Any:
+        """Drop unused categories from the identifier columns; see TRIMMED_CATEGORY_COLUMNS.
+        assign() rather than in-place assignment so the caller's frame is never mutated."""
+        trimmed = {
+            column: frame[column].cat.remove_unused_categories()
+            for column in self.TRIMMED_CATEGORY_COLUMNS
+            if column in frame.columns and isinstance(frame[column].dtype, pd.CategoricalDtype)
+        }
+        return frame.assign(**trimmed) if trimmed else frame
+
+    def _write(self, key: Sequence[Any], frame: Any) -> None:
+        name = self.partition_name(key)
+        entry = self.partitions.setdefault(
+            name,
+            {"key": [str(key[0]), str(key[1]), int(key[2])], "files": [], "rows": 0},
+        )
+        file_name = f"{name}__{len(entry['files']):04d}." + ("parquet" if self.parquet else "pkl")
+        path = self.root / file_name
+        written = self._trim_categories(frame)
+        if self.parquet:
+            written.to_parquet(path, engine="pyarrow", index=False)
+        else:
+            atomic_pickle(path, written.reset_index(drop=True))
+        entry["files"].append(file_name)
+        entry["rows"] += int(len(frame))
+
+
+class PredictionStore(TaskPartitionedStore):
+    """Every candidate's stored quantile predictions, partitioned by task.
+
+    The schema is fixed rather than adopted because candidates are added one at a time and the
+    first one added must not be allowed to define the store's columns for the rest.
+    """
+
+    STORED_COLUMNS = STORED_PREDICTION_COLUMNS
+
+
+class RowStore(TaskPartitionedStore):
+    """The prediction-row table, partitioned by task.
+
+    This is the table the modeling stage iterates and the largest object the study builds: one
+    row per (patient, cohort, outcome, origin month, target month) with the full feature set,
+    all splits, and - after weighting - row_id and analysis_weight. It was previously carried
+    whole through four stages and pickled twice, which made every one of those stages scale with
+    the size of the study. Its schema is adopted from the first chunk written, so the row
+    builder's column list stays in one place (the row literal) instead of being restated here.
+    """
+
+
+def read_cohort_outcome_rows(store: RowStore, cohort: str, outcome: str) -> Any:
+    """Every origin month's rows for one (cohort, outcome), in original table order.
+
+    Sorting by row_id restores exactly the order a boolean mask over the unpartitioned table
+    produced, because row_id is assigned in construction order and a mask preserves table order.
+    The ODE candidate trains on batches drawn in frame order, so this is load-bearing: reading
+    the partitions in origin order without re-sorting would regroup its training batches and
+    change the fitted model.
+    """
+    frames = [store.read(key) for key in store.keys() if key[0] == cohort and key[1] == outcome]
+    combined = concat_frames(frames)
+    if combined.empty or "row_id" not in combined.columns:
+        return combined
+    return combined.sort_values("row_id", kind="stable").reset_index(drop=True)
 
 
 def fit_candidate_roster(
-    weighted_rows: Any,
+    rows: "RowStore",
     cfg: RunConfig,
     dependencies: Mapping[str, Any],
     ode_gates: Any,
     scale_map: Mapping[tuple[str, str, int], float],
+    store: PredictionStore,
     cohorts: Any | None = None,
     measurements: Any | None = None,
 ) -> tuple[Any, Any, dict[str, Any]]:
-    spill = PredictionSpill()
+    """Fit every candidate for every task, reading one task's prediction rows at a time.
+
+    Visiting rows.keys() in sorted order is the same traversal the groupby on (cohort, outcome,
+    origin_month) performed, and each candidate reads nothing outside its own task, so the fitted
+    models and the status table are unchanged - but the stage's peak is now bounded by the
+    largest single task rather than by the whole prediction-row table.
+    """
     status_rows: list[dict[str, Any]] = []
     neural_details: dict[str, Any] = {"mlp": {}, "ode": {}}
     group_columns = ["cohort", "outcome", "origin_month"]
-    for keys, task in weighted_rows.groupby(group_columns, sort=True):
+    for keys in rows.keys():
+        task = rows.read(keys)
         cohort_name, outcome, origin_month = keys
         task_key = f"{cohort_name}|{outcome}|origin{origin_month}"
         observed_training_count = int((task["split"].eq("train") & task["target_observed"]).sum())
@@ -5651,7 +6921,8 @@ def fit_candidate_roster(
             started = time.perf_counter()
             try:
                 candidate_predictions = fit_function()
-                spill.add(drop_training_predictions(candidate_predictions))
+                store.add(drop_training_predictions(candidate_predictions), key=keys)
+                del candidate_predictions
                 status_rows.append(
                     {
                         **dict(zip(group_columns, keys, strict=False)),
@@ -5677,7 +6948,8 @@ def fit_candidate_roster(
             started = time.perf_counter()
             try:
                 mlp_predictions, details = fit_mlp_candidate(task, cfg)
-                spill.add(drop_training_predictions(mlp_predictions))
+                store.add(drop_training_predictions(mlp_predictions), key=keys)
+                del mlp_predictions
                 neural_details["mlp"][task_key] = details
                 status_rows.append(
                     {
@@ -5724,6 +6996,13 @@ def fit_candidate_roster(
                 "reason": "" if appropriate else (str(gate.iloc[0]["failed_gates"]) if not gate.empty else "suitability gate unavailable"),
             }
         )
+        # Modeling is the longest stage and the one that used to fail; report progress and the
+        # running peak per task so an operator watching the console can see where memory goes
+        # instead of only learning the total after the stage completes.
+        print(f"[metabolic] fitted task {task_key}", flush=True)
+        log_peak_rss(f"task {task_key}")
+        del task
+        gc.collect()
     for gate_row in ode_gates.loc[ode_gates["appropriate"]].itertuples(index=False):
         task_key = f"{gate_row.cohort}|{gate_row.outcome}"
         if cohorts is None or measurements is None:
@@ -5732,13 +7011,14 @@ def fit_candidate_roster(
                     status["status"] = "failed"
                     status["reason"] = "eligible task lacks cohort or exact-measurement input"
             continue
-        task = weighted_rows.loc[
-            weighted_rows["cohort"].eq(gate_row.cohort) & weighted_rows["outcome"].eq(gate_row.outcome)
-        ].copy()
+        task = read_cohort_outcome_rows(rows, gate_row.cohort, gate_row.outcome)
         started = time.perf_counter()
         try:
             ode_predictions, details = fit_ode_candidate(task, cohorts, measurements, cfg)
-            spill.add(drop_training_predictions(ode_predictions))
+            # No key: the ODE candidate is fitted per (cohort, outcome) across every origin
+            # month at once, so its rows are routed to several task partitions.
+            store.add(drop_training_predictions(ode_predictions))
+            del ode_predictions
             neural_details["ode"][task_key] = details
             for status in status_rows:
                 if status["cohort"] == gate_row.cohort and status["outcome"] == gate_row.outcome and status["candidate"] == "pytorch_ode_rnn":
@@ -5752,34 +7032,30 @@ def fit_candidate_roster(
                     status["status"] = "failed"
                     status["reason"] = f"{type(exc).__name__}: {exc}"
                     status["training_seconds"] = time.perf_counter() - started
-    if spill.count == 0:
+        del task
+        gc.collect()
+    if store.frames_added == 0:
         raise RuntimeError("Every model candidate failed")
-    # Assemble the per-candidate pieces into one frame (~1x via the parquet spill; a single
-    # pd.concat in the fallback). These candidate frames are the largest object in the run.
-    combined = spill.combine()
-    gc.collect()
-    ensemble_frames, ensemble_weights = compute_ensemble_candidates(combined, cfg, scale_map)
-    if ensemble_frames:
-        if _PARQUET_SPILL_ENABLED:
-            # Spill the ensemble pieces next to the candidate pieces already on disk, drop the
-            # interim combined frame (an explicit del so the reference is actually released), then
-            # rebuild once from disk. The combined frame is never held in two copies.
-            for frame in ensemble_frames:
-                spill.add(frame)
-            del ensemble_frames, combined
-            gc.collect()
-            combined = spill.combine()
-        else:
-            # Fallback: reproduce the old pd.concat exactly (2x transient, needs no pyarrow).
-            combined = pd.concat([combined, *ensemble_frames], ignore_index=True)
-    spill.close()
-    # candidate/architecture are low-cardinality labels repeated across every prediction row;
-    # store them as category to avoid duplicated object strings at production scale. This is
-    # done after the ensemble step so its new labels are part of the category universe.
-    for column in ("candidate", "architecture"):
-        if column in combined.columns:
-            combined[column] = combined[column].astype("category")
-    return combined, pd.DataFrame(status_rows), {**neural_details, "ensemble_weights": ensemble_weights}
+    # Form the validation-weighted ensemble one task at a time. compute_ensemble_candidates
+    # groups by exactly this task triple and reads nothing outside it, so handing it a single
+    # partition yields the same ensemble it built from the concatenated table while the peak
+    # stays at one task rather than the whole study.
+    ensemble_weight_frames: list[Any] = []
+    for key in store.keys():
+        task_predictions = store.read(key)
+        ensemble_frames, task_weights = compute_ensemble_candidates(task_predictions, cfg, scale_map)
+        del task_predictions
+        for frame in ensemble_frames:
+            store.add(frame, key=key)
+        if not task_weights.empty:
+            ensemble_weight_frames.append(task_weights)
+        del ensemble_frames, task_weights
+        gc.collect()
+    ensemble_weights = (
+        pd.concat(ensemble_weight_frames, ignore_index=True) if ensemble_weight_frames else pd.DataFrame()
+    )
+    log_peak_rss("candidate roster")
+    return store, pd.DataFrame(status_rows), {**neural_details, "ensemble_weights": ensemble_weights}
 
 
 def finite_sample_quantile(values: Any, coverage: float) -> float:
@@ -5792,14 +7068,20 @@ def finite_sample_quantile(values: Any, coverage: float) -> float:
 
 
 def conformal_calibrate(predictions: Any) -> tuple[Any, Any]:
-    # Calibrate the quantile columns in place. The caller has already computed everything it
-    # needs from the uncalibrated frame (the validation leaderboard) and drops its reference
-    # afterwards, so mutating avoids holding a second full copy of the largest table in the run.
-    calibrated = predictions
+    """Apply the conformal interval corrections to one task's predictions.
+
+    The corrections are gathered into a single float64 quantile matrix and written back as one
+    whole-column assignment rather than a per-group .loc setitem. That matters for two reasons:
+    the frame now arrives straight from the prediction store, where a zero-copy Arrow conversion
+    can hand pandas read-only buffers that an in-place write would reject, and a single
+    assignment replaces O(groups) partial block writes with one.
+    """
+    calibrated = predictions.reset_index(drop=True)
     corrections: list[dict[str, Any]] = []
     group_columns = ["cohort", "outcome", "origin_month", "target_month", "candidate"]
     interval_pairs = ((0, 6, 0.90), (1, 5, 0.80), (2, 4, 0.50))
-    for keys, group in calibrated.groupby(group_columns, sort=True):
+    quantile_values = calibrated[list(QUANTILE_COLUMNS)].to_numpy(dtype=float, copy=True)
+    for keys, group in calibrated.groupby(group_columns, sort=True, observed=True):
         calibration = group.loc[group["split"].eq("calibration") & group["target_observed"]]
         group_corrections: dict[tuple[int, int], float] = {}
         for lower_index, upper_index, coverage in interval_pairs:
@@ -5823,16 +7105,47 @@ def conformal_calibrate(predictions: Any) -> tuple[Any, Any]:
                     "status": status,
                 }
             )
-        indices = group.index
-        values = calibrated.loc[indices, list(QUANTILE_COLUMNS)].to_numpy(dtype=float, copy=True)
+        # reset_index above makes the group labels positions into quantile_values.
+        positions = group.index.to_numpy()
+        values = quantile_values[positions]
         for (lower_index, upper_index), correction in group_corrections.items():
             values[:, lower_index] -= correction
             values[:, upper_index] += correction
-        # Cast to the stored dtype explicitly: pandas 3.0's .loc setitem raises
-        # LossySetitemError rather than silently downcasting a float64 array into the float32
-        # quantile columns when the values are not exactly representable.
-        calibrated.loc[indices, list(QUANTILE_COLUMNS)] = stored_quantiles(rearrange_quantiles(values))
+        quantile_values[positions] = rearrange_quantiles(values)
+    # One whole-column assignment, which sets the stored float32 dtype outright instead of
+    # asking .loc to downcast float64 into it (pandas 3.0 raises LossySetitemError for that).
+    calibrated[list(QUANTILE_COLUMNS)] = stored_quantiles(quantile_values)
     return calibrated, pd.DataFrame(corrections)
+
+
+def calibrate_prediction_store(
+    source: PredictionStore,
+    target: PredictionStore,
+    scale_map: Mapping[tuple[str, str, int], float],
+) -> tuple[Any, Any]:
+    """Score and conformally calibrate the prediction table one task at a time.
+
+    Both reductions are exact per partition: the validation leaderboard groups by the task
+    triple plus candidate and architecture, and the conformal correction groups add target_month
+    and candidate - all refinements of the partition key. Visiting partitions in sorted key
+    order reproduces the row order the single-frame groupby(sort=True) produced.
+
+    Calibrated rows go to a second store rather than over the first, so the modeling stage's
+    output stays intact and the two stages remain independently resumable.
+    """
+    leaderboard_frames: list[Any] = []
+    correction_frames: list[Any] = []
+    for key in source.keys():
+        predictions = source.read(key)
+        leaderboard_frames.append(candidate_validation_scores(predictions, scale_map))
+        calibrated, corrections = conformal_calibrate(predictions)
+        del predictions
+        correction_frames.append(corrections)
+        target.add(calibrated, key=key)
+        del calibrated, corrections
+        gc.collect()
+    log_peak_rss("conformal calibration")
+    return concat_frames(leaderboard_frames), concat_frames(correction_frames)
 
 
 def pit_from_quantiles(y_true: Any, matrix: Any) -> Any:
@@ -5861,12 +7174,20 @@ def weighted_mean(values: Any, weights: Any) -> float:
 
 def evaluate_predictions(predictions: Any, weight_diagnostics: Any) -> tuple[Any, Any]:
     rows: list[dict[str, Any]] = []
-    pit_rows: list[dict[str, Any]] = []
+    # PIT is only ever consumed as a fixed 10-bin histogram per
+    # (cohort, outcome, origin_month, candidate, split) - see aggregate_pit_histograms - so the
+    # counts are accumulated here rather than emitting one Python dict per test row. The historical
+    # per-row table was O(test rows x candidates) dicts, by far the largest transient in the
+    # evaluation stage and one of the largest objects in the whole run. The bin edges are a
+    # constant rather than data-derived, so summing counts across target_month reproduces the
+    # previous histogram exactly.
+    bins = np.linspace(0, 1, 11)
+    pit_counts: dict[tuple[Any, ...], Any] = {}
     tests = predictions.loc[
         predictions["split"].isin(["temporal_test", "geographic_test"]) & predictions["target_observed"]
     ].copy()
     group_columns = ["cohort", "outcome", "origin_month", "target_month", "candidate", "split"]
-    for keys, group in tests.groupby(group_columns, sort=True):
+    for keys, group in tests.groupby(group_columns, sort=True, observed=True):
         y = group["target_value"].to_numpy(float)
         matrix = rearrange_quantiles(group[list(QUANTILE_COLUMNS)].to_numpy(float))
         weight = group["analysis_weight"].to_numpy(float)
@@ -5905,15 +7226,54 @@ def evaluate_predictions(predictions: Any, weight_diagnostics: Any) -> tuple[Any
                 "estimability": estimability,
             }
         )
-        for patient_id, pit_value in zip(group["patient_id"], pit, strict=False):
-            pit_rows.append(
+        # keys = (cohort, outcome, origin_month, target_month, candidate, split); the histogram is
+        # keyed without target_month, which is what aggregate_pit_histograms grouped on.
+        histogram_key = (keys[0], keys[1], keys[2], keys[4], keys[5])
+        counts, _ = np.histogram(pit, bins=bins)
+        accumulated = pit_counts.get(histogram_key)
+        pit_counts[histogram_key] = counts if accumulated is None else accumulated + counts
+    return pd.DataFrame(rows), pit_histogram_frame(pit_counts, bins)
+
+
+def evaluate_prediction_store(store: PredictionStore, weight_diagnostics: Any) -> tuple[Any, Any]:
+    """Test-split metrics and PIT histograms, one task partition at a time.
+
+    Every metric group is a refinement of the partition key, so this is the same computation the
+    single-frame version performed - it just never holds more than one task's test rows, and it
+    reads only the columns the metrics touch.
+    """
+    metric_frames: list[Any] = []
+    pit_frames: list[Any] = []
+    for key in store.keys():
+        predictions = store.read(key, columns=EVALUATION_COLUMNS)
+        metrics, pit_histograms = evaluate_predictions(predictions, weight_diagnostics)
+        del predictions
+        metric_frames.append(metrics)
+        pit_frames.append(pit_histograms)
+        gc.collect()
+    log_peak_rss("test-split evaluation")
+    return concat_frames(metric_frames), concat_frames(pit_frames)
+
+
+def pit_histogram_frame(counts_by_key: Mapping[tuple[Any, ...], Any], bins: Any) -> Any:
+    """Tidy the accumulated PIT bin counts into the frame the calibration figure reads.
+
+    Emitted in sorted key order, which is the order the previous groupby(sort=True) over the
+    per-row PIT table produced.
+    """
+    rows: list[dict[str, Any]] = []
+    for key in sorted(counts_by_key):
+        cohort, outcome, origin_month, candidate, split = key
+        counts = counts_by_key[key]
+        for index, count in enumerate(counts):
+            rows.append(
                 {
-                    "patient_id": patient_id,
-                    **dict(zip(group_columns, keys, strict=False)),
-                    "pit": float(pit_value),
+                    "cohort": cohort, "outcome": outcome, "origin_month": origin_month,
+                    "candidate": candidate, "split": split, "bin_left": bins[index],
+                    "bin_right": bins[index + 1], "n": int(count),
                 }
             )
-    return pd.DataFrame(rows), pd.DataFrame(pit_rows)
+    return pd.DataFrame(rows)
 
 
 def select_models(leaderboard: Any) -> Any:
@@ -5948,9 +7308,8 @@ def select_models(leaderboard: Any) -> Any:
 
 def development_iqr_by_task(weighted_rows: Any) -> Any:
     rows = []
-    for keys, group in weighted_rows.loc[weighted_rows["split"].eq("train") & weighted_rows["target_observed"]].groupby(
-        ["cohort", "outcome", "target_month"], sort=True
-    ):
+    development = weighted_rows.loc[weighted_rows["split"].eq("train") & weighted_rows["target_observed"]]
+    for keys, group in development.groupby(["cohort", "outcome", "target_month"], sort=True, observed=True):
         q25, q75 = np.quantile(group["target_value"], [0.25, 0.75])
         rows.append(
             {
@@ -6104,8 +7463,16 @@ def row_crps(y_true: Any, matrix: Any) -> Any:
     return 2.0 * np.mean(np.maximum(quantiles * error, (quantiles - 1.0) * error), axis=1)
 
 
-def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tuple[Any, Any]:
-    rng = np.random.default_rng(cfg.seed + 991)
+def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig, rng: Any = None) -> tuple[Any, Any]:
+    """Patient- and center-clustered bootstrap intervals for one task's test rows.
+
+    `rng` is threaded in by bootstrap_uncertainty_over_store so that streaming the tasks draws
+    exactly the sequence the single-frame version drew: partitions are visited in sorted key
+    order and the groups inside each partition are a sorted refinement of that key, so the order
+    in which replicates are requested is unchanged. The Benjamini-Hochberg adjustment is applied
+    by the caller because it is the one genuinely study-wide step.
+    """
+    rng = np.random.default_rng(cfg.seed + 991) if rng is None else rng
     ci_rows: list[dict[str, Any]] = []
     comparison_rows: list[dict[str, Any]] = []
     selected_map = {
@@ -6116,7 +7483,7 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
         predictions["split"].isin(["temporal_test", "geographic_test"])
         & predictions["target_observed"]
     ].copy()
-    for keys, group in tests.groupby(["cohort", "outcome", "origin_month", "target_month", "split"], sort=True):
+    for keys, group in tests.groupby(["cohort", "outcome", "origin_month", "target_month", "split"], sort=True, observed=True):
         selected_candidate = selected_map.get((keys[0], keys[1], keys[2]))
         candidates = [selected_candidate, "population_change", "persistence"]
         candidates = [item for item in dict.fromkeys(candidates) if item and item != "not_estimable"]
@@ -6193,7 +7560,7 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
                 paired = selected_frame.merge(baseline_frame, on="row_id", how="inner")
                 differences = paired["selected_crps"] - paired[f"{baseline_name}_crps"]
                 if len(differences):
-                    patient_differences = paired.assign(difference=differences).groupby("patient_id")["difference"].mean()
+                    patient_differences = paired.assign(difference=differences).groupby("patient_id", observed=True)["difference"].mean()
                     boot = []
                     values = patient_differences.to_numpy(float)
                     for _ in range(cfg.bootstrap_replicates):
@@ -6208,10 +7575,31 @@ def bootstrap_uncertainty(predictions: Any, selected: Any, cfg: RunConfig) -> tu
                             "p_value": float(2 * min(np.mean(np.asarray(boot) <= 0), np.mean(np.asarray(boot) >= 0))),
                         }
                     )
-    comparisons = pd.DataFrame(comparison_rows)
+    return pd.DataFrame(ci_rows), pd.DataFrame(comparison_rows)
+
+
+def bootstrap_uncertainty_over_store(store: PredictionStore, selected: Any, cfg: RunConfig) -> tuple[Any, Any]:
+    """Bootstrap every task in turn, then apply the one study-wide correction.
+
+    Benjamini-Hochberg needs every paired comparison before it can assign a q-value, but that
+    table holds one row per (cohort, outcome, origin, target, split) - so the two-pass structure
+    costs nothing while the prediction rows themselves are still streamed.
+    """
+    rng = np.random.default_rng(cfg.seed + 991)
+    ci_frames: list[Any] = []
+    comparison_frames: list[Any] = []
+    for key in store.keys():
+        predictions = store.read(key, columns=BOOTSTRAP_COLUMNS)
+        ci_rows, comparison_rows = bootstrap_uncertainty(predictions, selected, cfg, rng=rng)
+        del predictions
+        ci_frames.append(ci_rows)
+        comparison_frames.append(comparison_rows)
+        gc.collect()
+    comparisons = concat_frames(comparison_frames)
     if not comparisons.empty:
         comparisons["fdr_q_value"] = benjamini_hochberg(comparisons["p_value"].to_numpy(float))
-    return pd.DataFrame(ci_rows), comparisons
+    log_peak_rss("bootstrap uncertainty")
+    return concat_frames(ci_frames), comparisons
 
 
 def benjamini_hochberg(p_values: Any) -> Any:
@@ -6234,7 +7622,7 @@ def weight_sensitivity_table(predictions: Any, selected: Any) -> Any:
     }
     rows: list[dict[str, Any]] = []
     tests = predictions.loc[predictions["split"].isin(["temporal_test", "geographic_test"]) & predictions["target_observed"]]
-    for keys, group in tests.groupby(["cohort", "outcome", "origin_month", "target_month", "split"], sort=True):
+    for keys, group in tests.groupby(["cohort", "outcome", "origin_month", "target_month", "split"], sort=True, observed=True):
         candidate = selected_map.get((keys[0], keys[1], keys[2]))
         frame = group.loc[group["candidate"].eq(candidate)].copy()
         if frame.empty:
@@ -6264,16 +7652,32 @@ def weight_sensitivity_table(predictions: Any, selected: Any) -> Any:
     return pd.DataFrame(rows)
 
 
-def gap_rule_sensitivity(bundle: DataBundle) -> Any:
+def weight_sensitivity_over_store(store: PredictionStore, selected: Any) -> Any:
+    """Weight-scheme sensitivity per task. Each scheme's truncation quantiles are taken within
+    the group, so nothing here depends on the study-wide weight distribution."""
+    frames: list[Any] = []
+    for key in store.keys():
+        predictions = store.read(key, columns=EVALUATION_COLUMNS)
+        frames.append(weight_sensitivity_table(predictions, selected))
+        del predictions
+    return concat_frames(frames)
+
+
+def gap_rule_sensitivity(bundle: DataBundle, qualifying_days: int | None = None) -> Any:
     medications = bundle.medications
     if bundle.metadata.get("source_mode") == "cosmos_direct_wide_cohorts" and "source_cohort" in medications:
         medications = medications.loc[medications["source_cohort"].eq("incretin")]
     absolute_records, _ = medication_frame_to_coverage(medications)
+    # Vary only the allowable gap; the cohort-entry window stays the one the incretin arm was
+    # actually built on, so this reports sensitivity to the gap rule and nothing else.
+    window = bundle_incretin_qualifying_days(bundle) if qualifying_days is None else int(qualifying_days)
     patient_sets: dict[int, set[str]] = {}
     rows: list[dict[str, Any]] = []
     for gap in GAP_SENSITIVITIES:
-        episodes, _ = reconstruct_coverage_episodes(absolute_records, gap_rule_days=gap)
-        qualifiers = {episode.patient_id for episode in episodes if episode.qualifies_183}
+        episodes, _ = reconstruct_coverage_episodes(
+            absolute_records, gap_rule_days=gap, qualifying_days=window
+        )
+        qualifiers = {episode.patient_id for episode in episodes if episode.qualifies_window}
         patient_sets[gap] = qualifiers
         rows.append(
             {
@@ -6330,25 +7734,27 @@ def inverse_quantile(values: Any, probabilities: Any) -> Any:
     return np.interp(probabilities, np.asarray(QUANTILES), quantile_values, left=quantile_values[0], right=quantile_values[-1])
 
 
-def build_synthetic_trajectory_examples(predictions: Any, selected: Any, cfg: RunConfig) -> tuple[Any, Any]:
+def build_synthetic_trajectory_examples(store: PredictionStore, selected: Any, cfg: RunConfig) -> tuple[Any, Any]:
     rng = np.random.default_rng(cfg.seed + 404)
     example_rows: list[dict[str, Any]] = []
     score_rows: list[dict[str, Any]] = []
     for selection in selected.loc[selected["origin_month"].eq(0)].itertuples(index=False):
         if selection.selected_candidate == "not_estimable":
             continue
-        task = predictions.loc[
-            predictions["cohort"].eq(selection.cohort)
-            & predictions["outcome"].eq(selection.outcome)
-            & predictions["origin_month"].eq(0)
-            & predictions["candidate"].eq(selection.selected_candidate)
-            & predictions["split"].eq("calibration")
+        # The cohort/outcome/origin filters the single-frame version applied are exactly this
+        # partition's key, so reading the partition replaces them.
+        origin_predictions = store.read((selection.cohort, selection.outcome, 0), columns=TRAJECTORY_COLUMNS)
+        task = origin_predictions.loc[
+            origin_predictions["candidate"].eq(selection.selected_candidate)
+            & origin_predictions["split"].eq("calibration")
         ].copy()
         if task.empty:
+            del origin_predictions
             continue
         horizons, correlation = estimate_residual_correlation(
-            predictions, selection.selected_candidate, selection.cohort, selection.outcome, 0
+            origin_predictions, selection.selected_candidate, selection.cohort, selection.outcome, 0
         )
+        del origin_predictions
         supported_horizons = sorted(set(int(item) for item in task["target_month"]).intersection(horizons))
         if not supported_horizons:
             supported_horizons = sorted(int(item) for item in task["target_month"].unique())
@@ -6464,7 +7870,7 @@ def mask_small_cell_metrics(
 
 def baseline_composition_table(cohorts: Any) -> Any:
     rows: list[dict[str, Any]] = []
-    for keys, group in cohorts.groupby(["cohort", "treatment"], sort=True):
+    for keys, group in cohorts.groupby(["cohort", "treatment"], sort=True, observed=True):
         n = group["patient_id"].nunique()
         rows.append(
             {
@@ -6486,7 +7892,7 @@ def baseline_composition_table(cohorts: Any) -> Any:
 
 def target_support_table(weighted_rows: Any) -> Any:
     rows = []
-    for keys, group in weighted_rows.groupby(["cohort", "outcome", "origin_month", "target_month"], sort=True):
+    for keys, group in weighted_rows.groupby(["cohort", "outcome", "origin_month", "target_month"], sort=True, observed=True):
         counts = group["support_status"].value_counts()
         rows.append(
             {
@@ -6504,12 +7910,19 @@ def target_support_table(weighted_rows: Any) -> Any:
 
 
 def measurement_quality_table(quality: Any, normalized: Any) -> Any:
-    grouped = quality.groupby(["kind", "unit", "reason", "valid"], dropna=False).size().rename("n").reset_index()
-    duplicate = normalized.groupby("outcome").agg(
+    # `quality` is run-length encoded by normalize_measurements, so this sums the stored counts
+    # where it used to count rows. The two are equal because every key combination appears at
+    # most once in the encoded frame, and summing also aggregates away source_concept and
+    # source_table, which this reduction never grouped on.
+    grouped = quality.groupby(["kind", "unit", "reason", "valid"], dropna=False)["n"].sum().reset_index()
+    # outcome is stored as `category` on the measurement table, and grouping on a categorical
+    # yields a categorical key column; decoded_dtype restores the dtype this released table had
+    # before the measurement frame was compacted.
+    duplicate = normalized.groupby("outcome", observed=True).agg(
         valid_measurements=("value", "size"),
         duplicate_days=("duplicate_day", "sum"),
         derived_values=("method", lambda values: int((values == "derived_weight_height").sum())),
-    ).reset_index()
+    ).reset_index().astype({"outcome": decoded_dtype(normalized["outcome"])})
     return {"reasons": suppress_small_cells(grouped, ["n"]), "duplicates": duplicate}
 
 
@@ -6521,8 +7934,9 @@ def exposure_summary(exposure: Any, medication_audit: Any) -> dict[str, Any]:
         day_zero=("treatment_censor_day", lambda values: int(pd.to_numeric(values, errors="coerce").eq(0).sum())),
         median_censor_day=("treatment_censor_day", "median"),
     ).reset_index()
-    sources = medication_audit.groupby(["source_type", "accepted", "reason"], dropna=False).size().rename("n").reset_index()
-    pdc = exposure.loc[exposure["cohort"].eq("incretin"), [column for column in ("pdc_183", "maximum_gap_days", "switch_count") if column in exposure]].copy()
+    # Sums the run-length-encoded counts; see measurement_quality_table for the same pattern.
+    sources = medication_audit.groupby(["source_type", "accepted", "reason"], dropna=False)["n"].sum().reset_index()
+    pdc = exposure.loc[exposure["cohort"].eq("incretin"), [column for column in ("pdc_qualifying", "maximum_gap_days", "switch_count") if column in exposure]].copy()
     return {
         "classification": suppress_small_cells(classification, ["n"]),
         "censoring": censoring,
@@ -6531,26 +7945,26 @@ def exposure_summary(exposure: Any, medication_audit: Any) -> dict[str, Any]:
     }
 
 
-def aggregate_pit_histograms(pit_values: Any, selected: Any) -> Any:
+def aggregate_pit_histograms(pit_histograms: Any, selected: Any) -> Any:
+    """Keep only the selected candidate's PIT bins.
+
+    evaluate_predictions already accumulated the counts per
+    (cohort, outcome, origin_month, candidate, split), so this is a filter rather than a
+    re-aggregation over a per-row table.
+    """
     selected_map = {
         (row.cohort, row.outcome, row.origin_month): row.selected_candidate
         for row in selected.itertuples(index=False)
     }
-    rows = []
-    bins = np.linspace(0, 1, 11)
-    for keys, group in pit_values.groupby(["cohort", "outcome", "origin_month", "candidate", "split"], sort=True):
-        if selected_map.get((keys[0], keys[1], keys[2])) != keys[3]:
-            continue
-        counts, edges = np.histogram(group["pit"], bins=bins)
-        for index, count in enumerate(counts):
-            rows.append(
-                {
-                    "cohort": keys[0], "outcome": keys[1], "origin_month": keys[2],
-                    "candidate": keys[3], "split": keys[4], "bin_left": edges[index],
-                    "bin_right": edges[index + 1], "n": int(count),
-                }
-            )
-    return pd.DataFrame(rows)
+    if pit_histograms.empty:
+        return pd.DataFrame()
+    keep = [
+        selected_map.get((row.cohort, row.outcome, row.origin_month)) == row.candidate
+        for row in pit_histograms.itertuples(index=False)
+    ]
+    if not any(keep):
+        return pd.DataFrame()
+    return pit_histograms.loc[keep].reset_index(drop=True)
 
 
 def subgroup_performance(predictions: Any, selected: Any) -> Any:
@@ -6564,7 +7978,7 @@ def subgroup_performance(predictions: Any, selected: Any) -> Any:
         & predictions["origin_month"].eq(0)
     ].copy()
     rows: list[dict[str, Any]] = []
-    for keys, group in tests.groupby(["cohort", "outcome", "target_month", "split"], sort=True):
+    for keys, group in tests.groupby(["cohort", "outcome", "target_month", "split"], sort=True, observed=True):
         candidate = selected_map.get((keys[0], keys[1], 0))
         group = group.loc[group["candidate"].eq(candidate)].copy()
         if group.empty:
@@ -6602,6 +8016,18 @@ def subgroup_performance(predictions: Any, selected: Any) -> Any:
     return pd.DataFrame(rows)
 
 
+def subgroup_performance_over_store(store: PredictionStore, selected: Any) -> Any:
+    """Subgroup performance reads only the origin-0 partitions, which is all it ever scored."""
+    frames: list[Any] = []
+    for key in store.keys():
+        if int(key[2]) != 0:
+            continue
+        predictions = store.read(key, columns=SUBGROUP_COLUMNS)
+        frames.append(subgroup_performance(predictions, selected))
+        del predictions
+    return concat_frames(frames)
+
+
 def blind_center_summary(cohorts: Any, split_metadata: Mapping[str, Any], fingerprint: str) -> Any:
     centers = sorted(str(item) for item in cohorts["center_id"].unique())
     order = sorted(centers, key=lambda value: digest({"fingerprint": fingerprint, "center": value}))
@@ -6626,7 +8052,7 @@ def build_figure_data(
     leakage: Any,
     support: Any,
     weight_diagnostics: Any,
-    predictions: Any,
+    predictions: PredictionStore,
     model_status: Any,
     neural_details: Mapping[str, Any],
     leaderboard: Any,
@@ -6634,7 +8060,7 @@ def build_figure_data(
     calibration: Any,
     metrics: Any,
     iqr: Any,
-    pit_values: Any,
+    pit_histograms: Any,
     bootstrap_ci: Any,
     comparisons: Any,
     gates: Any,
@@ -6670,6 +8096,10 @@ def build_figure_data(
             "medication_coverage_semantics": bundle.metadata.get(
                 "medication_coverage_semantics", "audited_raw_events"
             ),
+            "incretin_qualifying_months": int(
+                bundle.metadata.get("incretin_qualifying_months")
+                or round(bundle_incretin_qualifying_days(bundle) / DAYS_PER_MONTH)
+            ),
             "center_validation_available": bool(
                 bundle.metadata.get("center_validation_available", True)
             ),
@@ -6678,7 +8108,7 @@ def build_figure_data(
         "funnel": cohort_artifacts["funnel"],
         "cohort_counts": (
             cohorts.drop_duplicates("patient_id")
-            .groupby("cohort")
+            .groupby("cohort", observed=True)
             .size()
             .rename("n")
             .reset_index()
@@ -6700,10 +8130,10 @@ def build_figure_data(
         "calibration": calibration,
         "metrics": metrics,
         "iqr": iqr,
-        "pit_histograms": aggregate_pit_histograms(pit_values, selected),
+        "pit_histograms": aggregate_pit_histograms(pit_histograms, selected),
         "bootstrap_ci": bootstrap_ci,
         "comparisons": comparisons,
-        "subgroups": subgroup_performance(predictions, selected),
+        "subgroups": subgroup_performance_over_store(predictions, selected),
         "gates": gates,
         "ode_gates": ode_gates,
         "neural_details": dict(neural_details),
@@ -6775,17 +8205,32 @@ def add_run_provenance(figure: Any, data: Mapping[str, Any]) -> None:
     )
 
 
+def incretin_window_months(data: Mapping[str, Any]) -> int:
+    """Completed treatment months the incretin arm was built on, as recorded in the run identity.
+
+    Defaults to six so text helpers keep working on the reduced identity dicts the self-tests
+    and the preflight page build.
+    """
+    return int(data.get("identity", {}).get("incretin_qualifying_months") or 6)
+
+
 def source_aware_text(data: Mapping[str, Any], value: str) -> str:
     if not wide_source_limited(data):
         return value
+    # Wide premade cohort tables expose a reported start-end interval rather than auditable
+    # fills, so continuation language is rewritten as an interval claim. The window follows the
+    # configured cohort-entry rule, so the disclaimer never states a length the run did not use.
+    months = incretin_window_months(data)
+    word = month_word(months)
+    days = qualifying_days_for_months(months)
     replacements = (
-        ("six-month incretin continuers", "patients with a reported ≥183-day incretin interval"),
-        ("six-month continuers", "reported ≥183-day interval cohort"),
-        ("primary six-month continuers", "primary reported ≥183-day interval cohort"),
-        ("no new user six month continuation episode", "no qualifying reported ≥183-day interval"),
+        (f"{word}-month incretin continuers", f"patients with a reported ≥{days}-day incretin interval"),
+        (f"{word}-month continuers", f"reported ≥{days}-day interval cohort"),
+        (f"primary {word}-month continuers", f"primary reported ≥{days}-day interval cohort"),
+        (f"no new user {word} month continuation episode", f"no qualifying reported ≥{days}-day interval"),
         ("patients with accepted exposure", "patients with an accepted reported interval"),
-        ("six month continuer", "reported ≥183-day interval"),
-        ("six-month persistence", "reported interval duration"),
+        (f"{word} month continuer", f"reported ≥{days}-day interval"),
+        (f"{word}-month persistence", "reported interval duration"),
     )
     result = str(value)
     for original, replacement in replacements:
@@ -7272,7 +8717,7 @@ def render_page_01(data: Mapping[str, Any]) -> Any:
 def render_page_02(data: Mapping[str, Any]) -> Any:
     subtitle = source_aware_text(
         data,
-        "Every inclusion and exclusion is enumerated separately for surgery and six-month incretin continuers",
+        f"Every inclusion and exclusion is enumerated separately for surgery and {month_word(incretin_window_months(data))}-month incretin continuers",
     )
     figure = new_page(2, "Cohort funnels", subtitle)
     funnel = data["funnel"].copy()
@@ -7281,7 +8726,7 @@ def render_page_02(data: Mapping[str, Any]) -> Any:
         panel_label(
             axis,
             chr(ord("A") + panel_index),
-            "Surgical cohort" if cohort_name == "surgery" else source_aware_text(data, "Six-month continuer cohort"),
+            "Surgical cohort" if cohort_name == "surgery" else source_aware_text(data, f"{month_word(incretin_window_months(data)).capitalize()}-month continuer cohort"),
         )
         subset = funnel.loc[funnel["cohort"].eq(cohort_name)].copy().head(14)
         if subset.empty:
@@ -7349,7 +8794,7 @@ def render_page_03(data: Mapping[str, Any]) -> Any:
     panel_label(
         axes[3],
         "D",
-        "Continuity under full reported-interval assumption" if wide_limited else "Six-month continuity distribution",
+        "Continuity under full reported-interval assumption" if wide_limited else f"{month_word(incretin_window_months(data)).capitalize()}-month continuity distribution",
     )
     draw_compact_table(axes[3], exposure["continuity"], list(exposure["continuity"].columns), max_rows=9)
     return figure
@@ -7952,7 +9397,7 @@ def render_page_16(data: Mapping[str, Any]) -> Any:
     if wide_limited:
         estimand_text = (
             "Primary surgery results use cross-fitted inverse-probability-of-remaining-incretin-free and observation weights. "
-            "Primary incretin results condition on at least 183 days inside one reported GLP1StartDate-to-GLP1EndDate interval "
+            f"Primary incretin results condition on at least {qualifying_days_for_months(incretin_window_months(data))} days inside one reported GLP1StartDate-to-GLP1EndDate interval "
             "and censor at that reported end or a known bariatric procedure. Unweighted and alternate weight truncation results "
             "remain available. Because dispense-level records are absent, internal gaps, stockpiling, and switches cannot be "
             "reconstructed; identical 0-, 30-, and 60-day rows reflect that source limitation, not demonstrated persistence."
@@ -7960,7 +9405,7 @@ def render_page_16(data: Mapping[str, Any]) -> Any:
     else:
         estimand_text = (
             "Primary surgery results use cross-fitted inverse-probability-of-remaining-incretin-free and observation weights. "
-            "Primary incretin results are on-treatment among confirmed six-month continuers and censor at the first supported "
+            f"Primary incretin results are on-treatment among confirmed {month_word(incretin_window_months(data))}-month continuers and censor at the first supported "
             "coverage end before an excessive gap, plus bariatric surgery. Unweighted complete-case results and alternate weight "
             "truncation are shown above. Gap-rule sensitivity reconstructs episodes and censor dates at 0, 30, and 60 days. "
             "Observed-care results, when produced in a full run, retain outcomes after medication discontinuation but still censor surgery and are labeled separately."
@@ -8027,7 +9472,7 @@ def render_page_18(data: Mapping[str, Any]) -> Any:
     limitations = source_aware_text(
         data,
         "This is a prognostic study, not a causal treatment comparison. Surgery and incretin therapy use separate models, "
-        "populations, time zeros, and claims. The initiation-origin incretin model is conditional on future six-month persistence. "
+        f"populations, time zeros, and claims. The initiation-origin incretin model is conditional on future {month_word(incretin_window_months(data))}-month persistence. "
         "Treatment censoring and observation may remain informative despite cross-fitted weighting. Recent ingredients can have "
         "short calendar support, so unsupported horizons are not estimable. Conditional sleeve and RYGB projections are model-based, "
         "overlap-restricted, baseline-origin projections and must not be used to recommend a procedure.",
@@ -8608,6 +10053,253 @@ def run_embedded_self_tests() -> dict[str, Any]:
         str(postoperative),
     )
 
+    # 4b. The incretin cohort-entry window is configurable and actually binds. Eight 28-day
+    # fills give 224 covered days: a completed six months, short of a completed twelve. The
+    # surgical prior-exposure rule is pinned to QUALIFYING_DAYS and must not move with it.
+    eight_fills = [record(28 * fill, 28 * fill + 27) for fill in range(8)]
+    fourteen_fills = [record(28 * fill, 28 * fill + 27) for fill in range(14)]
+    six_month_episodes, _ = reconstruct_coverage_episodes(
+        eight_fills, qualifying_days=qualifying_days_for_months(6)
+    )
+    twelve_month_episodes, _ = reconstruct_coverage_episodes(
+        eight_fills, qualifying_days=qualifying_days_for_months(12)
+    )
+    long_twelve_month, _ = reconstruct_coverage_episodes(
+        fourteen_fills, qualifying_days=qualifying_days_for_months(12)
+    )
+    surgical_still_six_month = classify_surgical_incretin_history(
+        [record(-182, 0)]
+    )["classification"]
+    check(
+        "04b_incretin_qualifying_window_is_configurable",
+        qualifying_days_for_months(6) == QUALIFYING_DAYS
+        and qualifying_days_for_months(12) == 365
+        and select_primary_incretin_episode(six_month_episodes) is not None
+        and select_primary_incretin_episode(twelve_month_episodes) is None
+        and select_primary_incretin_episode(long_twelve_month) is not None
+        and surgical_still_six_month == "previously_treated",
+        f"224 covered days: six-month={bool(select_primary_incretin_episode(six_month_episodes))}, "
+        f"twelve-month={bool(select_primary_incretin_episode(twelve_month_episodes))}; "
+        f"392 covered days twelve-month={bool(select_primary_incretin_episode(long_twelve_month))}; "
+        f"surgical prior-exposure rule unchanged={surgical_still_six_month}",
+    )
+
+    # 4c. The prediction store must return each task exactly what was added to it, in add order.
+    # Everything downstream of modeling now reads through it, so this pins the two properties the
+    # streaming design depends on: read-back equals pd.concat of the pieces in add order, and the
+    # category trimming applied on write changes no value. Both formats are exercised.
+    store_checks: list[str] = []
+    for use_parquet in (True, False):
+        if use_parquet and not _PYARROW_AVAILABLE:
+            continue
+        store_root = Path(tempfile.mkdtemp(prefix="metabolic-store-test-"))
+        try:
+            store = PredictionStore(store_root)
+            store.parquet = use_parquet
+            pieces = []
+            for order, (candidate, architecture, split_labels) in enumerate(
+                (
+                    ("population_change", "empirical_baseline", ["validation", "calibration"]),
+                    ("persistence", "empirical_baseline", ["temporal_test", "geographic_test"]),
+                    ("validation_weighted_ensemble", "architecture_ensemble", ["validation", "calibration"]),
+                )
+            ):
+                size = len(split_labels)
+                piece = pd.DataFrame(
+                    {
+                        "row_id": np.arange(order * size, order * size + size, dtype=np.int32),
+                        "patient_id": pd.Categorical(
+                            [f"PT{order}{index}" for index in range(size)],
+                            categories=[f"PT{a}{b}" for a in range(4) for b in range(4)],
+                        ),
+                        "cohort": "surgery",
+                        "outcome": "bmi",
+                        "origin_month": 0,
+                        "target_month": [12, 24][:size],
+                        "split": split_labels,
+                        "target_value": [31.5, 30.25][:size],
+                        "target_observed": [True, False][:size],
+                        "analysis_weight": [1.0, 2.0][:size],
+                        "support_status": "mature_with_target",
+                        "treatment": "sleeve",
+                        "center_id": pd.Categorical(["C1", "C2"][:size], categories=["C1", "C2", "C3"]),
+                        "prediction_reference_value": [44.0, 43.0][:size],
+                        "candidate": constant_label_column(candidate, CANDIDATE_LEVELS, size),
+                        "architecture": constant_label_column(architecture, ARCHITECTURE_LEVELS, size),
+                    }
+                )
+                piece[list(QUANTILE_COLUMNS)] = stored_quantiles(
+                    np.tile(np.arange(len(QUANTILE_COLUMNS), dtype=float), (size, 1))
+                )
+                # A dead column the store must drop, and an empty frame it must count but not write.
+                piece["model_detail"] = "dropped by the stored schema"
+                pieces.append(piece[list(STORED_PREDICTION_COLUMNS)])
+                store.add(piece, key=("surgery", "bmi", 0))
+            store.add(pieces[0].iloc[0:0], key=("surgery", "bmi", 0))
+            expected = pd.concat(pieces, ignore_index=True)
+            actual = store.read(("surgery", "bmi", 0)).reset_index(drop=True)
+            values_match = (
+                list(actual.columns) == list(STORED_PREDICTION_COLUMNS)
+                and len(actual) == len(expected)
+                and all(
+                    actual[column].astype(str).tolist() == expected[column].astype(str).tolist()
+                    for column in STORED_PREDICTION_COLUMNS
+                )
+            )
+            projected = store.read(("surgery", "bmi", 0), columns=("row_id", "candidate"))
+            store_checks.append(
+                f"{'parquet' if use_parquet else 'pickle'}: rows={len(actual)} "
+                f"values_match={values_match} frames_added={store.frames_added} "
+                f"partition_rows={store.manifest()['row_count']} projected_cols={list(projected.columns)} "
+                f"candidate_order_preserved={list(dict.fromkeys(actual['candidate'].astype(str)))}"
+            )
+            check(
+                f"04c_prediction_store_roundtrip_{'parquet' if use_parquet else 'pickle'}",
+                values_match
+                and store.frames_added == 4
+                and store.manifest()["row_count"] == len(expected)
+                and store.keys() == [("surgery", "bmi", 0)]
+                and list(projected.columns) == ["row_id", "candidate"]
+                and list(dict.fromkeys(actual["candidate"].astype(str)))
+                == ["population_change", "persistence", "validation_weighted_ensemble"],
+                store_checks[-1],
+            )
+        finally:
+            shutil.rmtree(store_root, ignore_errors=True)
+
+    # 4d. Partitioning the prediction-row table changes no result. This is the load-bearing
+    # guarantee of the RowStore: weight estimation, the leakage audit, both development-IQR
+    # reductions and the support table are all evaluated over the partitioned store and compared
+    # against the same functions applied to the unpartitioned frame. The fixture deliberately
+    # spans two origin months that share their target months, so the cross-origin pooling the
+    # IQR reductions depend on is actually exercised, and it is built patient-by-patient so the
+    # origins interleave in row order the way the real builder emits them.
+    rows_per_patient = [
+        (origin, target)
+        for origin in (0, 3)
+        for target in (12, 24)
+    ]
+    fixture_rows: list[dict[str, Any]] = []
+    for seat in range(48):
+        patient = f"PT{seat:03d}"
+        split = ["train", "train", "train", "validation", "calibration", "temporal_test"][seat % 6]
+        for origin, target in rows_per_patient:
+            fixture_rows.append(
+                {
+                    "patient_id": patient,
+                    "cohort": "surgery",
+                    "outcome": "bmi",
+                    "origin_month": origin,
+                    "target_month": target,
+                    "split": split,
+                    "center_id": f"C{seat % 5}",
+                    "treatment": ["sleeve", "bypass"][seat % 2],
+                    "sex": ["female", "male"][seat % 2],
+                    "race": ["white", "black"][(seat // 2) % 2],
+                    "baseline_value": 40.0 + (seat % 11) * 0.5,
+                    "age_at_index": 35.0 + (seat % 17),
+                    "diabetes_flag": float(seat % 2),
+                    "index_year": 2015 + (seat % 5),
+                    "administratively_mature": True,
+                    "uncensored_through_target": bool(seat % 7),
+                    "target_observed": bool(seat % 3),
+                    "target_value": 34.0 + (seat % 13) * 0.25 + origin * 0.1 + target * 0.05,
+                    "support_status": "mature_with_target" if seat % 3 else "mature_without_target",
+                    "feature_max_day": month_to_nominal_day(origin) - 5,
+                    "origin_day": month_to_nominal_day(origin),
+                    "target_day": month_to_nominal_day(target),
+                    "effective_censor_day": np.nan,
+                }
+            )
+    whole = assign_chunk_row_ids(pd.DataFrame(fixture_rows), 0)
+    partition_checks: list[str] = []
+    for use_parquet in (True, False):
+        if use_parquet and not _PYARROW_AVAILABLE:
+            continue
+        row_root = Path(tempfile.mkdtemp(prefix="metabolic-rowstore-test-"))
+        try:
+            unweighted = RowStore(row_root / "unweighted")
+            unweighted.parquet = use_parquet
+            weighted_store = RowStore(row_root / "weighted")
+            weighted_store.parquet = use_parquet
+            # Written in two chunks, as the real builder flushes them, so add() has to route one
+            # chunk across several task partitions rather than receiving pre-split frames.
+            unweighted.add(whole.iloc[: len(whole) // 2])
+            unweighted.add(whole.iloc[len(whole) // 2 :])
+            expected_weighted, expected_diagnostics = estimate_cross_fitted_weights(whole, SEED)
+            _, streamed_diagnostics = estimate_weights_over_store(unweighted, weighted_store, SEED)
+            # Row order within a task is add order, so compare on row_id rather than position.
+            streamed_weighted = concat_frames(
+                [weighted_store.read(key) for key in weighted_store.keys()]
+            ).sort_values("row_id", kind="stable").reset_index(drop=True)
+            baseline_weighted = expected_weighted.sort_values("row_id", kind="stable").reset_index(drop=True)
+            weights_match = bool(
+                len(streamed_weighted) == len(baseline_weighted)
+                and np.allclose(
+                    streamed_weighted["analysis_weight"].to_numpy(float),
+                    baseline_weighted["analysis_weight"].to_numpy(float),
+                    rtol=0, atol=0, equal_nan=True,
+                )
+                and streamed_weighted["row_id"].tolist() == baseline_weighted["row_id"].tolist()
+            )
+            diagnostics_match = bool(
+                list(streamed_diagnostics.columns) == list(expected_diagnostics.columns)
+                and streamed_diagnostics.astype(str).equals(expected_diagnostics.astype(str))
+            )
+            split_metadata = {"heldout_centers": [], "center_validation_available": True}
+            audit_match = leakage_audit_over_store(unweighted, split_metadata).equals(
+                leakage_audit(whole, split_metadata)
+            )
+            values = development_target_values(weighted_store)
+            iqr_match = bool(
+                development_iqr_scale_map_from_values(values) == development_iqr_scale_map(expected_weighted)
+                and development_iqr_by_task_from_values(values)
+                .astype(str)
+                .equals(development_iqr_by_task(expected_weighted).astype(str))
+            )
+            support_match = bool(
+                target_support_table_over_store(weighted_store)
+                .astype(str)
+                .equals(target_support_table(expected_weighted).astype(str))
+            )
+            # The ODE candidate reads every origin month for one (cohort, outcome) and trains on
+            # batches in frame order, so this must reproduce the original table order exactly.
+            ode_order_match = (
+                read_cohort_outcome_rows(weighted_store, "surgery", "bmi")["row_id"].tolist()
+                == baseline_weighted["row_id"].tolist()
+            )
+            partition_checks.append(
+                f"{'parquet' if use_parquet else 'pickle'}: tasks={len(unweighted.keys())} "
+                f"rows={unweighted.row_count} weights={weights_match} diagnostics={diagnostics_match} "
+                f"leakage={audit_match} iqr={iqr_match} support={support_match} ode_order={ode_order_match}"
+            )
+            check(
+                f"04d_row_store_partitioning_is_result_preserving_{'parquet' if use_parquet else 'pickle'}",
+                weights_match
+                and diagnostics_match
+                and audit_match
+                and iqr_match
+                and support_match
+                and ode_order_match
+                and unweighted.row_count == len(whole)
+                and unweighted.keys() == [("surgery", "bmi", 0), ("surgery", "bmi", 3)],
+                partition_checks[-1],
+            )
+        finally:
+            shutil.rmtree(row_root, ignore_errors=True)
+
+    # 4e. row_id is assigned at construction as one contiguous study-wide sequence, which is what
+    # the ensemble intersection, the paired bootstrap and the ODE scatter all join on.
+    first_chunk = assign_chunk_row_ids(pd.DataFrame({"value": range(5)}), 0)
+    second_chunk = assign_chunk_row_ids(pd.DataFrame({"value": range(3)}), len(first_chunk))
+    check(
+        "04e_row_ids_are_one_contiguous_study_wide_sequence",
+        first_chunk["row_id"].tolist() == [0, 1, 2, 3, 4]
+        and second_chunk["row_id"].tolist() == [5, 6, 7]
+        and str(first_chunk["row_id"].dtype) == "int32",
+        f"chunks={first_chunk['row_id'].tolist()}+{second_chunk['row_id'].tolist()} dtype={first_chunk['row_id'].dtype}",
+    )
+
     # 5. A postoperative flag without a resolvable start is a primary exclusion.
     unresolved = classify_surgical_incretin_history([], postoperative_flag=True)
     check(
@@ -8647,15 +10339,15 @@ def run_embedded_self_tests() -> dict[str, Any]:
     gap_episodes, _ = reconstruct_coverage_episodes([record(0, 40), record(72, 182)])
     check(
         "07_31_day_gap_fails_primary",
-        len(gap_episodes) == 2 and not any(item.qualifies_183 for item in gap_episodes),
-        str([(item.maximum_gap_days, item.qualifies_183) for item in gap_episodes]),
+        len(gap_episodes) == 2 and not any(item.qualifies_window for item in gap_episodes),
+        str([(item.maximum_gap_days, item.qualifies_window) for item in gap_episodes]),
     )
 
     # 8. Within-class ingredient switching within the gap remains one episode.
     switch_episodes, _ = reconstruct_coverage_episodes([record(0, 90, "liraglutide"), record(100, 182, "semaglutide")])
     check(
         "08_within_class_switch_continues_episode",
-        len(switch_episodes) == 1 and switch_episodes[0].qualifies_183 and len(switch_episodes[0].switch_days) == 1,
+        len(switch_episodes) == 1 and switch_episodes[0].qualifies_window and len(switch_episodes[0].switch_days) == 1,
         str(asdict(switch_episodes[0])),
     )
 
@@ -8664,7 +10356,7 @@ def run_embedded_self_tests() -> dict[str, Any]:
     low_pdc, _ = reconstruct_coverage_episodes(low_pdc_records)
     check(
         "09_low_pdc_fails",
-        len(low_pdc) == 1 and low_pdc[0].maximum_gap_days <= 30 and low_pdc[0].pdc_183 < 0.80 and not low_pdc[0].qualifies_183,
+        len(low_pdc) == 1 and low_pdc[0].maximum_gap_days <= 30 and low_pdc[0].pdc_qualifying < 0.80 and not low_pdc[0].qualifies_window,
         str(asdict(low_pdc[0])),
     )
 
@@ -8735,7 +10427,7 @@ def run_embedded_self_tests() -> dict[str, Any]:
     tie_target = select_target_measurement(normalized_quality, "bmi", index, 3)
     check(
         "14_outliers_duplicates_and_tie_break",
-        int((quality_audit["reason"] == "outside_plausible_range").sum()) == 2
+        int(quality_audit.loc[quality_audit["reason"].eq("outside_plausible_range"), "n"].sum()) == 2
         and bool(normalized_quality.loc[normalized_quality["measurement_date"].eq(index + pd.Timedelta(days=86)), "duplicate_day"].iloc[0])
         and tie_target is not None and tie_target["day"] == 86 and abs(tie_target["value"] - 40.0) < 1e-12,
         str(tie_target),
@@ -9739,6 +11431,160 @@ def run_embedded_self_tests() -> dict[str, Any]:
             ),
         )
 
+    # 38-39. The streaming acquire is byte-invariant to the patient page size, and a patient
+    # present in both source cohorts stays whole inside one batch even at the smallest page (I1-I7).
+    # Both drive the real stream_wide_acquire with an in-memory wide fixture whose sorted patient
+    # union straddles several page boundaries and includes cross-cohort and multi-row GLP1 patients.
+    def _invariance_wide_fixture() -> tuple[Any, Any]:
+        bmi_columns = [
+            ("BMIatEvent", 0), ("BMI3mPostEvent", 1), ("BMI6mPostEvent", 2), ("BMI12mPostEvent", 3),
+            ("BMI2yPostEvent", 4), ("BMI3yPostEvent", 5),
+        ]
+        hba_columns = [("HbA1cAtEvent", 0), ("HbA1c12mPostEvent", 1), ("HbA1c2yPostEvent", 2)]
+        mbs_rows: list[dict[str, Any]] = []
+        glp1_rows: list[dict[str, Any]] = []
+        for index in range(6):
+            patient = f"INV{index:03d}"
+            # Patients 1 and 4 appear in both source tables under a shared PatKey. Their surgery is
+            # dated about three years after their incretin episode so they qualify for both arms -
+            # the bariatric procedure falls outside the first 183 days after the incretin index.
+            cross_cohort = index in (1, 4)
+            mbs_row = {
+                "PatKey": patient, "CptCode": "43775" if index % 2 == 0 else "43644",
+                "ProcDateValue": f"{2022 if cross_cohort else 2019 + index % 3}-0{1 + index % 8}-15", "AgeAtEvent": 30 + index * 4,
+                "PriorGLP1": 0, "PostOpGLP1": 0, "PMH_PriorMBS": 0, "PMH_dialysis_transplant": 0,
+                "ActiveEndInterval": 2200,
+            }
+            for name, offset in bmi_columns:
+                mbs_row[name] = 42.0 - offset * 1.3 + index * 0.2
+            for name, offset in hba_columns:
+                mbs_row[name] = 7.5 - offset * 0.2 + index * 0.05
+            mbs_rows.append(mbs_row)
+            # Patients 1 and 4 reuse their surgery PatKey in the incretin table, so a page of one
+            # patient still carries their surgery and incretin rows together across both tables.
+            glp1_key = patient if cross_cohort else f"GLP{index:03d}"
+            for repeat in range(2 if index % 3 == 0 else 1):
+                year = 2019 + (0 if cross_cohort else (index + repeat) % 3)
+                glp1_row = {
+                    "PatKey": glp1_key, "AgeAtEvent": 33 + index * 3, "PriorGLP1": 0,
+                    "GLP1StartDate": f"{year}-0{1 + (index + repeat) % 8}-10",
+                    "GLP1EndDate": f"{year + 1}-0{1 + (index + repeat) % 8}-10",
+                    "GLP1Duration": 400, "GLP1Name": ["semaglutide", "tirzepatide", "dulaglutide"][(index + repeat) % 3],
+                    "GLP1Route": "subcutaneous", "MostRecentDose": 1.0, "MaxGLP1Dose": 2.4,
+                    "PMH_PriorMBS": 0, "MBSduringGLP1": 0, "PMH_dialysis_transplant": 0, "ActiveEndInterval": 2200,
+                }
+                for name, offset in bmi_columns:
+                    glp1_row[name] = 36.0 - offset * 0.6 + index * 0.15
+                for name, offset in hba_columns:
+                    glp1_row[name] = 7.0 - offset * 0.15 + index * 0.05
+                glp1_rows.append(glp1_row)
+        return pd.DataFrame(mbs_rows), pd.DataFrame(glp1_rows)
+
+    invariance_mbs, invariance_glp1 = _invariance_wide_fixture()
+
+    def _invariance_reader(sql: str, connection: Any) -> Any:
+        frame = invariance_glp1 if "GLP1Cohort" in sql else invariance_mbs
+        if "column probe" in sql:
+            return frame.iloc[0:0].copy()
+        if "aggregate source count" in sql:
+            return pd.DataFrame([{"source_rows": len(frame), "source_patients": frame["PatKey"].nunique()}])
+        return frame.copy()
+
+    def _artifact_signature(frame: Any, sort_columns: Sequence[str] | None = None) -> str:
+        work = frame.copy()
+        if sort_columns:
+            work = work.sort_values([column for column in sort_columns if column in work.columns]).reset_index(drop=True)
+        lines = [repr(list(work.columns))]
+        for column in work.columns:
+            rendered = []
+            for value in work[column].tolist():
+                if value is pd.NaT:
+                    rendered.append("NaT")
+                elif isinstance(value, (bool, np.bool_)):
+                    rendered.append(str(bool(value)))
+                elif isinstance(value, (int, float, np.integer, np.floating)):
+                    number = float(value)
+                    # Compare numeric content the way the figure oracle does (%.10g). An
+                    # integer-valued column stored as int64 under one page layout and float64
+                    # under another - a difference the figure dump renders identically and that
+                    # never reaches the figure payload - must not read as a page-size mismatch.
+                    rendered.append("nan" if math.isnan(number) else f"{number:.10g}")
+                else:
+                    rendered.append(str(value))
+            lines.append(f"{column}=" + "|".join(rendered))
+        return "\n".join(lines)
+
+    invariance_environment = ("METABOLIC_SOURCE_SCHEMA", "METABOLIC_MBS_TABLE", "METABOLIC_GLP1_TABLE")
+    invariance_saved = {name: os.environ.get(name) for name in invariance_environment}
+    invariance_original_connect = globals()["connect_cosmos"]
+    invariance_original_reader = pd.read_sql_query
+    invariance_signatures: dict[int, dict[str, str]] = {}
+    invariance_payloads: dict[int, tuple[Any, dict[str, Any]]] = {}
+    try:
+        for name in invariance_environment:
+            os.environ.pop(name, None)
+        globals()["connect_cosmos"] = lambda: type("InvarianceConnection", (), {"close": lambda self: None})()
+        pd.read_sql_query = _invariance_reader
+        for page in (1, 3, 10_000):
+            artifacts, bundle = stream_wide_acquire(RunConfig.create("smoke", None, False), patient_page=page)
+            invariance_signatures[page] = {
+                "cohorts": _artifact_signature(artifacts["cohorts"]),
+                "measurements": _artifact_signature(
+                    artifacts["measurements"], ["patient_id", "measurement_date", "outcome", "source_cohort"]
+                ),
+                "funnel": _artifact_signature(artifacts["funnel"]),
+            }
+            invariance_payloads[page] = (bundle, artifacts)
+    finally:
+        globals()["connect_cosmos"] = invariance_original_connect
+        pd.read_sql_query = invariance_original_reader
+        for name, value in invariance_saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    invariance_reference = invariance_signatures[10_000]
+    reference_bundle = invariance_payloads[10_000][0]
+    artifact_mismatch = [
+        f"page={page}:{key}"
+        for page, signature in invariance_signatures.items()
+        for key in invariance_reference
+        if signature[key] != invariance_reference[key]
+    ]
+    metadata_mismatch = [
+        f"page={page}"
+        for page, (bundle, _) in invariance_payloads.items()
+        if bundle.metadata["preflight"] != reference_bundle.metadata["preflight"]
+        or bundle.metadata["index_row_selection"] != reference_bundle.metadata["index_row_selection"]
+    ]
+    check(
+        "38_streaming_acquire_batch_size_invariance",
+        not artifact_mismatch and not metadata_mismatch,
+        f"artifact_mismatch={artifact_mismatch}; metadata_mismatch={metadata_mismatch}",
+    )
+
+    smallest_bundle, smallest_artifacts = invariance_payloads[1]
+    smallest_cohorts = smallest_artifacts["cohorts"]
+    smallest_splits, _ = assign_global_splits(smallest_cohorts)
+    cross_cohort_patients = sorted(set(invariance_mbs["PatKey"]).intersection(invariance_glp1["PatKey"]))
+    cross_cohort_ok = bool(cross_cohort_patients)
+    for patient in cross_cohort_patients:
+        cohort_rows = smallest_cohorts.loc[smallest_cohorts["patient_id"].eq(patient)]
+        merged_attributes = (
+            "mbs__wide_index_date" in cohort_rows
+            and "glp1__wide_index_date" in cohort_rows
+            and cohort_rows["mbs__wide_index_date"].notna().all()
+            and cohort_rows["glp1__wide_index_date"].notna().all()
+        )
+        single_split = int(smallest_splits.loc[smallest_splits["patient_id"].eq(patient), "split"].nunique()) == 1
+        cross_cohort_ok = cross_cohort_ok and set(cohort_rows["cohort"]) == {"surgery", "incretin"} and merged_attributes and single_split
+    check(
+        "39_streaming_cross_cohort_stays_whole_at_page_one",
+        cross_cohort_ok,
+        f"cross_cohort_patients={cross_cohort_patients}",
+    )
+
     return {
         "status": "passed",
         "tests": results,
@@ -9855,6 +11701,10 @@ def write_preflight_success(context: RunContext, bundle: DataBundle, dependencie
             "medication_coverage_semantics": bundle.metadata.get(
                 "medication_coverage_semantics", "audited_raw_events"
             ),
+            "incretin_qualifying_months": int(
+                bundle.metadata.get("incretin_qualifying_months")
+                or round(bundle_incretin_qualifying_days(bundle) / DAYS_PER_MONTH)
+            ),
             "center_validation_available": bool(
                 bundle.metadata.get("center_validation_available", True)
             ),
@@ -9879,11 +11729,18 @@ def write_preflight_success(context: RunContext, bundle: DataBundle, dependencie
 
 def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     set_deterministic_seed(cfg.seed, include_torch=bool(dependencies.get("torch_importable")))
+    streamed_cohort_artifacts: dict[str, Any] | None = None
     if cfg.smoke and not use_real_smoke_source(dependencies):
         bundle = synthetic_data_bundle(cfg)
         print("[metabolic] smoke source: deterministic raw-event fixture", flush=True)
+    elif cfg.mode == "preflight-only":
+        bundle = query_cosmos(cfg, preflight_only=True)
+        print("[metabolic] source: Cosmos preflight query", flush=True)
     else:
-        bundle = query_cosmos(cfg, preflight_only=cfg.mode == "preflight-only")
+        # The wide production path streams cohort construction one patient page at a time so the
+        # acquire transient is bounded (Section 5); it returns the cohort artifacts and a light
+        # metadata-plus-medications bundle for the run context and the gap-rule sensitivity.
+        streamed_cohort_artifacts, bundle = stream_wide_acquire(cfg)
         print("[metabolic] source: bounded Cosmos query" if cfg.smoke else "[metabolic] source: Cosmos production query", flush=True)
     context = make_run_context(cfg, bundle, dependencies)
     if cfg.mode == "preflight-only":
@@ -9895,14 +11752,20 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     timing_label = bundle.metadata.get("measurement_timing", "exact-day")
     print(f"[metabolic] constructing cohorts and outcomes ({timing_label})", flush=True)
     cohort_artifacts, cohort_hash = load_or_run_stage(
-        context, "cohorts", lambda: construct_cohorts(bundle)
+        context,
+        "cohorts",
+        lambda: streamed_cohort_artifacts if streamed_cohort_artifacts is not None else construct_cohorts(bundle),
     )
-    # Cohort construction has consumed the raw patient/procedure/measurement frames; only
-    # bundle.medications (gap-rule sensitivity) and bundle.metadata are read afterwards.
-    # Release the rest so they do not occupy memory through modeling at production scale.
+    # The gap-rule sensitivity is the last analysis that reads raw medication events, and it
+    # depends on nothing computed later, so it runs here rather than in the evaluation stage.
+    gap_sensitivity, _ = load_or_run_stage(context, "gap_sensitivity", lambda: gap_rule_sensitivity(bundle))
+    # Cohort construction and the gap-rule sensitivity have now consumed every raw event frame;
+    # only bundle.metadata is read afterwards. Release the rest so they do not occupy memory
+    # through modeling at production scale.
     bundle.patients = bundle.patients.iloc[0:0].copy()
     bundle.procedures = bundle.procedures.iloc[0:0].copy()
     bundle.measurements = bundle.measurements.iloc[0:0].copy()
+    bundle.medications = bundle.medications.iloc[0:0].copy()
     gc.collect()
     split_payload, split_hash = load_or_run_stage(
         context,
@@ -9915,11 +11778,11 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     prediction_rows, row_hash = load_or_run_stage(
         context,
         "prediction_rows",
-        lambda: build_prediction_rows(cohorts, cohort_artifacts["measurements"]),
+        lambda: build_prediction_rows(cohorts, cohort_artifacts["measurements"], context.new_row_store("unweighted")),
         {"cohorts": cohort_hash, "splits": split_hash},
     )
     try:
-        leakage = leakage_audit(prediction_rows, split_metadata)
+        leakage = leakage_audit_over_store(prediction_rows, split_metadata)
     except LeakageError as exc:
         render_preflight_failure(cfg, "Leakage invariant failed", [str(exc)], ["Model fitting was not started."])
         raise
@@ -9927,19 +11790,29 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     weight_payload, weight_hash = load_or_run_stage(
         context,
         "weights",
-        lambda: dict(zip(("rows", "diagnostics"), estimate_cross_fitted_weights(prediction_rows, cfg.seed), strict=True)),
+        lambda: dict(
+            zip(
+                ("rows", "diagnostics"),
+                estimate_weights_over_store(prediction_rows, context.new_row_store("weighted"), cfg.seed),
+                strict=True,
+            )
+        ),
         {"prediction_rows": row_hash},
     )
     weighted_rows = weight_payload["rows"]
     weight_diagnostics = weight_payload["diagnostics"]
-    # weighted_rows is a copy of prediction_rows with weight columns added; the original is
-    # not read again, so release it before model fitting, which needs the memory.
     del prediction_rows
     gc.collect()
     ode_gates = ode_suitability_gates(cohorts, cohort_artifacts["measurements"], dependencies)
     # Development IQR scale, sourced from the prediction-row table so the model roster and
     # leaderboard no longer depend on train-split predictions (which are dropped from storage).
-    scale_map = development_iqr_scale_map(weighted_rows)
+    # Both IQR reductions consume the same pooled values, so the table is streamed once.
+    development_values = development_target_values(weighted_rows)
+    scale_map = development_iqr_scale_map_from_values(development_values)
+    development_iqr = development_iqr_by_task_from_values(development_values)
+    support_table = target_support_table_over_store(weighted_rows)
+    del development_values
+    gc.collect()
     print("[metabolic] fitting matched candidate roster", flush=True)
     model_payload, model_hash = load_or_run_stage(
         context,
@@ -9953,6 +11826,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
                     dependencies,
                     ode_gates,
                     scale_map,
+                    context.new_prediction_store("uncalibrated"),
                     cohorts=cohorts,
                     measurements=cohort_artifacts["measurements"],
                 ),
@@ -9964,37 +11838,27 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
     predictions = model_payload["predictions"]
     model_status = model_payload["status"]
     neural_details = model_payload["details"]
-    # weighted_rows (the prediction-row table) is the second-largest object in the run and is
-    # not needed past model fitting except for two cheap task-level reductions. Compute them
-    # now and release the frame - including the checkpoint payload's reference - so it does not
-    # occupy memory through evaluation and figure assembly at production scale.
-    development_iqr = development_iqr_by_task(weighted_rows)
-    support_table = target_support_table(weighted_rows)
     del weighted_rows
-    weight_payload["rows"] = None
     gc.collect()
-    leaderboard = candidate_validation_scores(predictions, scale_map)
+    calibrated = context.new_prediction_store("calibrated")
+    leaderboard, calibration = calibrate_prediction_store(predictions, calibrated, scale_map)
     selected = select_models(leaderboard)
-    calibrated, calibration = conformal_calibrate(predictions)
-    # conformal_calibrate mutates predictions in place, so the uncalibrated frame and its
-    # calibrated copy never coexist; the uncalibrated view (leaderboard) was already computed.
     del predictions
     model_payload["predictions"] = None
     print("[metabolic] evaluating protected tests and uncertainty", flush=True)
 
     def evaluation_stage() -> dict[str, Any]:
-        metrics, pit_values = evaluate_predictions(calibrated, weight_diagnostics)
+        metrics, pit_histograms = evaluate_prediction_store(calibrated, weight_diagnostics)
         iqr = development_iqr
-        bootstrap_ci, comparisons = bootstrap_uncertainty(calibrated, selected, cfg)
+        bootstrap_ci, comparisons = bootstrap_uncertainty_over_store(calibrated, selected, cfg)
         gates = apply_success_gates(metrics, selected, iqr, comparisons)
         gates = apply_source_claim_limit(gates, bundle.metadata)
         gates = apply_smoke_claim_limit(gates, cfg)
-        sensitivity = weight_sensitivity_table(calibrated, selected)
-        gap_sensitivity = gap_rule_sensitivity(bundle)
+        sensitivity = weight_sensitivity_over_store(calibrated, selected)
         examples, joint_scores = build_synthetic_trajectory_examples(calibrated, selected, cfg)
         return {
             "metrics": metrics,
-            "pit_values": pit_values,
+            "pit_histograms": pit_histograms,
             "iqr": iqr,
             "gates": gates,
             "bootstrap_ci": bootstrap_ci,
@@ -10031,7 +11895,7 @@ def run_study(cfg: RunConfig, dependencies: Mapping[str, Any]) -> Path:
             calibration=calibration,
             metrics=evaluation["metrics"],
             iqr=evaluation["iqr"],
-            pit_values=evaluation["pit_values"],
+            pit_histograms=evaluation["pit_histograms"],
             bootstrap_ci=evaluation["bootstrap_ci"],
             comparisons=evaluation["comparisons"],
             gates=evaluation["gates"],
@@ -10070,15 +11934,20 @@ STAGE_SEQUENCE = (
 
 
 def bundle_for_light_checkpoint(bundle: DataBundle) -> DataBundle:
-    """A minimal copy of the data bundle for the stages that run after cohort construction. Only
-    medications (gap-rule sensitivity) and metadata (figure identity + source-claim limits) are
-    read downstream, so every large event frame is replaced by an empty same-schema frame. This is
-    what lets the evaluation and figure workers run without ever reloading the raw bundle."""
+    """A metadata-only copy of the data bundle for the stages after cohort construction.
+
+    Nothing downstream reads a raw event frame any more: metadata carries figure identity, the
+    source-claim limits and the qualifying window, and the one analysis that needed raw medication
+    events - the gap-rule sensitivity - is computed while the full bundle is still open and
+    persisted as its own four-row checkpoint. So every event frame is replaced by an empty
+    same-schema frame, including medications, which is one row per dispense or administration and
+    was previously carried through evaluation and figure assembly.
+    """
     empty = lambda frame: frame.iloc[0:0].copy()
     return DataBundle(
         patients=empty(bundle.patients),
         procedures=empty(bundle.procedures),
-        medications=bundle.medications,
+        medications=empty(bundle.medications),
         measurements=empty(bundle.measurements),
         encounters=empty(bundle.encounters),
         diagnoses=empty(bundle.diagnoses),
@@ -10103,18 +11972,24 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
     set_deterministic_seed(cfg.seed, include_torch=bool(dependencies.get("torch_importable")))
 
     if stage == "acquire_cohorts":
+        streamed_cohort_artifacts: dict[str, Any] | None = None
         if cfg.smoke and not use_real_smoke_source(dependencies):
             bundle = synthetic_data_bundle(cfg)
             print("[metabolic] smoke source: deterministic raw-event fixture", flush=True)
         else:
-            bundle = query_cosmos(cfg, preflight_only=False)
+            streamed_cohort_artifacts, bundle = stream_wide_acquire(cfg, preflight_only=False)
             print("[metabolic] source: bounded Cosmos query" if cfg.smoke else "[metabolic] source: Cosmos production query", flush=True)
         context = make_run_context(cfg, bundle, dependencies)
         timing_label = bundle.metadata.get("measurement_timing", "exact-day")
         print(f"[metabolic] constructing cohorts and outcomes ({timing_label})", flush=True)
-        context.save_checkpoint("cohorts", construct_cohorts(bundle))
-        # Cohort construction has consumed the raw patient/procedure/measurement frames; keep only
-        # medications + metadata for the downstream stages, mirroring run_study's in-process release.
+        context.save_checkpoint("cohorts", streamed_cohort_artifacts if streamed_cohort_artifacts is not None else construct_cohorts(bundle))
+        # The gap-rule sensitivity is the only analysis downstream of here that reads raw
+        # medication events, and it depends on nothing but the bundle. Computing it now, while the
+        # bundle is still open, reduces it to a four-row frame and is what lets the light bundle
+        # drop the medication table entirely instead of carrying it to the evaluation stage.
+        context.save_checkpoint("gap_sensitivity", gap_rule_sensitivity(bundle))
+        # Cohort construction has consumed the raw event frames and the gap-rule sensitivity has
+        # consumed the medications; keep only metadata, mirroring run_study's in-process release.
         bundle.patients = bundle.patients.iloc[0:0].copy()
         bundle.procedures = bundle.procedures.iloc[0:0].copy()
         bundle.measurements = bundle.measurements.iloc[0:0].copy()
@@ -10137,12 +12012,17 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
         split_hash = checkpoint_hash(context, "global_splits")
         cohorts = split_payload["cohorts"]
         split_metadata = split_payload["metadata"]
-        rows = build_prediction_rows(cohorts, cohort_artifacts["measurements"])
+        rows = build_prediction_rows(cohorts, cohort_artifacts["measurements"], context.new_row_store("unweighted"))
         row_hash = context.save_checkpoint("prediction_rows", rows, {"cohorts": cohort_hash, "splits": split_hash})
+        # The ODE suitability gates are the only reason the modeling stage would otherwise have to
+        # load the measurement table at all. Deciding them here, where the table is already open,
+        # reduces them to a four-row frame that both modeling and figure assembly read instead.
+        ode_gates = ode_suitability_gates(cohorts, cohort_artifacts["measurements"], dependencies)
+        context.save_checkpoint("ode_gates", ode_gates, {"cohorts": cohort_hash, "splits": split_hash})
         # The leakage audit is a guard that must pass before weighting/modeling. Persist its small
         # result so the figure stage never reloads the full prediction-row table just to read it.
         try:
-            leakage = leakage_audit(rows, split_metadata)
+            leakage = leakage_audit_over_store(rows, split_metadata)
         except LeakageError as exc:
             render_preflight_failure(cfg, "Leakage invariant failed", [str(exc)], ["Model fitting was not started."])
             raise
@@ -10151,17 +12031,25 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
     elif stage == "weights":
         rows = require_checkpoint(context, "prediction_rows")
         row_hash = checkpoint_hash(context, "prediction_rows")
-        weight_payload = dict(zip(("rows", "diagnostics"), estimate_cross_fitted_weights(rows, cfg.seed), strict=True))
+        weight_payload = dict(
+            zip(
+                ("rows", "diagnostics"),
+                estimate_weights_over_store(rows, context.new_row_store("weighted"), cfg.seed),
+                strict=True,
+            )
+        )
         weight_hash = context.save_checkpoint("weights", weight_payload, {"prediction_rows": row_hash})
         del rows
         gc.collect()
         weighted_rows = weight_payload["rows"]
-        # Small reductions of weighted_rows that downstream stages need; persisting them here is
-        # what lets calibration/evaluation/figure avoid ever reloading the weighted-row table.
+        # Small reductions of the weighted rows that downstream stages need; persisting them here
+        # is what lets calibration/evaluation/figure avoid ever reopening the row table. Both IQR
+        # reductions consume the same pooled values, so the table is streamed once for them.
+        development_values = development_target_values(weighted_rows)
         derived = {
-            "scale_map": development_iqr_scale_map(weighted_rows),
-            "development_iqr": development_iqr_by_task(weighted_rows),
-            "support": target_support_table(weighted_rows),
+            "scale_map": development_iqr_scale_map_from_values(development_values),
+            "development_iqr": development_iqr_by_task_from_values(development_values),
+            "support": target_support_table_over_store(weighted_rows),
             "diagnostics": weight_payload["diagnostics"],
         }
         context.save_checkpoint("weights_derived", derived, {"weights": weight_hash})
@@ -10172,17 +12060,28 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
         weighted_rows = weight_payload["rows"]
         derived = require_checkpoint(context, "weights_derived")
         scale_map = derived["scale_map"]
-        cohort_artifacts = require_checkpoint(context, "cohorts")
-        split_payload = require_checkpoint(context, "global_splits")
-        cohorts = split_payload["cohorts"]
-        measurements = cohort_artifacts["measurements"]
-        ode_gates = ode_suitability_gates(cohorts, measurements, dependencies)
+        ode_gates = require_checkpoint(context, "ode_gates")
+        # The cohort and measurement tables are inputs to the ODE candidate alone, and it is
+        # fitted only where every suitability gate passed. Loading them only in that case keeps
+        # the measurement table - the largest frame in the cohorts checkpoint - off the heap for
+        # the whole of the longest stage on every run where no task qualifies.
+        cohorts = measurements = None
+        if bool(ode_gates["appropriate"].any()):
+            cohorts = require_checkpoint(context, "global_splits")["cohorts"]
+            measurements = require_checkpoint(context, "cohorts")["measurements"]
         print("[metabolic] fitting matched candidate roster", flush=True)
         payload = dict(
             zip(
                 ("predictions", "status", "details"),
                 fit_candidate_roster(
-                    weighted_rows, cfg, dependencies, ode_gates, scale_map, cohorts=cohorts, measurements=measurements
+                    weighted_rows,
+                    cfg,
+                    dependencies,
+                    ode_gates,
+                    scale_map,
+                    context.new_prediction_store("uncalibrated"),
+                    cohorts=cohorts,
+                    measurements=measurements,
                 ),
                 strict=True,
             )
@@ -10195,9 +12094,9 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
         derived = require_checkpoint(context, "weights_derived")
         scale_map = derived["scale_map"]
         predictions = model_payload["predictions"]
-        leaderboard = candidate_validation_scores(predictions, scale_map)
+        calibrated = context.new_prediction_store("calibrated")
+        leaderboard, calibration = calibrate_prediction_store(predictions, calibrated, scale_map)
         selected = select_models(leaderboard)
-        calibrated, calibration = conformal_calibrate(predictions)
         payload = {
             "calibrated": calibrated,
             "calibration": calibration,
@@ -10218,17 +12117,18 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
         weight_diagnostics = derived["diagnostics"]
         development_iqr = derived["development_iqr"]
         print("[metabolic] evaluating protected tests and uncertainty", flush=True)
-        metrics, pit_values = evaluate_predictions(calibrated, weight_diagnostics)
-        bootstrap_ci, comparisons = bootstrap_uncertainty(calibrated, selected, cfg)
+        metrics, pit_histograms = evaluate_prediction_store(calibrated, weight_diagnostics)
+        bootstrap_ci, comparisons = bootstrap_uncertainty_over_store(calibrated, selected, cfg)
         gates = apply_success_gates(metrics, selected, development_iqr, comparisons)
         gates = apply_source_claim_limit(gates, bundle.metadata)
         gates = apply_smoke_claim_limit(gates, cfg)
-        sensitivity = weight_sensitivity_table(calibrated, selected)
-        gap_sensitivity = gap_rule_sensitivity(bundle)
+        sensitivity = weight_sensitivity_over_store(calibrated, selected)
+        # Computed in the acquire stage, where the raw medication events were still open.
+        gap_sensitivity = require_checkpoint(context, "gap_sensitivity")
         examples, joint_scores = build_synthetic_trajectory_examples(calibrated, selected, cfg)
         payload = {
             "metrics": metrics,
-            "pit_values": pit_values,
+            "pit_histograms": pit_histograms,
             "iqr": development_iqr,
             "gates": gates,
             "bootstrap_ci": bootstrap_ci,
@@ -10251,7 +12151,8 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
         bundle = require_checkpoint(context, "bundle_light")
         cohorts = split_payload["cohorts"]
         split_metadata = split_payload["metadata"]
-        ode_gates = ode_suitability_gates(cohorts, cohort_artifacts["measurements"], dependencies)
+        # Read back rather than recomputed from the measurement table, as the modeling stage does.
+        ode_gates = require_checkpoint(context, "ode_gates")
         figure_payload = build_figure_data(
             context=context,
             dependencies=dependencies,
@@ -10270,7 +12171,7 @@ def run_stage_worker(cfg: RunConfig, dependencies: Mapping[str, Any], stage: str
             calibration=calibration_payload["calibration"],
             metrics=evaluation["metrics"],
             iqr=evaluation["iqr"],
-            pit_values=evaluation["pit_values"],
+            pit_histograms=evaluation["pit_histograms"],
             bootstrap_ci=evaluation["bootstrap_ci"],
             comparisons=evaluation["comparisons"],
             gates=evaluation["gates"],
@@ -10297,7 +12198,12 @@ def run_study_orchestrated(cfg: RunConfig, dependencies: Mapping[str, Any]) -> P
     run_dir = Path(cfg.output_dir).expanduser().resolve() if cfg.output_dir else timestamped_default_output_dir()
     worker_env = os.environ.copy()
     for stage in STAGE_SEQUENCE:
-        argv = [sys.executable, str(SCRIPT_PATH), "--worker", stage, "--output-dir", str(run_dir)]
+        argv = [
+            sys.executable, str(SCRIPT_PATH), "--worker", stage, "--output-dir", str(run_dir),
+            # Every scientific switch must be forwarded: a worker parses its own CLI, so a flag
+            # left off here would silently run that stage under the default rule.
+            "--incretin-qualifying-months", str(cfg.incretin_qualifying_months),
+        ]
         if cfg.smoke:
             argv.append("--smoke")
         print(f"[metabolic] orchestrated stage: {stage}", flush=True)
@@ -10397,6 +12303,19 @@ def build_parser() -> argparse.ArgumentParser:
         help=r"Override the default .\results\metabolic_trajectory_YYYYMMDD_HHMMSS run directory",
     )
     parser.add_argument("--resume", action="store_true", help="Resume only verified fingerprint-compatible checkpoints")
+    parser.add_argument(
+        "--incretin-qualifying-months",
+        type=int,
+        choices=list(INCRETIN_QUALIFYING_MONTH_CHOICES),
+        default=INCRETIN_QUALIFYING_MONTHS,
+        help=(
+            "Completed months of recorded incretin treatment required to enter the incretin arm "
+            f"(default {INCRETIN_QUALIFYING_MONTHS}). This changes the estimand, not only the "
+            "sample size: a longer window conditions entry on persistence occurring after index, "
+            "so the earlier landmark origins carry immortal time and the surgical arm, which has "
+            "no matching requirement, is a correspondingly less like-for-like comparator."
+        ),
+    )
     parser.add_argument("--worker", choices=STAGE_SEQUENCE, default=None, help=argparse.SUPPRESS)
     parser.add_argument(
         "--orchestrate",
@@ -10430,7 +12349,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         mode = "smoke"
     elif args.plot_only:
         mode = "plot-only"
-    cfg = RunConfig.create(mode, args.output_dir, args.resume)
+    cfg = RunConfig.create(
+        mode,
+        args.output_dir,
+        args.resume,
+        incretin_qualifying_months=args.incretin_qualifying_months,
+    )
     require_database = mode in {"production", "preflight-only", "schema-discovery"}
     dependencies, dependency_issues = dependency_manifest(require_database=require_database)
     if dependency_issues:

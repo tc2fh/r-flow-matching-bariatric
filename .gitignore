@@ -16,3 +16,5 @@ __pycache__/
 
 # temporary folder
 temp/
+# Study run outputs
+results/
