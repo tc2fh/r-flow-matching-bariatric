@@ -68,7 +68,7 @@ import traceback
 import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 
 # --------------------------------------------------------------------------------------------
@@ -135,6 +135,8 @@ ESTIMAND_NOTE = (
     "Marginal average treatment effect of RYGB vs sleeve in the eligible surgical target "
     "population, under conditional exchangeability given measured baseline L. Causal only under "
     "that unverifiable assumption; the E-value and RCT benchmark bound residual confounding. "
+    "Procedure choice is a point intervention at time zero, so ITT and per-protocol coincide and "
+    "no separate per-protocol contrast is estimated. "
     "Not a substitute for an RCT. Unmeasured confounders include GERD/reflux and surgeon/center."
 )
 
@@ -157,6 +159,10 @@ SECONDARY_PAGE_FILES = (
     "14_decision_curves.png",
     "15_predictability_map_and_glp1_vs_surgery.png",
     "16_gates_limitations_and_conclusion.png",
+    "17_per_procedure_auroc.png",
+    "18_cate_heterogeneous_benefit.png",
+    "19_forecast_feature_sensitivity.png",
+    "20_per_arm_calibration_and_accuracy.png",
 )
 FIGURE_BOOK_PDF = "secondary_analyses_figure_book.pdf"
 FAILURE_PNG = "00_preflight_failure.png"
@@ -536,13 +542,16 @@ COVARIATE_COLUMNS = (
     "baseline_hba1c_day", "diabetes_eligible", "diabetes_flag", "hypertension", "dyslipidemia",
     "osa", "insulin", "biguanide", "sglt2", "svi", "ruca", "state", "sex", "race", "ethnicity",
     "coverage", "center_id", "index_year", "smoking",
-)
+# Section 4.1's enriched preoperative baselines ride on the study module's own roster, so this
+# frame surfaces exactly what the acquire gated in. _dedupe_covariates keeps only the names that
+# are actually columns, so an unacquired covariate never materializes as an all-NaN column.
+) + study.OPTIONAL_WIDE_NUMERIC_COVARIATES
 # The covariate axes whose population must be audited before an analysis that needs them runs.
 AUDITED_COLUMNS = (
     "state", "svi", "ruca", "race", "sex", "ethnicity", "index_ingredient", "index_route",
     "procedure", "diabetes_flag", "hypertension", "dyslipidemia", "osa", "insulin", "biguanide",
     "sglt2", "coverage", "index_year", "age_at_index", "baseline_bmi", "baseline_hba1c",
-)
+) + study.OPTIONAL_WIDE_NUMERIC_COVARIATES
 
 
 def _dedupe_covariates(cohorts: Any) -> Any:
@@ -832,8 +841,10 @@ TTE_NUMERIC_CONFOUNDERS = (
     "osa", "insulin", "biguanide", "sglt2", "svi", "index_year",
 )
 TTE_BASE_CATEGORICAL_CONFOUNDERS = ("sex", "ethnicity", "coverage")
-# state / ruca enter L only when the column-population audit marks them usable.
+# state / ruca and Section 4.1's enriched baselines (creatinine, eGFR, GERD, the lab panel) enter
+# L only when the column-population audit marks them usable; the rest are named absent confounders.
 TTE_OPTIONAL_CATEGORICAL_CONFOUNDERS = ("state", "ruca")
+TTE_OPTIONAL_NUMERIC_CONFOUNDERS = study.OPTIONAL_WIDE_NUMERIC_COVARIATES
 
 # Positivity / overlap gate thresholds (production gate, spec Section 6 Part A).
 POSITIVITY_MIN_ESS = 50.0
@@ -860,14 +871,22 @@ def _tte_population_label(outcome: str) -> str:
     return "HbA1c (diabetes-eligible)" if outcome == "hba1c" else "BMI (all eligible surgical)"
 
 
-def _tte_confounder_lists(audit: Any) -> tuple[list[str], list[str]]:
-    """Numeric and categorical L column lists; state/ruca gated by the population audit."""
+def _tte_confounder_lists(audit: Any) -> tuple[list[str], list[str], list[str]]:
+    """Numeric and categorical L column lists, plus the optional confounders the audit refused.
+
+    One gate covers every optional confounder: state/ruca and the enriched baselines alike join L
+    only when the population audit marks the column usable. An unpopulated one (GERD and the lab
+    panel are not acquirable from this source) is OMITTED from L rather than carried as an all-NaN
+    confounder, and comes back in the third list as a named absent confounder.
+    """
     numeric = list(TTE_NUMERIC_CONFOUNDERS)
     categorical = list(TTE_BASE_CATEGORICAL_CONFOUNDERS)
-    for column in TTE_OPTIONAL_CATEGORICAL_CONFOUNDERS:
-        if audit is not None and audit_usable(audit, column):
-            categorical.append(column)
-    return numeric, categorical
+    absent: list[str] = []
+    for optional, accepted in ((TTE_OPTIONAL_NUMERIC_CONFOUNDERS, numeric),
+                               (TTE_OPTIONAL_CATEGORICAL_CONFOUNDERS, categorical)):
+        for column in optional:
+            (accepted if audit is not None and audit_usable(audit, column) else absent).append(column)
+    return numeric, categorical, sorted(absent)
 
 
 def _encoded_feature_names(encoder: Any) -> list[str]:
@@ -899,7 +918,7 @@ def build_wide_L_A(surgical_covariates: Any, outcome: str, audit: Any) -> tuple[
     """
     frame = surgical_covariates.copy()
     frame["baseline_value"] = pd.to_numeric(frame[_tte_baseline_column(outcome)], errors="coerce")
-    numeric, categorical = _tte_confounder_lists(audit)
+    numeric, categorical, _absent = _tte_confounder_lists(audit)
     numeric = [column for column in numeric if column == "baseline_value" or column in frame.columns]
     categorical = [column for column in categorical if column in frame.columns]
     encoder = study.TabularEncoder.fit(frame, numeric=numeric, categorical=categorical)
@@ -1058,6 +1077,19 @@ def positivity_gate(ps: Any, arm: Any, degenerate: bool = False, trim: tuple[flo
     }
 
 
+def _c_for_benefit(predicted_tau: Any, A: Any, Y: Any, ps: Any) -> dict[str, Any]:
+    """Concordance-for-benefit for a predicted RYGB-vs-sleeve effect, sign-matched to the metric.
+
+    ``tte.c_for_benefit`` forms the OBSERVED pair benefit as Y[control] - Y[treated], which is
+    already higher-is-better for a lower-is-better outcome, but it consumes the PREDICTED vector
+    exactly as handed over. Our predicted effect is tau = mu1 - mu0 = E[Y(RYGB)] - E[Y(sleeve)],
+    where a NEGATIVE value is the benefit, so tau must be negated before it goes in: passing it raw
+    scores a perfect predictor near 0.08 instead of near 0.92. Both the marginal TTE cell and the
+    CATE page route through here, so the two can never disagree about the sign.
+    """
+    return tte.c_for_benefit(-np.asarray(predicted_tau, dtype=float), A, Y, ps, lower_is_better=True)
+
+
 def _resolve_outcome_model_label(cfg: SecondaryConfig) -> str:
     """Label for the counterfactual outcome model, importing torch lazily only when requested.
 
@@ -1081,9 +1113,10 @@ def _tte_skipped(cfg: SecondaryConfig, reason: str, gate_ok: bool) -> dict[str, 
     _write_csv(cfg.secondary_dir / "tte_aipw.csv",
                pd.DataFrame(columns=list(TTE_AIPW_COLUMNS)), header_note=ESTIMAND_NOTE)
     _write_csv(cfg.secondary_dir / "tte_balance.csv", pd.DataFrame(columns=list(TTE_BALANCE_COLUMNS)))
+    _write_cate_csvs(cfg, {})
     payload = {
         "status": "skipped", "skip_reason": reason, "tte_gate_ok": bool(gate_ok),
-        "cells": [], "balance": [], "ps_overlap": {}, "love": {}, "populations": {},
+        "cells": [], "balance": [], "ps_overlap": {}, "love": {}, "populations": {}, "cate": {},
         "outcome_model": "none", "estimand_note": ESTIMAND_NOTE,
     }
     _save_checkpoint(cfg, "tte", payload)
@@ -1114,6 +1147,314 @@ def _write_tte_csvs(cfg: SecondaryConfig, cells_frame: Any, balance_frame: Any) 
     _write_csv(cfg.secondary_dir / "tte_balance.csv", balance_out)
 
 
+# --------------------------------------------------------------------------------------------
+# Purpose-built CATE (spec Section 8): a DR-learner riding on the TTE's own cross-fitted nuisances
+# --------------------------------------------------------------------------------------------
+# The individualized estimand is carried by ONE cell, the headline BMI horizon: reusing that
+# cell's ps / pc / mu1 / mu0 (and its patient-clustered folds) means the CATE costs exactly one
+# extra regression and no new large data structure.
+CATE_OUTCOME = "bmi"
+CATE_TARGET_MONTH = 12
+CATE_MIN_N = 100                # below this the deciles and the cross-fit folds are not usable
+CATE_DECILES = 10
+CATE_PERMUTATION_REPEATS = 5
+CATE_TOC_GRID = tuple(round(0.05 * step, 2) for step in range(1, 21))
+# Effect modifiers X (spec 8.2). The optional ones (creatinine/eGFR, GERD, the lab panel) join X
+# only when the population audit marks them usable, exactly as they join L: an unpopulated modifier
+# is OMITTED rather than carried as an all-NaN column, and is named as an absent modifier instead.
+CATE_NUMERIC_MODIFIERS = (
+    "baseline_bmi", "baseline_hba1c", "age_at_index", "diabetes_flag", "hypertension",
+    "dyslipidemia", "osa", "insulin", "biguanide", "sglt2",
+)
+CATE_CATEGORICAL_MODIFIERS = ("sex", "hba1c_band")
+CATE_OPTIONAL_NUMERIC_MODIFIERS = study.OPTIONAL_WIDE_NUMERIC_COVARIATES
+CATE_CALIBRATION_COLUMNS = ("decile", "n", "mean_predicted_benefit", "aipw_benefit",
+                            "ci_low", "ci_high")
+CATE_IMPORTANCE_COLUMNS = ("modifier", "permutation_importance")
+# Spec 8.4 is an OPTIONAL cross-check. GRF/econml is not a confirmed dependency of the production
+# VM and this script imports nothing outside study/causal_tte, so the causal forest is a DOCUMENTED
+# omission (it reaches the page and the ledger) rather than a silent one.
+CAUSAL_FOREST_NOTE = (
+    "Optional causal-forest cross-check (spec 8.4) deliberately omitted: GRF/econml is outside "
+    "this script's bundled dependencies, so the cross-fitted DR-learner is the sole CATE estimator."
+)
+CATE_CAVEAT = (
+    "Heterogeneity map, not an individualized prescription. tau_hat reads MEASURED effect "
+    "modification only, and an unmeasured modifier can masquerade as heterogeneity. Treat the "
+    "ranking as a hypothesis about who may benefit more, not as a treatment assignment rule, "
+    "unless the RATE interval clearly excludes zero."
+)
+
+
+def _dr_pseudo_outcome(Y: Any, A: Any, delta: Any, ps: Any, pc: Any, mu1: Any, mu0: Any) -> Any:
+    """Per-patient doubly-robust (efficient influence function) pseudo-outcome, spec 8.1.
+
+    This is exactly the per-row term ``tte.aipw`` averages into the marginal ATE, restated so the
+    DR-learner can regress on it:
+
+      psi = (mu1 - mu0) + [A / ps] * w * (Y - mu1) - [(1 - A) / (1 - ps)] * w * (Y - mu0)
+
+    The IPCW weight w is the one the AIPW itself applies, ``delta / pc`` from the censoring
+    nuisance (NOT the store's ``analysis_weight``, which is a prognostic-evaluation weight and
+    never enters this estimator), and the ps / pc clipping constants are the AIPW's own, so the
+    pseudo-outcome and the marginal estimate can never drift apart. A = 1 is RYGB, so psi estimates
+    Y(RYGB) - Y(sleeve) in the outcome's units and NEGATIVE psi means RYGB lowered BMI.
+    """
+    Y = np.asarray(Y, dtype=float)
+    A = np.asarray(A, dtype=float)
+    ps = np.asarray(ps, dtype=float)
+    mu1 = np.asarray(mu1, dtype=float)
+    mu0 = np.asarray(mu0, dtype=float)
+    w_ipcw = np.where(np.asarray(delta) == 1, 1.0 / np.clip(np.asarray(pc, dtype=float), 0.05, 1.0), 0.0)
+    observed = np.nan_to_num(Y)  # unobserved rows carry weight 0 through w_ipcw
+    return ((mu1 - mu0)
+            + A * w_ipcw * (observed - mu1) / np.clip(ps, 1e-3, 1.0)
+            - (1.0 - A) * w_ipcw * (observed - mu0) / np.clip(1.0 - ps, 1e-3, 1.0))
+
+
+def _cate_regressor(seed: int) -> Any:
+    """Squared-loss HistGradientBoosting for the DR-learner (torch-free, seeded, deterministic).
+
+    tau(x) = E[psi | X = x] is a conditional MEAN, so unlike the g-computation nuisance this fit
+    must not be the median (absolute-error) one.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor
+
+    return HistGradientBoostingRegressor(random_state=int(seed), max_depth=3, max_iter=200,
+                                         early_stopping=False)
+
+
+def _cate_modifier_design(rows: Any, audit: Any) -> tuple[Any, list[tuple[str, list[int]]], list[str]]:
+    """Encoded modifier design X, its per-modifier column groups, and the absent modifiers.
+
+    Encoding is the production ``study.TabularEncoder`` (numeric value + missingness flag,
+    categorical one-hot + out-of-vocabulary), the same encoder L uses. ``hba1c_band`` is derived
+    from baseline HbA1c with the bands the subgroup pages already use. Columns the encoder did not
+    keep (an audit-refused optional modifier, or one this source never carried) come back as named
+    absent modifiers so the page and the omissions ledger can say so.
+    """
+    frame = rows.reset_index(drop=True).copy()
+    if "baseline_hba1c" in frame.columns:
+        frame["hba1c_band"] = _tier2_hba1c_band_labels(frame["baseline_hba1c"]).to_numpy()
+    absent = _cate_absent_modifiers(audit)
+    numeric = list(CATE_NUMERIC_MODIFIERS) + [column for column in CATE_OPTIONAL_NUMERIC_MODIFIERS
+                                              if column not in absent]
+    categorical = list(CATE_CATEGORICAL_MODIFIERS)
+    encoder = study.TabularEncoder.fit(frame, numeric=numeric, categorical=categorical)
+    kept = set(encoder.numeric) | set(encoder.categorical)
+    absent.extend(column for column in numeric + categorical if column not in kept)
+    return encoder.transform(frame), _cate_modifier_groups(encoder), sorted(set(absent))
+
+
+def _cate_absent_modifiers(audit: Any) -> list[str]:
+    """The optional modifiers (creatinine/eGFR, GERD, the lab panel) the population audit refused.
+
+    Derived from the audit alone, so the honesty gate can name them even on a run where the CATE
+    itself was not estimable, exactly as the TTE names its absent confounders whether or not it ran.
+    Sorted, so the estimable and not-estimable payloads order the same names the same way.
+    """
+    return sorted(column for column in CATE_OPTIONAL_NUMERIC_MODIFIERS
+                  if audit is None or not audit_usable(audit, column))
+
+
+def _cate_modifier_groups(encoder: Any) -> list[tuple[str, list[int]]]:
+    """Encoded-column indices grouped by SOURCE modifier, in ``TabularEncoder.transform`` order.
+
+    Permuting a categorical's one-hot levels one at a time would understate it, so importance is
+    reported per clinical variable: every encoded column a modifier produced moves together.
+    """
+    groups: list[tuple[str, list[int]]] = []
+    index = 0
+    for column in encoder.numeric:
+        groups.append((column, [index, index + 1]))
+        index += 2
+    for column in encoder.categorical:
+        width = len(encoder.levels[column]) + 1
+        groups.append((column, list(range(index, index + width))))
+        index += width
+    return groups
+
+
+def _crossfit_tau(X: Any, psi: Any, patient_ids: Any, seed: int, folds: int,
+                  groups: Sequence[tuple[str, list[int]]]) -> tuple[Any, Any]:
+    """Out-of-fold tau_hat(x) and per-modifier permutation importance, in ONE pass over the folds.
+
+    ``patient_folds`` is called with the same seed and salt the TTE nuisances used, so the fold
+    assignment is byte-identical and no patient's tau_hat is fit on that patient's own psi.
+    Importance is the fold-size-weighted mean rise in held-out squared error when a modifier's
+    encoded columns are permuted together. Each fold's model and its permutation block are freed
+    before the next fold is fit, so only one fold of design matrix is live at a time.
+    """
+    X = np.asarray(X, dtype=float)
+    psi = np.asarray(psi, dtype=float)
+    n = int(psi.size)
+    tau = np.full(n, np.nan)
+    importance = np.zeros(len(groups), dtype=float)
+    fold_ids = patient_folds(patient_ids, seed, folds)
+    rng = np.random.default_rng(int(seed))
+    for fold in range(folds):
+        test_idx = np.where(fold_ids == fold)[0]
+        if test_idx.size == 0:
+            continue
+        train_idx = np.where(fold_ids != fold)[0]
+        if train_idx.size < TTE_MIN_MU_FIT:  # too thin to fit: fall back to a constant (no signal)
+            tau[test_idx] = float(np.mean(psi[train_idx])) if train_idx.size else 0.0
+            continue
+        model = _cate_regressor(seed)
+        model.fit(X[train_idx], psi[train_idx])
+        # Fancy indexing already hands back a private copy of the fold, so the permutations below
+        # shuffle it in place without touching X and without a second fold-sized allocation.
+        block = X[test_idx]
+        prediction = model.predict(block)
+        tau[test_idx] = prediction
+        baseline = float(np.mean((psi[test_idx] - prediction) ** 2))
+        for position, (_name, columns) in enumerate(groups):
+            original = block[:, columns].copy()
+            total = 0.0
+            for _repeat in range(CATE_PERMUTATION_REPEATS):
+                block[:, columns] = original[rng.permutation(test_idx.size)]
+                total += float(np.mean((psi[test_idx] - model.predict(block)) ** 2))
+            block[:, columns] = original
+            importance[position] += (total / CATE_PERMUTATION_REPEATS - baseline) * test_idx.size
+        del model, block
+    fill = float(np.mean(psi[np.isfinite(psi)])) if np.isfinite(psi).any() else 0.0
+    return np.where(np.isfinite(tau), tau, fill), importance / max(n, 1)
+
+
+def _toc_and_rate(rank: Any, benefit_psi: Any) -> tuple[Any, float]:
+    """Yadlowsky TOC over every prefix of the benefit ranking, and the RATE (AUTOC) it integrates.
+
+    TOC(q) is the mean doubly-robust BENEFIT among the top q fraction minus the population mean,
+    so a ranking that really does put higher-benefit patients first has a positive, decaying TOC
+    that reaches exactly zero at q = 1; RATE is its average over q. Ties keep source order (stable
+    sort), so the curve and its bootstrap are deterministic.
+    """
+    order = np.argsort(-np.asarray(rank, dtype=float), kind="stable")
+    cumulative = np.cumsum(np.asarray(benefit_psi, dtype=float)[order])
+    prefix = np.arange(1, cumulative.size + 1, dtype=float)
+    toc = cumulative / prefix - cumulative[-1] / cumulative.size
+    return toc, float(np.mean(toc))
+
+
+def _cate_dr_learner(cfg: SecondaryConfig, rows: Any, audit: Any, Y: Any, A: Any, delta: Any,
+                     ps: Any, pc: Any, mu1: Any, mu0: Any, patient_ids: Any,
+                     gate: Mapping[str, Any]) -> dict[str, Any]:
+    """DR-learner CATE for one sleeve-vs-RYGB cell (spec 8.1 - 8.3), on the TTE's own nuisances.
+
+    ps / pc / mu1 / mu0 arrive already cross-fitted by ``stage_tte`` over the same patient folds
+    this regression reuses, so nothing here refits a nuisance. Orientation: tau_hat estimates
+    E[Y(RYGB) - Y(sleeve) | X] in BMI units and lower BMI is better, so everything the page reports
+    is stated in BENEFIT units, benefit = -tau, where a larger number means RYGB helps more.
+
+    A cell whose positivity gate failed has no usable propensity overlap, so the pseudo-outcome is
+    dominated by the clipped 1/ps term: that cell returns not-estimable rather than a fitted curve
+    over noise, exactly as the TTE pages suppress a failed cell's point estimate.
+    """
+    n = int(np.asarray(Y).size)
+    if bool(gate.get("positivity_fail")) or n < CATE_MIN_N:
+        reason = (f"positivity gate failed for the {CATE_OUTCOME} {CATE_TARGET_MONTH}-month cell "
+                  f"(minimum propensity {gate.get('min_ps', float('nan')):.2e}), so the "
+                  "doubly-robust pseudo-outcome has no propensity overlap to stand on"
+                  if bool(gate.get("positivity_fail")) else
+                  # Reaches the page-16 ledger, so the count is suppressed like every other one.
+                  f"cell has {study.display_count(n)} patients, below the {CATE_MIN_N} the "
+                  "decile calibration needs")
+        return {"status": "not_estimable", "n": n, "skipped_reason": reason,
+                "outcome": CATE_OUTCOME, "target_month": CATE_TARGET_MONTH,
+                "absent_modifiers": _cate_absent_modifiers(audit),
+                "calibration": [], "importance": []}
+
+    Y = np.asarray(Y, dtype=float)
+    A = np.asarray(A).astype(int)
+    delta = np.asarray(delta).astype(int)
+    ps = np.asarray(ps, dtype=float)
+    pc = np.asarray(pc, dtype=float)
+    mu1 = np.asarray(mu1, dtype=float)
+    mu0 = np.asarray(mu0, dtype=float)
+    psi = _dr_pseudo_outcome(Y, A, delta, ps, pc, mu1, mu0)
+    X, groups, absent = _cate_modifier_design(rows, audit)
+    tau, importance = _crossfit_tau(X, psi, patient_ids, cfg.seed, cfg.nuisance_folds, groups)
+    del X
+    benefit_hat = -tau            # predicted BMI reduction from choosing RYGB
+    benefit_psi = -psi            # its doubly-robust observed counterpart
+
+    # RATE / TOC with inference: a patient-clustered bootstrap over ROW INDICES (the cell is one
+    # row per patient), which never copies a frame and re-ranks the same two vectors per replicate.
+    grid = np.asarray(CATE_TOC_GRID, dtype=float)
+    grid_index = np.clip((grid * n).astype(int) - 1, 0, n - 1)
+    toc, rate = _toc_and_rate(benefit_hat, benefit_psi)
+    replicates = int(cfg.bootstrap_replicates)
+    rates = np.empty(replicates, dtype=float)
+    band = np.empty((replicates, grid.size), dtype=float)
+    rng = np.random.default_rng([int(cfg.seed), int(CATE_TARGET_MONTH)])
+    for replicate in range(replicates):
+        resample = rng.integers(0, n, size=n)
+        curve, rates[replicate] = _toc_and_rate(benefit_hat[resample], benefit_psi[resample])
+        band[replicate] = curve[grid_index]
+    finite = rates[np.isfinite(rates)]
+    rate_low = rate_high = float("nan")
+    if finite.size >= 2:
+        rate_low, rate_high = (float(value) for value in np.percentile(finite, [2.5, 97.5]))
+    toc_low, toc_high = np.percentile(band, [2.5, 97.5], axis=0)
+    del band, rates
+
+    # Benefit calibration: equal-size predicted-benefit deciles, each re-estimated with the SAME
+    # doubly-robust estimator the marginal ATE uses, so the observed axis is not the predicted one.
+    order = np.argsort(benefit_hat, kind="stable")
+    decile = np.empty(n, dtype=int)
+    decile[order] = (np.arange(n) * CATE_DECILES) // n
+    calibration: list[dict[str, Any]] = []
+    for index in range(CATE_DECILES):
+        mask = decile == index
+        estimate = tte.aipw(Y[mask], A[mask], delta[mask], ps[mask], pc[mask], mu1[mask], mu0[mask])
+        low, high = estimate["ci"]
+        calibration.append({
+            "decile": index + 1, "n": int(mask.sum()),
+            "mean_predicted_benefit": float(np.mean(benefit_hat[mask])) if bool(mask.any()) else float("nan"),
+            "aipw_benefit": -float(estimate["ate"]),
+            "ci_low": -float(high), "ci_high": -float(low),  # negation swaps the interval ends
+        })
+    observed = np.asarray([row["aipw_benefit"] for row in calibration], dtype=float)
+    estimable = np.isfinite(observed)
+    rho = float("nan")
+    if int(estimable.sum()) >= 3:
+        ranked = np.argsort(np.argsort(observed[estimable], kind="stable"), kind="stable").astype(float)
+        rho = float(np.corrcoef(np.arange(CATE_DECILES, dtype=float)[estimable], ranked)[0, 1])
+    steps = np.diff(observed[estimable])
+
+    # Policy value of "operate RYGB where tau_hat predicts benefit", read off the same pseudo-
+    # outcomes: mean(pi * benefit_psi) against treat-all (mean benefit_psi) and treat-none (0).
+    treat = benefit_hat > 0.0
+    benefit = _c_for_benefit(tau, A, Y, ps)
+    return {
+        "status": "done", "outcome": CATE_OUTCOME, "target_month": CATE_TARGET_MONTH, "n": n,
+        "n_rygb": int((A == 1).sum()), "n_sleeve": int((A == 0).sum()),
+        "rate": rate, "rate_ci_low": rate_low, "rate_ci_high": rate_high,
+        "toc_grid": [float(value) for value in grid], "toc": [float(value) for value in toc[grid_index]],
+        "toc_ci_low": [float(value) for value in toc_low],
+        "toc_ci_high": [float(value) for value in toc_high],
+        "calibration": calibration, "calibration_rho": rho,
+        "monotone_fraction": float(np.mean(steps >= 0.0)) if steps.size else float("nan"),
+        "importance": [{"modifier": name, "permutation_importance": float(value)}
+                       for (name, _columns), value in zip(groups, importance, strict=True)],
+        "absent_modifiers": absent,
+        "c_for_benefit": float(benefit["c_for_benefit"]), "n_pairs": int(benefit["n_pairs"]),
+        "policy_value": float(np.mean(np.where(treat, benefit_psi, 0.0))),
+        "treat_all_value": float(np.mean(benefit_psi)), "treated_fraction": float(np.mean(treat)),
+        "ess_iptw": float(gate.get("ess_iptw", float("nan"))),
+    }
+
+
+def _write_cate_csvs(cfg: SecondaryConfig, cate: Mapping[str, Any]) -> None:
+    """Benefit-calibration deciles and per-modifier permutation importance, n < 11 suppressed."""
+    _write_tier1_csv(cfg.secondary_dir / "cate_benefit_calibration.csv",
+                     _rows_to_frame(list(cate.get("calibration") or []), CATE_CALIBRATION_COLUMNS),
+                     CATE_CALIBRATION_COLUMNS, ["n"], structural=["decile"], header_note=CATE_CAVEAT)
+    _write_tier1_csv(cfg.secondary_dir / "cate_modifier_importance.csv",
+                     _rows_to_frame(list(cate.get("importance") or []), CATE_IMPORTANCE_COLUMNS),
+                     CATE_IMPORTANCE_COLUMNS, [], header_note=CAUSAL_FOREST_NOTE)
+
+
 def stage_tte(cfg: SecondaryConfig) -> dict[str, Any]:
     """Doubly-robust IPCW-AIPW sleeve-vs-RYGB TTE at origin 0 over all available frozen rows.
 
@@ -1138,6 +1479,13 @@ def stage_tte(cfg: SecondaryConfig) -> dict[str, Any]:
 
     cells: list[dict[str, Any]] = []
     balance_rows: list[dict[str, Any]] = []
+    cate: dict[str, Any] = {}  # filled by the one cell that carries the individualized estimand
+    # What the enriched, audit-gated L actually resolved to; the encoder is the ground truth. Both
+    # outcomes resolve the SAME column list (they differ only in rows and in what baseline_value
+    # aliases), so the per-outcome write below restates it rather than racing. The refused
+    # confounders are deliberately NOT duplicated here: _tte_absent_confounders derives them from
+    # the assemble audit, so they are named even on the runs where the TTE never executes.
+    confounders: dict[str, Any] = {"numeric": [], "categorical": []}
     ps_overlap: dict[str, dict[str, list[float]]] = {}
     love: dict[str, dict[str, Any]] = {}
     populations: dict[str, dict[str, Any]] = {}
@@ -1149,7 +1497,8 @@ def stage_tte(cfg: SecondaryConfig) -> dict[str, Any]:
         pop = _tte_population(surgical, outcome)
         if len(pop) < MIN_CELL_SIZE:
             continue
-        L, A, names, _encoder = build_wide_L_A(pop, outcome, audit)
+        L, A, names, encoder = build_wide_L_A(pop, outcome, audit)
+        confounders.update(numeric=list(encoder.numeric), categorical=list(encoder.categorical))
         patient_ids = pop["patient_id"].astype(str).to_numpy()
         ps, degenerate = _crossfit_propensity(L, A, patient_ids, cfg.seed, cfg.nuisance_folds)
 
@@ -1217,7 +1566,12 @@ def stage_tte(cfg: SecondaryConfig) -> dict[str, Any]:
             estimate = tte.aipw(Y, A_cell, delta, ps_cell, pc, mu1, mu0)
             ate, se = estimate["ate"], estimate["se"]
             ci_low, ci_high = estimate["ci"]
-            benefit = tte.c_for_benefit(mu1 - mu0, A_cell, Y, ps_cell, lower_is_better=True)
+            benefit = _c_for_benefit(mu1 - mu0, A_cell, Y, ps_cell)
+            if outcome == CATE_OUTCOME and int(target_month) == CATE_TARGET_MONTH:
+                # Spec 8.1: the CATE runs HERE so it consumes this cell's already-cross-fitted
+                # nuisances (and their folds) rather than refitting any of them.
+                cate = _cate_dr_learner(cfg, pop.iloc[rows_idx], audit, Y, A_cell, delta, ps_cell,
+                                        pc, mu1, mu0, cell_ids, gate)
 
             observed = Y[delta == 1]
             outcome_sd = float(np.nanstd(observed, ddof=1)) if observed.size > 1 else float("nan")
@@ -1264,13 +1618,16 @@ def stage_tte(cfg: SecondaryConfig) -> dict[str, Any]:
     cells_frame = pd.DataFrame(cells)
     balance_frame = pd.DataFrame(balance_rows, columns=list(TTE_BALANCE_COLUMNS))
     _write_tte_csvs(cfg, cells_frame, balance_frame)
+    _write_cate_csvs(cfg, cate)
 
     payload = {
         "status": "done" if cells else "no_cells",
         "tte_gate_ok": True,
         "outcome_model": outcome_model,
         "cells": cells,
+        "cate": cate,
         "balance": balance_rows,
+        "confounders": confounders,
         "ps_overlap": ps_overlap,
         "love": love,
         "populations": populations,
@@ -1303,12 +1660,13 @@ def stage_tier1(cfg: SecondaryConfig) -> dict[str, Any]:
     transport_rows, transport_meta = _tier1_transportability(cfg, frames, audit)
     tipping_rows, triage_rows, smd_rows, tipping_curves = _tier1_attrition(cfg, frames)
     drug_rows = _tier1_drug_heterogeneity(cfg, frames)
+    which_incretin = _within_incretin_dr_read(cfg, frames, audit)
     procedure_rows = _tier1_procedure_heterogeneity(cfg, frames)
 
     # BH-FDR the coverage-calibration test within each horizon/subgroup family, report q-values.
     transport_frame = _apply_fdr(
         _rows_to_frame(transport_rows, TRANSPORTABILITY_COLUMNS),
-        ["cohort", "outcome", "axis", "target_month"], "p_value_cov80", "q_value_cov80")
+        ["arm", "outcome", "axis", "target_month"], "p_value_cov80", "q_value_cov80")
     drug_frame = _apply_fdr(
         _rows_to_frame(drug_rows, HETEROGENEITY_DRUG_COLUMNS),
         ["outcome", "target_month"], "p_value_cov80", "q_value_cov80")
@@ -1321,21 +1679,35 @@ def stage_tier1(cfg: SecondaryConfig) -> dict[str, Any]:
 
     transport_note = (
         "Held-out (temporal/geographic) re-validation of the frozen selected model stratified by "
-        "geography/equity axes; state/SVI/RUCA substitute for the absent center id."
+        "geography/equity axes; state/SVI/RUCA substitute for the absent center id. "
+        + ARM_RECUT_NOTE
+    )
+    tipping_note = (
+        "MNAR delta tipping-point per arm. delta_star_crps is where THAT arm's model stops beating "
+        "the population-mean baseline. ate_at_0 / delta_star_ate are the surgical arm against the "
+        "OTHER surgical arm - a cross-arm contrast, so it is read off the shared surgical frame "
+        "(both procedures present) and the sleeve row mirrors the RYGB row. " + ARM_RECUT_NOTE
     )
     _write_tier1_csv(cfg.secondary_dir / "transportability.csv", transport_frame,
                      TRANSPORTABILITY_COLUMNS, ["n"], structural=["target_month"],
                      header_note=transport_note)
     _write_tier1_csv(cfg.secondary_dir / "attrition_tipping_point.csv", tipping_frame,
-                     TIPPING_POINT_COLUMNS, ["n"], structural=["target_month"])
+                     TIPPING_POINT_COLUMNS, ATTRITION_COUNT_COLUMNS, structural=["target_month"],
+                     header_note=tipping_note)
     _write_tier1_csv(cfg.secondary_dir / "attrition_estimator_triage.csv", triage_frame,
-                     TRIAGE_COLUMNS, ["n"], structural=["target_month"])
+                     TRIAGE_COLUMNS, ATTRITION_COUNT_COLUMNS, structural=["target_month"],
+                     header_note=ARM_RECUT_NOTE)
     _write_tier1_csv(cfg.secondary_dir / "attrition_observed_vs_censored_smd.csv", smd_frame,
-                     ATTRITION_SMD_COLUMNS, ["n_observed"], structural=["target_month"])
+                     ATTRITION_SMD_COLUMNS, ATTRITION_COUNT_COLUMNS, structural=["target_month"],
+                     header_note=ARM_RECUT_NOTE)
     _write_tier1_csv(cfg.secondary_dir / "heterogeneity_drug.csv", drug_frame,
                      HETEROGENEITY_DRUG_COLUMNS, ["n"], structural=["target_month"])
     _write_tier1_csv(cfg.secondary_dir / "heterogeneity_procedure.csv", procedure_frame,
                      HETEROGENEITY_PROCEDURE_COLUMNS, ["n"], structural=["target_month"])
+    _write_tier1_csv(cfg.secondary_dir / "which_incretin_modifier_importance.csv",
+                     _rows_to_frame(list(which_incretin.get("importance") or []),
+                                    CATE_IMPORTANCE_COLUMNS),
+                     CATE_IMPORTANCE_COLUMNS, [], header_note=WITHIN_INCRETIN_CAVEAT)
 
     payload = {
         "status": "done",
@@ -1353,11 +1725,14 @@ def stage_tier1(cfg: SecondaryConfig) -> dict[str, Any]:
         },
         "heterogeneity": {
             "drug": drug_frame.to_dict(orient="records"),
+            "which_incretin": which_incretin,
             "procedure": procedure_frame.to_dict(orient="records"),
             "sophia_procedure": dict(SOPHIA_PROCEDURE_RMSE_60),
             "sophia_pooled": {int(k): float(v) for k, v in SOPHIA_POOLED_RMSE.items()},
         },
         "caveat": SUBGROUP_CAVEAT,
+        # One record for the whole Section-10 re-cut: every tier reads these same frames.
+        "arm_gaps": _arm_formation_gaps(frames),
         "cells": {
             "transportability": int(len(transport_frame)),
             "tipping": int(len(tipping_frame)),
@@ -1395,11 +1770,12 @@ def stage_tier2(cfg: SecondaryConfig) -> dict[str, Any]:
     rows, axes_usable = _tier2_subgroup_cells(cfg, frames, audit, pooled)
 
     frame = _rows_to_frame(rows, SUBGROUPS_TIER2_COLUMNS)
-    # BH-FDR the coverage-vs-nominal test family within each (cohort, outcome, axis) horizon set.
-    frame = _apply_fdr(frame, ["cohort", "outcome", "axis", "target_month"],
+    # BH-FDR the coverage-vs-nominal test family within each (arm, outcome, axis) horizon set.
+    frame = _apply_fdr(frame, ["arm", "outcome", "axis", "target_month"],
                        "p_value_cov80", "q_value_cov80")
     _write_tier1_csv(cfg.secondary_dir / "subgroups_tier2.csv", frame, SUBGROUPS_TIER2_COLUMNS,
-                     ["n"], structural=["target_month"], header_note=SUBGROUP_CAVEAT)
+                     ["n"], structural=["target_month"],
+                     header_note=SUBGROUP_CAVEAT + " " + ARM_RECUT_NOTE)
 
     scored = frame.loc[frame["skipped_reason"].astype(str) == ""]
     payload = {
@@ -1521,11 +1897,17 @@ def stage_tier4(cfg: SecondaryConfig) -> dict[str, Any]:
     decision_rows = _tier4_decision_curves(cfg, frames, audit)
     predictability_rows = _tier4_predictability_map(cfg, frames, audit)
     glp1_rows, glp1_trajectory = _tier4_glp1_overlap(cfg, frames)
+    procedure_auroc_rows, procedure_auroc_curves = _procedure_auroc(cfg, frames)
+    per_arm_rows = _per_arm_prognostic(cfg, frames)
+    sensitivity_rows, sensitivity_sweeps = _feature_sensitivity(cfg, frames, audit)
 
     threshold_frame = _rows_to_frame(threshold_rows, THRESHOLD_PROB_COLUMNS)
     decision_frame = _rows_to_frame(decision_rows, DECISION_CURVE_COLUMNS)
     predictability_frame = _rows_to_frame(predictability_rows, PREDICTABILITY_MAP_COLUMNS)
     glp1_frame = _rows_to_frame(glp1_rows, GLP1_OVERLAP_COLUMNS)
+    procedure_auroc_frame = _rows_to_frame(procedure_auroc_rows, PROCEDURE_AUROC_COLUMNS)
+    per_arm_frame = _rows_to_frame(per_arm_rows, PER_ARM_PROGNOSTIC_COLUMNS)
+    sensitivity_frame = _rows_to_frame(sensitivity_rows, FEATURE_SENSITIVITY_COLUMNS)
 
     _write_tier1_csv(cfg.secondary_dir / "threshold_probabilities.csv", threshold_frame,
                      THRESHOLD_PROB_COLUMNS, ["n"], structural=["target_month"],
@@ -1540,6 +1922,15 @@ def stage_tier4(cfg: SecondaryConfig) -> dict[str, Any]:
     _write_tier1_csv(cfg.secondary_dir / "glp1_vs_surgery_overlap.csv", glp1_frame,
                      GLP1_OVERLAP_COLUMNS, ["n_surgery", "n_incretin"], structural=["target_month"],
                      header_note=GLP1_CAVEAT)
+    _write_tier1_csv(cfg.secondary_dir / "per_procedure_auroc.csv", procedure_auroc_frame,
+                     PROCEDURE_AUROC_COLUMNS, ["n"], structural=["target_month"],
+                     header_note=PROCEDURE_AUROC_NOTE)
+    _write_tier1_csv(cfg.secondary_dir / "per_arm_calibration_accuracy.csv", per_arm_frame,
+                     PER_ARM_PROGNOSTIC_COLUMNS, ["n"], structural=["target_month"],
+                     header_note=PER_ARM_PROGNOSTIC_NOTE)
+    _write_tier1_csv(cfg.secondary_dir / "forecast_feature_sensitivity.csv", sensitivity_frame,
+                     FEATURE_SENSITIVITY_COLUMNS, ["n"], structural=["rank"],
+                     header_note=FEATURE_SENSITIVITY_NOTE)
 
     payload = {
         "status": "done",
@@ -1561,11 +1952,29 @@ def stage_tier4(cfg: SecondaryConfig) -> dict[str, Any]:
             "trajectory": glp1_trajectory,
             "caveat": GLP1_CAVEAT,
         },
+        "procedure_auroc": {
+            "rows": procedure_auroc_frame.to_dict(orient="records"),
+            "curves": procedure_auroc_curves,
+            "fpr_grid": [float(value) for value in ROC_FPR_GRID],
+        },
+        "per_arm_prognostic": {
+            "rows": per_arm_frame.to_dict(orient="records"),
+            "note": PER_ARM_PROGNOSTIC_NOTE,
+        },
+        "feature_sensitivity": {
+            "rows": sensitivity_frame.to_dict(orient="records"),
+            "sweeps": sensitivity_sweeps,
+            "target_month": FEATURE_SENSITIVITY_MONTH,
+            "note": FEATURE_SENSITIVITY_NOTE,
+        },
         "cells": {
             "threshold": int(len(threshold_frame)),
             "decision": int(len(decision_frame)),
             "predictability": int(len(predictability_frame)),
             "glp1": int(len(glp1_frame)),
+            "procedure_auroc": int(len(procedure_auroc_frame)),
+            "per_arm_prognostic": int(len(per_arm_frame)),
+            "feature_sensitivity": int(len(sensitivity_frame)),
         },
     }
     _save_checkpoint(cfg, "tier4", payload)
@@ -1575,12 +1984,22 @@ def stage_tier4(cfg: SecondaryConfig) -> dict[str, Any]:
 # --------------------------------------------------------------------------------------------
 # Checkpoint I/O and frame spill helpers
 # --------------------------------------------------------------------------------------------
+def _peak_rss_gb() -> float | None:
+    """This process's peak RSS in GB, or None where the platform cannot report it."""
+    peak = study.process_peak_rss_bytes()
+    return None if peak is None else round(peak / (1024 ** 3), 3)
+
+
 def _save_checkpoint(cfg: SecondaryConfig, stage: str, payload: Any) -> None:
     cfg.checkpoints_dir.mkdir(parents=True, exist_ok=True)
     study.atomic_pickle(cfg.checkpoints_dir / f"{stage}.pkl", payload)
     study.atomic_json(
         cfg.checkpoints_dir / f"{stage}.json",
-        {"stage": stage, "time_utc": study.utc_now(), "config_hash": config_hash(cfg)},
+        # The peak is taken HERE, inside the stage's own process, so it is the stage's real
+        # high-water mark under --orchestrate too; the driver loop's own peak (which is what it
+        # would measure after a subprocess returns) says nothing about what the stage needed.
+        {"stage": stage, "time_utc": study.utc_now(), "config_hash": config_hash(cfg),
+         "peak_rss_gb": _peak_rss_gb()},
     )
 
 
@@ -1687,6 +2106,14 @@ PAGE_TITLES = {
     14: ("Decision curves", "Net benefit across threshold probabilities"),
     15: ("Predictability map and GLP-1 vs surgery", "Who is predictable; overlap-weighted contrast"),
     16: ("Gates, limitations, and conclusion", "Supported vs exploratory; residual-confounding caveat"),
+    17: ("Per-procedure discrimination for P(BMI < 35)",
+         "IPCW-weighted ROC at 6, 12, and 24 months: incretin, RYGB, sleeve"),
+    18: ("Heterogeneous benefit of RYGB vs sleeve",
+         "DR-learner CATE: RATE / TOC, benefit calibration, top effect modifiers"),
+    19: ("Forecast sensitivity to baseline features",
+         "Surrogate permutation importance and counterfactual sweep, per arm"),
+    20: ("Per-arm calibration and accuracy",
+         "CRPS / RMSE / MAE / bias / coverage / calibration slope by horizon: incretin, RYGB, sleeve"),
 }
 PENDING_NOTE = "Content pending - this analysis is populated by a later build milestone."
 
@@ -1813,8 +2240,11 @@ def _analysis_family_summary(data: Mapping[str, Any]) -> list[dict[str, Any]]:
     families.append({"family": "Subgroups", "cells": scored, "powered": powered, "gate": "descriptive"})
     tier3 = data.get("tier3") or {}
     verdicts = [str(row.get("verdict", "")) for row in tier3.get("powered_only", [])]
+    # An arm with nothing above the disclosure floor is named in the verdict column but scored
+    # nothing, so it must not inflate the census's scored-cell count.
     families.append({
-        "family": "Robustness", "cells": len(verdicts),
+        "family": "Robustness",
+        "cells": sum(1 for verdict in verdicts if verdict != "no_disclosable_cells"),
         "powered": sum(1 for verdict in verdicts if verdict in {"stable_real_signal", "power_artifact"}),
         "gate": "powered vs all",
     })
@@ -1830,6 +2260,17 @@ def _analysis_family_summary(data: Mapping[str, Any]) -> list[dict[str, Any]]:
     return families
 
 
+def _tte_absent_confounders(data: Mapping[str, Any]) -> list[str]:
+    """The named residual-confounding target (Section 9): every optional confounder the audit
+    refused, then the surgeon/center identifiers this source never carries. Derived from the
+    assemble audit so the names are recorded whether or not the TTE ran. The order is fixed (the
+    sorted audit-refused names, then the structural one), so the manifest, the omissions ledger,
+    and the page text are deterministic."""
+    audit = (data.get("assemble") or {}).get("audit")
+    gated = _tte_confounder_lists(audit)[2] if audit is not None else []
+    return gated + ["surgeon_or_center_id"]
+
+
 def _collect_omissions(data: Mapping[str, Any]) -> list[str]:
     """The de-duplicated 'no silent caps' ledger: every documented skip/omission across the
     checkpoints (surfaced on page 16 and in the manifest). Surfaces the Tier-3 omissions list and
@@ -1839,6 +2280,8 @@ def _collect_omissions(data: Mapping[str, Any]) -> list[str]:
     if str(tte_data.get("status")) == "skipped" and tte_data.get("skip_reason"):
         omissions.append(f"TTE skipped: {tte_data['skip_reason']}")
     tier1 = data.get("tier1") or {}
+    omissions.extend(f"Reporting arm not formed, dropped from every per-arm tier: {gap}"
+                     for gap in (tier1.get("arm_gaps") or []))
     transportability = tier1.get("transportability") or {}
     if transportability.get("loso_note"):
         omissions.append(str(transportability["loso_note"]))
@@ -1864,6 +2307,24 @@ def _collect_omissions(data: Mapping[str, Any]) -> list[str]:
         if str(row.get("skipped_reason", "")).strip()
     })
     omissions.extend(f"Threshold event disabled: {reason}" for reason in threshold_reasons)
+    # Named per (arm, outcome): the reasons differ only in a row count, so an unnamed ledger entry
+    # would read as four near-duplicates instead of four distinct cells.
+    sensitivity_reasons = sorted({
+        f"{row.get('arm')} {row.get('outcome')}, {str(row.get('skipped_reason', '')).strip()}"
+        for row in (tier4.get("feature_sensitivity") or {}).get("rows", [])
+        if str(row.get("skipped_reason", "")).strip()
+    })
+    omissions.extend(f"Feature sensitivity not estimable for {reason}" for reason in sensitivity_reasons)
+    which_incretin = ((tier1.get("heterogeneity") or {}).get("which_incretin") or {})
+    if which_incretin.get("skipped_reason"):
+        omissions.append(f"Which-incretin contrast not estimable: {which_incretin['skipped_reason']}")
+    cate = _cate_payload(data)
+    if cate.get("skipped_reason"):
+        omissions.append(f"CATE not estimable: {cate['skipped_reason']}")
+    # Structural, every-run entries last so the run-specific skips stay at the head of the ledger.
+    omissions.append(CAUSAL_FOREST_NOTE)
+    omissions.extend(f"TTE confounder not populated, omitted from L and unadjusted: {name}"
+                     for name in _tte_absent_confounders(data))
     unique: list[str] = []
     for item in omissions:
         if item and item not in unique:
@@ -1883,7 +2344,9 @@ def _executive_highlights(data: Mapping[str, Any]) -> list[str]:
     tier4 = data.get("tier4") or {}
     n_threshold = _powered_counts((tier4.get("threshold") or {}).get("rows", []))[0]
     decision_rows = (tier4.get("decision") or {}).get("rows", [])
-    n_decision = len({(row.get("cohort"), row.get("outcome"), row.get("target_month"), row.get("event"))
+    # Keyed on arm, not cohort: the decision rows report the three reporting arms, so dropping the
+    # arm out of this dedup would silently halve the census (rygb folding onto incretin).
+    n_decision = len({(row.get("arm"), row.get("outcome"), row.get("target_month"), row.get("event"))
                       for row in decision_rows})
     predictability = (tier4.get("predictability") or {}).get("rows", [])
     n_reliable = sum(1 for row in predictability if bool(row.get("reliable_flag")))
@@ -1933,6 +2396,7 @@ def _limitations_text(data: Mapping[str, Any], tte: Mapping[str, Any]) -> str:
     """The honest limitations paragraph: the causal-only-under-conditional-exchangeability caveat
     (ESTIMAND_NOTE) with the reported E-value bound and the absent confounders named explicitly, plus
     the transportability-approximation note and the remaining prognostic caveats already in the file."""
+    absent = ", ".join(_tte_absent_confounders(data))
     if tte["status"] == "skipped":
         lead = ("The target-trial emulation was skipped in this run (" +
                 (tte.get("skip_reason") or "gate not satisfied") + "), so no causal contrast is claimed; the "
@@ -1943,13 +2407,13 @@ def _limitations_text(data: Mapping[str, Any], tte: Mapping[str, Any]) -> str:
         low, high = tte.get("e_value_low"), tte.get("e_value_high")
         if np.isfinite(low) and np.isfinite(high):
             bound = f"{low:.2f}" if abs(high - low) < 1e-9 else f"{low:.2f} to {high:.2f}"
-            e_clause = (f" The reported E-value ({bound} across estimable horizons) quantifies that bound: an "
-                        "unmeasured confounder - GERD/reflux or surgeon/center, both ABSENT from this source - "
-                        "would need at least that association strength with both the arm and the outcome to "
-                        "explain the estimate away.")
+            e_clause = (f" The reported E-value ({bound} across estimable horizons) is read against the enriched L "
+                        f"(creatinine and eGFR now adjusted): an unmeasured confounder - one of the axes ABSENT "
+                        f"from this source and therefore omitted from L ({absent}) - would need at least that "
+                        "association strength with both the arm and the outcome to explain the estimate away.")
         else:
-            e_clause = (" The E-value bound is not estimable in this run; the confounders ABSENT from this source "
-                        "and therefore unadjusted are GERD/reflux and surgeon/center.")
+            e_clause = (f" The E-value bound is not estimable in this run; the axes ABSENT from this source and "
+                        f"therefore omitted from the enriched L and unadjusted are {absent}.")
     return (
         lead + ESTIMAND_NOTE + e_clause + " Geographic transportability is APPROXIMATED by state, SVI, and RUCA "
         "strata, not by true held-out centers, so out-of-center generalization is not established. Treatment "
@@ -2011,13 +2475,13 @@ def _page_executive_summary(cfg: SecondaryConfig, data: Mapping[str, Any], numbe
     if powered_only.empty:
         empty_panel(ax_rob, "Robustness not populated")
     else:
-        columns = ["cohort", "outcome", "rel_improvement_all", "rel_improvement_powered", "verdict"]
+        columns = ["arm", "outcome", "rel_improvement_all", "rel_improvement_powered", "verdict"]
         for column in columns:
             if column not in powered_only.columns:
                 powered_only[column] = np.nan
         study.draw_compact_table(
             ax_rob, powered_only.loc[:, columns], columns,
-            labels=["Cohort", "Outcome", "Rel.\nall", "Rel.\npowered", "Verdict"], max_rows=8)
+            labels=["Arm", "Outcome", "Rel.\nall", "Rel.\npowered", "Verdict"], max_rows=8)
 
     ax_cov = figure.add_axes([0.055, 0.185, 0.44, 0.235])
     study.panel_label(ax_cov, "C", "Analysis coverage: scored cells and powered")
@@ -2102,6 +2566,10 @@ def _page_run_identity(cfg: SecondaryConfig, data: Mapping[str, Any], number: in
         empty_panel(ax_audit_right, "")
     else:
         audit_frame = audit.loc[:, [column for column in audit_columns if column in audit.columns]].reset_index(drop=True)
+        # The enriched baselines run past draw_compact_table's 22-character cell budget, which would
+        # render glucose_fasting_baseline as a bare ellipsis. The suffix is uniform and dropping it
+        # collides with nothing, so shorten it here; the CSV keeps the full column names.
+        audit_frame["column"] = audit_frame["column"].astype(str).str.replace("_baseline", "", regex=False)
         half = (len(audit_frame) + 1) // 2
         study.draw_compact_table(ax_audit_left, audit_frame.iloc[:half], audit_columns,
                                  labels=audit_labels, max_rows=half + 1)
@@ -2152,10 +2620,17 @@ def _page_gates_limitations(cfg: SecondaryConfig, data: Mapping[str, Any], numbe
                        color=study.PALETTE["ink"], va="top", transform=ax_conclusion.transAxes)
 
     omissions = _collect_omissions(data)
-    shown = omissions[:4]
-    suffix = "" if len(omissions) <= 4 else f" (+{len(omissions) - 4} more in manifest)"
-    ledger = "Omissions (no silent caps): " + ((" | ".join(shown) + suffix) if shown else "none recorded.")
-    figure.text(0.055, 0.062, textwrap.fill(ledger, 205), fontsize=6.0, color=study.PALETTE["muted"], va="top")
+    ledger = "Omissions (no silent caps): " + (" | ".join(omissions) if omissions else "none recorded.")
+    # Cap the RENDERED lines, not the item count. Capping items alone does not bound the height,
+    # because the entries vary in length, and an overlong block prints straight over the page
+    # footer. Three lines at width 205, anchored at y=0.085, is the budget that clears it; the
+    # trimmed last line still points at the manifest, which always carries the complete ledger.
+    lines = textwrap.wrap(ledger, 205)
+    if len(lines) > 3:
+        tail = f" ... ({len(omissions)} omissions listed in full in manifest.json)"
+        lines = lines[:3]
+        lines[-1] = lines[-1][:205 - len(tail)].rstrip() + tail
+    figure.text(0.055, 0.085, "\n".join(lines), fontsize=6.0, color=study.PALETTE["muted"], va="top")
     return figure
 
 
@@ -2164,6 +2639,53 @@ def _page_gates_limitations(cfg: SecondaryConfig, data: Mapping[str, Any], numbe
 # --------------------------------------------------------------------------------------------
 def _short_covariate(name: str) -> str:
     return name.replace("__", " ").replace("_", " ").replace("=", ": ")
+
+
+def _feature_label(name: str) -> str:
+    """A baseline feature's display name, used by EVERY page that names one.
+
+    Every such feature is a baseline covariate, so the redundant baseline_ prefix and _baseline
+    suffix the source columns carry are dropped (they cost a y axis or a table column more width
+    than they carry meaning), and the clinical acronyms are cased the way the rest of the book
+    writes them. This is the book's standing convention - figures name things for a reader, CSVs
+    keep the source column names - so pages 07, 18, and 19 all route their modifier and feature
+    names through here and cate_modifier_importance.csv,
+    which_incretin_modifier_importance.csv, and forecast_feature_sensitivity.csv all keep
+    baseline_bmi.
+    """
+    acronyms = {"bmi": "BMI", "hba1c": "HbA1c", "egfr": "eGFR", "osa": "OSA", "sglt2": "SGLT2"}
+    text = str(name)
+    text = text[len("baseline_"):] if text.startswith("baseline_") else text
+    text = text[:-len("_baseline")] if text.endswith("_baseline") else text
+    # Cased per word, not per whole name, so hba1c_band reads "HbA1c band" beside a plain "HbA1c".
+    return " ".join(acronyms.get(word, word) for word in _short_covariate(text).split(" "))
+
+
+def _draw_modifier_importance(axis: Any, importance: Sequence[Mapping[str, Any]],
+                              max_rows: int) -> None:
+    """The permutation-importance modifier ranking, shared by the CATE and which-incretin pages.
+
+    Ranking is done on the SOURCE names so the order matches the CSV exactly; only the rendered
+    label is shortened.
+    """
+    frame = pd.DataFrame(list(importance or []))
+    if not frame.empty:
+        frame = frame.sort_values(["permutation_importance", "modifier"],
+                                  ascending=[False, True]).head(max_rows)
+        frame = frame.assign(modifier=frame["modifier"].map(_feature_label))
+    study.draw_compact_table(axis, frame, list(CATE_IMPORTANCE_COLUMNS),
+                             labels=["Effect modifier", "Permutation\nimportance"],
+                             max_rows=max_rows)
+
+
+def _tte_confounder_text(data: Mapping[str, Any]) -> str:
+    """What the enriched, audit-gated L resolved to, and which axes it could not adjust for."""
+    confounders = (data.get("tte") or {}).get("confounders") or {}
+    entered = list(confounders.get("numeric") or []) + list(confounders.get("categorical") or [])
+    return (f"{len(entered)} audit-gated baseline confounders entered L: "
+            + (", ".join(entered) if entered else "none")
+            + ". Unpopulated in this source, so omitted from L rather than carried as an all-NaN "
+            "column, and therefore unadjusted: " + ", ".join(_tte_absent_confounders(data)) + ".")
 
 
 def _tte_skip_panel(figure: Any, tte: Mapping[str, Any]) -> Any:
@@ -2267,8 +2789,10 @@ def _page_tte_design(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
     ax_love = figure.add_axes([0.55, 0.14, 0.40, 0.68])
     _draw_love_plot(ax_love, tte.get("love", {}))
     study.panel_label(ax_love, "B", "Covariate balance (Love plot)")
-    figure.text(0.06, 0.44, textwrap.fill("Estimand. " + ESTIMAND_NOTE, 74), fontsize=7.2,
+    figure.text(0.06, 0.46, textwrap.fill("Estimand. " + ESTIMAND_NOTE, 74), fontsize=7.2,
                 color=study.PALETTE["muted"], va="top")
+    figure.text(0.06, 0.34, textwrap.fill("Confounder set L. " + _tte_confounder_text(data), 74),
+                fontsize=7.2, color=study.PALETTE["muted"], va="top")
     return figure
 
 
@@ -2294,6 +2818,9 @@ def _page_tte_positivity(cfg: SecondaryConfig, data: Mapping[str, Any], number: 
             labels=["Outcome", "Target\nmonth", "N", "IPTW\nESS", "Min PS", "Positivity\nfail"],
             max_rows=14,
         )
+    figure.text(0.07, 0.115, textwrap.fill(
+        "Propensity and positivity are re-audited over the enriched L. " + _tte_confounder_text(data), 195),
+        fontsize=6.5, color=study.PALETTE["muted"], va="top")
     return figure
 
 
@@ -2318,11 +2845,14 @@ def _page_tte_results(cfg: SecondaryConfig, data: Mapping[str, Any], number: int
     study.panel_label(ax_hba, "B", "ATE: HbA1c (%)")
     _draw_ate_forest(ax_hba, display[display["outcome"] == "hba1c"], "RYGB - sleeve, HbA1c")
     figure.text(0.06, 0.495, textwrap.fill(
-        "Doubly-robust IPCW-AIPW; negative ATE favors RYGB. BMI 12/24-mo ATE is benchmarked as "
-        "%TWL against the SM-BOSS/SLEEVEPASS anchor (RCT overlap column). Causal only under "
-        "conditional exchangeability given measured L; the E-value and RCT overlap bound residual "
-        "confounding (GERD/reflux and surgeon/center unmeasured). Point estimates are suppressed "
-        "where the positivity gate fails.", 150),
+        "The marginal doubly-robust IPCW-AIPW ATE over the enriched, audit-gated L is the PRIMARY "
+        "estimand; negative ATE favors RYGB. Procedure choice is a point intervention at time zero, "
+        "so ITT and per-protocol coincide. BMI 12/24-mo ATE is benchmarked as %TWL against the "
+        "SM-BOSS/SLEEVEPASS anchor (RCT overlap column). Causal only under conditional "
+        "exchangeability given measured L; the E-value and RCT overlap bound confounding by the "
+        "axes still absent from this source and therefore omitted from L: "
+        + ", ".join(_tte_absent_confounders(data)) + ". Point estimates are suppressed "
+        "where the positivity gate fails.", 168),
         fontsize=6.5, color=study.PALETTE["muted"], va="top")
     ax_table = figure.add_axes([0.06, 0.06, 0.89, 0.32])
     study.panel_label(ax_table, "C", "Doubly-robust AIPW summary")
@@ -2373,27 +2903,60 @@ SUBGROUP_CAVEAT = (
     "modification or rank patient groups."
 )
 
+# Every Section-10 tier is cut over the three reporting arms, so its CSV header says so once.
+ARM_RECUT_NOTE = (
+    "Reported per REPORTING ARM: the incretin cohort, and the shared surgical model subset by "
+    "procedure into RYGB and sleeve (separately reported, not separately fitted). The arms are "
+    "formed by the single shared arm primitive every per-arm read uses. No arm-cell below the "
+    "n < 11 disclosure floor is scored: where this analysis emits a row per declared cell that "
+    "row is blanked, and where it scores only disclosable cells the thin cell is absent."
+)
+
 TRANSPORTABILITY_COLUMNS = (
-    "cohort", "outcome", "axis", "stratum", "target_month", "n", "ess", "crps",
+    "arm", "outcome", "axis", "stratum", "target_month", "n", "ess", "crps",
     "coverage_80", "coverage_90", "cal_slope", "cal_intercept", "powered",
     "p_value_cov80", "q_value_cov80", "skipped_reason",
 )
 TIPPING_POINT_COLUMNS = (
-    "cohort", "outcome", "target_month", "n", "n_censored", "censored_fraction",
+    "arm", "outcome", "target_month", "n", "n_censored", "censored_fraction",
     "model_beats_baseline_at_0", "delta_star_crps", "is_surgery", "ate_at_0",
     "delta_star_ate", "powered",
 )
 TRIAGE_COLUMNS = (
-    "cohort", "outcome", "target_month", "estimator", "n", "rmse", "rmse_ci_low",
+    "arm", "outcome", "target_month", "estimator", "n", "rmse", "rmse_ci_low",
     "rmse_ci_high", "crps", "powered",
 )
 ATTRITION_SMD_COLUMNS = (
-    "cohort", "outcome", "target_month", "covariate", "smd", "abs_smd", "mnar_flag",
+    "arm", "outcome", "target_month", "covariate", "smd", "abs_smd", "mnar_flag",
     "n_observed", "n_censored",
 )
+# Every count the attrition CSVs publish. n_censored has to be suppressed like any other count:
+# censored_fraction times n recovers it exactly, and the observed-vs-censored SMD is a statistic
+# ABOUT the censored group, so a sub-11 censored count takes its whole row with it.
+ATTRITION_COUNT_COLUMNS = ("n", "n_observed", "n_censored")
 HETEROGENEITY_DRUG_COLUMNS = (
     "outcome", "drug_group", "target_month", "n", "ess", "crps", "rmse", "mae",
-    "coverage_80", "cal_slope", "powered", "p_value_cov80", "q_value_cov80",
+    "coverage_80", "cal_slope", "auroc_bmi35", "event_rate_bmi35", "powered",
+    "p_value_cov80", "q_value_cov80",
+)
+DRUG_GROUP_LABELS = {
+    "tirzepatide": "Tirzepatide", "semaglutide_injectable": "Semaglutide inj",
+    "semaglutide_oral": "Semaglutide oral", "dulaglutide": "Dulaglutide",
+    "liraglutide": "Liraglutide", "older": "Older agents",
+}
+# Spec 10 asks for a "which agent for whom" read on a within-incretin contrast where a defensible
+# comparator exists. Tirzepatide against INJECTABLE semaglutide is the only pair that qualifies:
+# same route, same weekly schedule, same prescribing era, same indications. Oral semaglutide and
+# the older agents differ in administration or potency class, so they are never contrasted here.
+WITHIN_INCRETIN_TREATED = "tirzepatide"
+WITHIN_INCRETIN_COMPARATOR = "semaglutide_injectable"
+WITHIN_INCRETIN_CAVEAT = (
+    "PROGNOSTIC HETEROGENEITY, NOT A CAUSAL TREATMENT EFFECT. Incretin agent choice is "
+    "prescriber-driven and never randomized, and this source carries no defensible propensity for "
+    "it: formulary position, prior authorization, tolerability, and supply shortage all drive "
+    "which agent a patient receives and none of them is measured here. Spec 8.5 keeps this "
+    "contrast secondary and exploratory. Read tau_hat as a map of which patients' forecasts "
+    "differ between agents, never as the effect of switching agent."
 )
 HETEROGENEITY_PROCEDURE_COLUMNS = (
     "outcome", "procedure", "target_month", "n", "ess", "crps", "rmse", "mae",
@@ -2710,12 +3273,12 @@ def _tier1_transportability(cfg: SecondaryConfig, frames: Mapping[tuple[str, str
     )
     axes_usable = {axis: usable for axis, _column, _msg, usable in axes_plan}
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)].copy()
         for axis, column, message, usable in axes_plan:
             if not usable or column not in observed.columns:
                 rows.append({
-                    "cohort": cohort, "outcome": outcome, "axis": axis, "stratum": "",
+                    "arm": arm, "outcome": outcome, "axis": axis, "stratum": "",
                     "target_month": np.nan, "n": 0, "ess": np.nan, "crps": np.nan,
                     "coverage_80": np.nan, "coverage_90": np.nan, "cal_slope": np.nan,
                     "cal_intercept": np.nan, "powered": False, "p_value_cov80": np.nan,
@@ -2743,7 +3306,7 @@ def _tier1_transportability(cfg: SecondaryConfig, frames: Mapping[tuple[str, str
                 ess = _effective_sample_size(weight)
                 n = int(len(cell))
                 rows.append({
-                    "cohort": cohort, "outcome": outcome, "axis": axis, "stratum": str(stratum),
+                    "arm": arm, "outcome": outcome, "axis": axis, "stratum": str(stratum),
                     "target_month": int(target_month), "n": n, "ess": ess,
                     "crps": metrics["crps"], "coverage_80": metrics["coverage_80"],
                     "coverage_90": metrics["coverage_90"], "cal_slope": metrics["cal_slope"],
@@ -2827,7 +3390,7 @@ def _impute_censored_outcome(cell: Any, y: Any, observed: Any, median: Any, seed
         return np.where(observed, y, median)
 
 
-def _estimator_triage(cohort: str, outcome: str, target_month: int, cell: Any, observed: Any,
+def _estimator_triage(arm: str, outcome: str, target_month: int, cell: Any, observed: Any,
                       y: Any, matrix: Any, weight: Any, cfg: SecondaryConfig, rng: Any,
                       powered: bool) -> list[dict[str, Any]]:
     """Complete-case vs IPCW vs multiple-imputation headline RMSE/CRPS with patient-clustered CIs."""
@@ -2844,7 +3407,7 @@ def _estimator_triage(cohort: str, outcome: str, target_month: int, cell: Any, o
 
     def _record(estimator: str, rmse: float, ci: tuple[float, float], crps: float, n: int) -> None:
         rows.append({
-            "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+            "arm": arm, "outcome": outcome, "target_month": int(target_month),
             "estimator": estimator, "n": int(n), "rmse": float(rmse),
             "rmse_ci_low": float(ci[0]), "rmse_ci_high": float(ci[1]), "crps": float(crps),
             "powered": bool(powered),
@@ -2895,7 +3458,7 @@ def _estimator_triage(cohort: str, outcome: str, target_month: int, cell: Any, o
     return rows
 
 
-def _observed_vs_censored_smd(cohort: str, outcome: str, target_month: int, cell: Any,
+def _observed_vs_censored_smd(arm: str, outcome: str, target_month: int, cell: Any,
                               observed: Any) -> list[dict[str, Any]]:
     """Standardized mean difference of baseline covariates between observed and censored patients."""
     observed = np.asarray(observed).astype(bool)
@@ -2910,13 +3473,38 @@ def _observed_vs_censored_smd(cohort: str, outcome: str, target_month: int, cell
     for column, value in zip(columns, np.asarray(smd, dtype=float)):
         abs_value = float(abs(value)) if np.isfinite(value) else float("nan")
         rows.append({
-            "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+            "arm": arm, "outcome": outcome, "target_month": int(target_month),
             "covariate": column, "smd": float(value) if np.isfinite(value) else float("nan"),
             "abs_smd": abs_value,
             "mnar_flag": bool(np.isfinite(value) and abs_value > MNAR_SMD_FLAG),
             "n_observed": n_obs, "n_censored": n_cens,
         })
     return rows
+
+
+def _surgical_ate_tipping(parent: Any, arm: str, target_month: int,
+                          grid: Sequence[float]) -> tuple[list[float] | None, float, float]:
+    """This surgical arm minus the OTHER surgical arm, stress-tested over the MNAR delta grid.
+
+    RYGB-vs-sleeve is a CONTRAST, not a within-arm read, so it is computed on the shared surgical
+    frame - where both procedures are present - rather than on the arm subset, which carries a
+    single procedure and could never form a contrast. The sleeve row is therefore the mirror of the
+    RYGB row by construction, and every field of an arm's row still describes that arm. Returns
+    (curve, ate_at_0, delta*), all blank when the contrast cannot be formed.
+    """
+    blank: tuple[list[float] | None, float, float] = (None, float("nan"), float("nan"))
+    if parent is None or "procedure" not in parent.columns:
+        return blank
+    cell = parent.loc[pd.to_numeric(parent["target_month"], errors="coerce") == int(target_month)]
+    cell = cell.drop_duplicates("patient_id")
+    indicator = (cell["procedure"].astype("string").str.lower() == arm).fillna(False).astype(int).to_numpy()
+    if not (int(indicator.sum()) and int((indicator == 0).sum())):
+        return blank
+    matrix = _quantile_matrix(cell)
+    curve, ate0, delta_star = tipping_point_effect_curve(
+        cell["target_observed"].fillna(False).astype(bool).to_numpy(), matrix[:, 3], indicator,
+        _cell_weight(cell), grid, pd.to_numeric(cell["target_value"], errors="coerce").to_numpy(float))
+    return [float(value) for value in curve], float(ate0), float(delta_star)
 
 
 def _tier1_attrition(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any]) -> tuple[
@@ -2926,8 +3514,11 @@ def _tier1_attrition(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any]
     triage_rows: list[dict[str, Any]] = []
     smd_rows: list[dict[str, Any]] = []
     tipping_curves: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
-        is_surgery = cohort == "surgery"
+    for arm, outcome, frame in _reporting_arm_frames(frames):
+        is_surgery = arm != "incretin"
+        # Uncopied identity view of the shared surgical frame; the ATE contrast needs both
+        # procedures, which an arm subset by construction never has.
+        parent = _arm_view(frames, "surgery", outcome, "")[0] if is_surgery else None
         grid = _delta_grid(outcome)
         for target_month, raw_cell in frame.groupby("target_month", sort=True):
             cell = raw_cell.drop_duplicates("patient_id").reset_index(drop=True)
@@ -2938,40 +3529,32 @@ def _tier1_attrition(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any]
             y = pd.to_numeric(cell["target_value"], errors="coerce").to_numpy(float)
             matrix = _quantile_matrix(cell)
             weight = _cell_weight(cell)
-            median = matrix[:, 3]
             ess = _effective_sample_size(weight)
             powered = _is_powered(n, ess)
             n_censored = int((~observed).sum())
 
             margins, margin0, delta_star_crps, beats0 = tipping_point_crps_curve(
                 observed, y, matrix, weight, grid)
-            ate_curve = None
-            ate0 = float("nan")
-            delta_star_ate = float("nan")
-            if is_surgery and "procedure" in cell.columns:
-                arm = (cell["procedure"].astype("string").str.lower() == "rygb").astype(int).to_numpy()
-                if int(arm.sum()) > 0 and int((arm == 0).sum()) > 0:
-                    curve, ate0, delta_star_ate = tipping_point_effect_curve(
-                        observed, median, arm, weight, grid, y)
-                    ate_curve = [float(value) for value in curve]
+            ate_curve, ate0, delta_star_ate = _surgical_ate_tipping(
+                parent, arm, int(target_month), grid)
 
             tipping_rows.append({
-                "cohort": cohort, "outcome": outcome, "target_month": int(target_month), "n": n,
+                "arm": arm, "outcome": outcome, "target_month": int(target_month), "n": n,
                 "n_censored": n_censored, "censored_fraction": float(n_censored / n) if n else np.nan,
                 "model_beats_baseline_at_0": bool(beats0), "delta_star_crps": float(delta_star_crps),
                 "is_surgery": bool(is_surgery), "ate_at_0": float(ate0),
                 "delta_star_ate": float(delta_star_ate), "powered": bool(powered),
             })
             tipping_curves.append({
-                "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                "arm": arm, "outcome": outcome, "target_month": int(target_month),
                 "grid": [float(value) for value in grid], "margins": [float(value) for value in margins],
                 "ate_curve": ate_curve, "delta_star_crps": float(delta_star_crps),
                 "delta_star_ate": float(delta_star_ate), "is_surgery": bool(is_surgery),
                 "powered": bool(powered), "n": n, "n_censored": n_censored,
             })
             triage_rows.extend(_estimator_triage(
-                cohort, outcome, int(target_month), cell, observed, y, matrix, weight, cfg, rng, powered))
-            smd_rows.extend(_observed_vs_censored_smd(cohort, outcome, int(target_month), cell, observed))
+                arm, outcome, int(target_month), cell, observed, y, matrix, weight, cfg, rng, powered))
+            smd_rows.extend(_observed_vs_censored_smd(arm, outcome, int(target_month), cell, observed))
     return tipping_rows, triage_rows, smd_rows, tipping_curves
 
 
@@ -3013,8 +3596,79 @@ def _tier1_drug_heterogeneity(cfg: SecondaryConfig,
         for (group, target_month), cell in observed.groupby(["_group", "target_month"], sort=True):
             if cell.empty:
                 continue
-            rows.append(_heterogeneity_metric_row(outcome, "drug_group", str(group), int(target_month), cell))
+            record = _heterogeneity_metric_row(outcome, "drug_group", str(group), int(target_month), cell)
+            # Spec 10's per-drug discrimination read. P(BMI < 35) is a BMI event, so the HbA1c rows
+            # carry it as not estimable rather than as a second scale silently pooled into it.
+            if outcome == "bmi":
+                record["auroc_bmi35"], record["event_rate_bmi35"] = _cell_threshold_auroc(cell)
+            rows.append(record)
     return rows
+
+
+def _within_incretin_dr_read(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any],
+                             audit: Any) -> dict[str, Any]:
+    """Spec 10's "which agent for whom": the DR-learner read on ONE within-incretin contrast.
+
+    Tirzepatide (A=1) against injectable semaglutide (A=0) on the held-out incretin BMI cell at the
+    CATE horizon. Estimator, gating, and payload are the sleeve-vs-RYGB CATE's unchanged - the same
+    doubly-robust pseudo-outcome, the same cross-fitted tau, the same positivity gate - so a cell
+    without agent-choice overlap comes back not-estimable rather than as a curve fitted over a
+    clipped propensity ratio. The nuisances CANNOT be borrowed from the target trial (that one is
+    surgical and its arm is the procedure), so ps / pc / mu are cross-fit here over the same
+    patient folds, on the modifier design that also serves as L.
+
+    Nothing in this contrast is randomized. Spec 8.5 makes it secondary and exploratory, and every
+    surface that renders it carries WITHIN_INCRETIN_CAVEAT: this is prognostic heterogeneity, not a
+    causal treatment effect. Benefit is oriented as for the CATE, so a positive number means the
+    tirzepatide forecast is the lower BMI.
+    """
+    frame = frames.get(("incretin", "bmi"))
+    if frame is None or frame.empty or "index_ingredient" not in frame.columns:
+        return {"status": "not_estimable", "n": 0, "calibration": [], "importance": [],
+                "outcome": CATE_OUTCOME, "target_month": CATE_TARGET_MONTH,
+                "absent_modifiers": _cate_absent_modifiers(audit),
+                "treated_agent": WITHIN_INCRETIN_TREATED, "n_treated": 0,
+                "comparator_agent": WITHIN_INCRETIN_COMPARATOR, "n_comparator": 0,
+                "caveat": WITHIN_INCRETIN_CAVEAT,
+                "skipped_reason": "no held-out incretin BMI predictions with a recorded index agent"}
+    route = (frame["index_route"] if "index_route" in frame.columns
+             else pd.Series([""] * len(frame), index=frame.index))
+    agent = pd.Series([_drug_group(ingredient, value) for ingredient, value
+                       in zip(frame["index_ingredient"], route)], index=frame.index)
+    keep = (agent.isin([WITHIN_INCRETIN_TREATED, WITHIN_INCRETIN_COMPARATOR])
+            & (pd.to_numeric(frame["target_month"], errors="coerce") == CATE_TARGET_MONTH))
+    rows = frame.loc[keep].copy()          # the two-agent horizon cell only, never the whole frame
+    rows["_agent"] = agent.loc[keep].to_numpy()
+    rows = rows.drop_duplicates("patient_id").reset_index(drop=True)
+    A = (rows["_agent"].to_numpy() == WITHIN_INCRETIN_TREATED).astype(int)
+    Y = pd.to_numeric(rows["target_value"], errors="coerce").to_numpy(float)
+    delta = rows["target_observed"].fillna(False).astype(bool).astype(int).to_numpy()
+    patient_ids = rows["patient_id"].to_numpy()
+    n, treated = int(A.size), int(A.sum())
+    if n < CATE_MIN_N or treated in {0, n}:
+        # One agent absent (or the cell too thin to cross-fit): skip the nuisances entirely and let
+        # the CATE's own gate write the refusal. min_ps 0 is the literal truth for a one-armed cell.
+        blank = np.zeros(n)
+        read = _cate_dr_learner(cfg, rows, audit, Y, A, delta, np.full(n, 0.5), np.ones(n), blank,
+                                blank, patient_ids,
+                                {"positivity_fail": treated in {0, n}, "min_ps": 0.0,
+                                 "ess_iptw": float("nan")})
+    else:
+        X, _groups, _absent = _cate_modifier_design(rows, audit)
+        ps, degenerate = _crossfit_propensity(X, A, patient_ids, cfg.seed, cfg.nuisance_folds)
+        gate = positivity_gate(ps, A, degenerate=degenerate)
+        mu1, mu0, pc = _crossfit_mu_pc(X, A, Y, delta, patient_ids, cfg.seed, cfg.nuisance_folds)
+        del X
+        gc.collect()
+        read = _cate_dr_learner(cfg, rows, audit, Y, A, delta, ps, pc, mu1, mu0, patient_ids, gate)
+    # The CATE payload names its arms rygb/sleeve; this contrast has different ones, so they are
+    # replaced rather than left to be misread.
+    read.pop("n_rygb", None)
+    read.pop("n_sleeve", None)
+    read.update({"treated_agent": WITHIN_INCRETIN_TREATED, "n_treated": treated,
+                 "comparator_agent": WITHIN_INCRETIN_COMPARATOR, "n_comparator": n - treated,
+                 "caveat": WITHIN_INCRETIN_CAVEAT})
+    return read
 
 
 def _tier1_procedure_heterogeneity(cfg: SecondaryConfig,
@@ -3111,22 +3765,26 @@ def _page_transportability(cfg: SecondaryConfig, data: Mapping[str, Any], number
     if scored.empty:
         empty_panel(ax_table, "No populated strata")
     else:
-        ordered = scored.sort_values(["powered", "axis", "outcome", "target_month", "stratum"],
-                                     ascending=[False, True, True, True, True])
-        columns = ["axis", "outcome", "stratum", "target_month", "n", "crps", "coverage_80", "cal_slope"]
+        ordered = scored.sort_values(["powered", "axis", "arm", "outcome", "target_month", "stratum"],
+                                     ascending=[False, True, True, True, True, True])
+        columns = ["axis", "arm", "outcome", "stratum", "target_month", "n", "crps", "coverage_80",
+                   "cal_slope"]
         study.draw_compact_table(
             ax_table, ordered.loc[:, columns], columns,
-            labels=["Axis", "Outcome", "Stratum", "Target\nmonth", "N", "CRPS", "Cov 80", "Cal\nslope"],
-            max_rows=16)
+            labels=["Axis", "Arm", "Outcome", "Stratum", "Target\nmonth", "N", "CRPS", "Cov 80",
+                    "Cal\nslope"], max_rows=16)
     ax_bar = figure.add_axes([0.66, 0.30, 0.29, 0.52])
     study.panel_label(ax_bar, "B", "CRPS by stratum")
-    bar_source = scored.copy()
+    # Disclosure: the bar plots a statistic rather than a count, so sub-11 strata are dropped from
+    # it outright (the same n >= 11 guard _tier2_single_axis_slice applies before its bar).
+    bar_source = scored.loc[pd.to_numeric(scored["n"], errors="coerce") >= MIN_CELL_SIZE]
     if not bar_source.empty:
         pick_axis = bar_source["axis"].iloc[0]
         subset = bar_source.loc[bar_source["axis"] == pick_axis]
-        pick = subset.loc[subset["target_month"] == subset["target_month"].iloc[0]]
+        pick = subset.loc[(subset["target_month"] == subset["target_month"].iloc[0])
+                          & (subset["arm"] == subset["arm"].iloc[0])]
         _bar_by_group(ax_bar, pick["stratum"].tolist(), pick["crps"].tolist(),
-                      f"CRPS ({pick_axis})", study.PALETTE["blue"])
+                      f"CRPS ({pick_axis}, {pick['arm'].iloc[0]})", study.PALETTE["blue"])
     else:
         empty_panel(ax_bar, "Not estimable")
     degraded = [axis for axis, ok in usable.items() if not ok]
@@ -3170,13 +3828,14 @@ def _page_attrition(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
             twin = ax_tip.twinx()
             twin.plot(grid, np.asarray(chosen["ate_curve"], dtype=float),
                       color=study.PALETTE["orange"], marker="s", ms=3, label="ATE")
-            twin.set_ylabel("ATE (RYGB - sleeve)", fontsize=7, color=study.PALETTE["orange"])
+            twin.set_ylabel(f"ATE ({chosen['arm']} - other surgical arm)", fontsize=7,
+                            color=study.PALETTE["orange"])
             if np.isfinite(chosen.get("delta_star_ate", float("nan"))):
                 twin.axvline(float(chosen["delta_star_ate"]), color=study.PALETTE["orange"], ls="--", lw=0.9)
         ax_tip.set_xlabel("delta (imputed shift on censored)", fontsize=8)
         ax_tip.set_ylabel("baseline CRPS - model CRPS", fontsize=8)
         ax_tip.legend(fontsize=6.0, loc="best", frameon=False)
-        ax_tip.set_title(f"{chosen['cohort']}/{chosen['outcome']} at {chosen['target_month']} mo",
+        ax_tip.set_title(f"{chosen['arm']}/{chosen['outcome']} at {chosen['target_month']} mo",
                          loc="right", fontsize=6.8, color=study.PALETTE["muted"])
     else:
         empty_panel(ax_tip, "No powered cells to stress-test")
@@ -3186,20 +3845,22 @@ def _page_attrition(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
     if triage.empty:
         empty_panel(ax_triage, "Not estimable")
     else:
-        columns = ["cohort", "outcome", "target_month", "estimator", "n", "rmse", "rmse_ci_low", "rmse_ci_high"]
+        columns = ["arm", "outcome", "target_month", "estimator", "n", "rmse", "rmse_ci_low", "rmse_ci_high"]
         study.draw_compact_table(
             ax_triage, triage.loc[:, columns], columns,
-            labels=["Cohort", "Outcome", "Target\nmonth", "Estimator", "N", "RMSE", "CI low", "CI high"],
+            labels=["Arm", "Outcome", "Target\nmonth", "Estimator", "N", "RMSE", "CI low", "CI high"],
             max_rows=14)
 
     ax_smd = figure.add_axes([0.07, 0.13, 0.55, 0.30])
     study.panel_label(ax_smd, "C", "Observed vs censored baseline SMD")
     _draw_smd_heatmap(ax_smd, smd)
     figure.text(0.66, 0.42, textwrap.fill(
-        "Delta shifts the censored outcomes (imputed at the model median) to probe MNAR: the flip "
-        "point marks where the model stops beating the population-mean baseline or, for surgery, "
-        "where the ATE crosses zero. |SMD| > 0.1 (panel C) flags observed-vs-censored imbalance and "
-        "MNAR risk. " + SUBGROUP_CAVEAT, 60), fontsize=6.8, color=study.PALETTE["muted"], va="top")
+        "Delta shifts the censored outcomes (imputed at the model median) to probe MNAR, per "
+        "reporting arm: the flip point marks where that arm's model stops beating the "
+        "population-mean baseline or, for a surgical arm, where its ATE against the other surgical "
+        "arm crosses zero (a cross-arm contrast, so it is read off the shared surgical frame). "
+        "|SMD| > 0.1 (panel C) flags observed-vs-censored imbalance and MNAR risk. "
+        + SUBGROUP_CAVEAT, 60), fontsize=6.8, color=study.PALETTE["muted"], va="top")
     return figure
 
 
@@ -3208,7 +3869,7 @@ def _draw_smd_heatmap(axis: Any, smd: Any) -> None:
         empty_panel(axis, "Not estimable")
         return
     frame = smd.copy()
-    frame["cell"] = frame["cohort"].astype(str) + "/" + frame["outcome"].astype(str) + " " + \
+    frame["cell"] = frame["arm"].astype(str) + "/" + frame["outcome"].astype(str) + " " + \
         frame["target_month"].astype("Int64").astype(str) + "mo"
     pivot = frame.pivot_table(index="covariate", columns="cell", values="abs_smd", aggfunc="mean")
     if pivot.empty:
@@ -3226,37 +3887,132 @@ def _draw_smd_heatmap(axis: Any, smd: Any) -> None:
     colorbar.set_label("|SMD|", fontsize=6.5)
 
 
+def _drug_horizon_rows(drug: Any) -> tuple[Any, int]:
+    """Every agent's rows at ONE horizon: the CATE horizon when this source reaches it, else the
+    earliest one it does.
+
+    Pinning the page to a single horizon lets the table show every agent at a comparable point
+    instead of an alphabetical truncation of the full agent-by-horizon grid, drops the now-constant
+    target_month column (which buys the agent names the width they were being clipped at), and
+    makes the bar panels read exactly the rows the table lists. heterogeneity_drug.csv keeps the
+    complete grid, so nothing here is a silent cap.
+    """
+    months = pd.to_numeric(drug["target_month"], errors="coerce")
+    available = sorted({int(value) for value in months.dropna().tolist()})
+    if not available:
+        return drug.iloc[0:0], 0
+    month = CATE_TARGET_MONTH if CATE_TARGET_MONTH in available else available[0]
+    return drug.loc[months == month].sort_values(["outcome", "drug_group"]), month
+
+
+def _draw_drug_bars(axis: Any, pick: Any, column: str, xlabel: str, color: str,
+                    labelled: bool, chance: float | None = None) -> None:
+    """Horizontal bars over the drug groups. Long agent names read far better on the y axis than
+    rotated under a narrow panel, and a shared row order lets the second panel go label-free.
+
+    The checkpointed rows are unsuppressed (the CSV writer and the table renderer each suppress
+    their own copy), so a bar panel reading them directly has to apply the disclosure floor itself:
+    an under-floor agent gets a labelled row and an explicit "n < 11" in place of its bar, never a
+    plotted value and never a silent gap.
+    """
+    values = pd.to_numeric(pick.get(column), errors="coerce").to_numpy(float) if len(pick) else np.zeros(0)
+    counts = pd.to_numeric(pick.get("n"), errors="coerce").to_numpy(float) if len(pick) else np.zeros(0)
+    disclosable = np.isfinite(counts) & (counts >= MIN_CELL_SIZE)
+    values = np.where(disclosable, values, np.nan)
+    if values.size == 0 or not np.isfinite(values).any():
+        empty_panel(axis, "Not estimable")
+        return
+    y = np.arange(values.size)[::-1]
+    axis.barh(y, values, color=color, alpha=0.88, height=0.66)
+    axis.set_ylim(-0.6, values.size - 0.4)   # room for the suppression markers on the end rows
+    axis.set_yticks(y)
+    axis.set_yticklabels([DRUG_GROUP_LABELS.get(str(name), str(name))
+                          for name in pick["drug_group"]] if labelled else [""] * values.size,
+                         fontsize=6.8)
+    if chance is not None:
+        axis.axvline(chance, color=study.PALETTE["muted"], lw=0.9, ls=":")
+        axis.set_xlim(min(0.4, float(np.nanmin(values))), 1.0)
+    for row in np.where(~disclosable)[0]:
+        # On the paper ground, so a marker that lands on the AUROC chance line stays legible.
+        axis.text(0.02, y[row], "n < 11", transform=axis.get_yaxis_transform(), ha="left",
+                  va="center", fontsize=6.0, color=study.PALETTE["muted"],
+                  bbox={"facecolor": study.PALETTE["paper"], "edgecolor": "none", "pad": 0.8})
+    axis.set_xlabel(xlabel, fontsize=8)
+
+
+def _which_incretin_summary_lines(read: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """The within-incretin readout, in the order the summary column prints it."""
+    return [
+        ("Agent scored", DRUG_GROUP_LABELS.get(str(read.get("treated_agent")), "?")),
+        ("Comparator", DRUG_GROUP_LABELS.get(str(read.get("comparator_agent")), "?")),
+        ("N on agent", study.display_count(int(read.get("n_treated") or 0))),
+        ("N on comparator", study.display_count(int(read.get("n_comparator") or 0))),
+        ("RATE", _cate_number(read.get("rate"), 3)),
+        ("c-for-benefit", _cate_number(read.get("c_for_benefit"), 3)),
+        ("IPTW effective N", _cate_number(read.get("ess_iptw"), 1)),
+    ]
+
+
 @register_page(7)
 def _page_drug_heterogeneity(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
                              title: str, subtitle: str) -> Any:
+    """Spec 10's which-incretin science page: per-agent calibrated CRPS and P(BMI < 35)
+    discrimination (panels A-C), then the "which agent for whom" DR-learner read on the one
+    within-incretin contrast with a defensible comparator (panels D-F). The contrast is not
+    randomized, so panel F carries the prognostic-not-causal gate and a cell without agent-choice
+    overlap renders not-estimable exactly as the CATE page does."""
     figure = secondary_new_page(number, title, subtitle)
     tier1 = _tier1_payload(data)
     if tier1 is None:
         return _tier1_note_page(figure, PENDING_NOTE)
-    drug = pd.DataFrame(tier1.get("heterogeneity", {}).get("drug", []))
+    heterogeneity = tier1.get("heterogeneity", {})
+    drug = pd.DataFrame(heterogeneity.get("drug", []))
     if drug.empty:
         return _tier1_note_page(figure, "Incretin drug groups not populated in this source")
-    ax_table = figure.add_axes([0.06, 0.30, 0.55, 0.52])
-    study.panel_label(ax_table, "A", "Incretin drug-group performance")
-    columns = ["drug_group", "outcome", "target_month", "n", "crps", "rmse", "coverage_80", "cal_slope"]
-    ordered = drug.sort_values(["outcome", "drug_group", "target_month"])
+    horizon, month = _drug_horizon_rows(drug)
+    ax_table = figure.add_axes([0.055, 0.455, 0.505, 0.355])
+    study.panel_label(ax_table, "A", f"Calibrated performance by agent at {month} months")
+    columns = ["drug_group", "outcome", "n", "crps", "rmse", "coverage_80", "auroc_bmi35"]
+    labelled = horizon.copy()
+    labelled["drug_group"] = labelled["drug_group"].map(
+        lambda value: DRUG_GROUP_LABELS.get(str(value), str(value)))
     study.draw_compact_table(
-        ax_table, ordered.loc[:, columns], columns,
-        labels=["Drug group", "Outcome", "Target\nmonth", "N", "CRPS", "RMSE", "Cov 80", "Cal\nslope"],
-        max_rows=18)
-    ax_bar = figure.add_axes([0.66, 0.30, 0.29, 0.52])
-    study.panel_label(ax_bar, "B", "RMSE by drug group")
-    bmi = ordered.loc[ordered["outcome"] == "bmi"] if "outcome" in ordered else ordered
-    subset = bmi if not bmi.empty else ordered
-    if not subset.empty:
-        pick = subset.loc[subset["target_month"] == subset["target_month"].iloc[0]]
-        _bar_by_group(ax_bar, pick["drug_group"].tolist(), pick["rmse"].tolist(),
-                      "RMSE (kg/m2 or %)", study.PALETTE["green"])
+        ax_table, labelled.loc[:, columns], columns,
+        labels=["Agent", "Outcome", "N", "CRPS", "RMSE", "Cov 80", "AUROC\nBMI<35"], max_rows=12)
+    pick = horizon.loc[horizon["outcome"].astype(str) == "bmi"]
+    ax_rmse = figure.add_axes([0.620, 0.455, 0.150, 0.355])
+    _narrow_panel_label(ax_rmse, "B", f"RMSE at {month} mo")
+    _draw_drug_bars(ax_rmse, pick, "rmse", "RMSE, BMI (kg/m2)", study.PALETTE["green"], True)
+    ax_auroc = figure.add_axes([0.800, 0.455, 0.150, 0.355])
+    _narrow_panel_label(ax_auroc, "C", f"AUROC at {month} mo")
+    _draw_drug_bars(ax_auroc, pick, "auroc_bmi35", "P(BMI < 35) AUROC", study.PALETTE["blue"],
+                    False, chance=0.5)
+
+    read = heterogeneity.get("which_incretin") or {}
+    ax_modifiers = figure.add_axes([0.055, 0.135, 0.245, 0.225])
+    _narrow_panel_label(ax_modifiers, "D", "Agent-contrast modifiers")
+    if str(read.get("status")) == "done":
+        _draw_modifier_importance(ax_modifiers, read.get("importance"), 6)
     else:
-        empty_panel(ax_bar, "Not estimable")
-    figure.text(0.06, 0.24, textwrap.fill(
-        "Groups derived from index_ingredient (+ index_route for oral vs injectable semaglutide). "
-        + SUBGROUP_CAVEAT, 150), fontsize=7.0, color=study.PALETTE["muted"], va="top")
+        empty_panel(ax_modifiers, textwrap.fill(
+            f"Not estimable: {read.get('skipped_reason')}" if read.get("skipped_reason")
+            else "Within-incretin contrast not populated in this source", 34))
+    _draw_summary_column(figure.add_axes([0.375, 0.135, 0.185, 0.225]), "E",
+                         "Which agent for whom", _which_incretin_summary_lines(read),
+                         "Benefit is BMI reduction under the scored\nagent rather than the "
+                         "comparator.")
+    # The caveat is read off the payload, not the constant, so the page states what the archived
+    # estimate itself carries - on the not-estimable branches as much as the estimable one.
+    _cate_honesty_panel(figure.add_axes([0.630, 0.135, 0.320, 0.225]), "F", read, 66,
+                        caveat=str(read.get("caveat", WITHIN_INCRETIN_CAVEAT)),
+                        structural="prescriber_or_formulary", tail="")
+    figure.text(0.055, 0.088, textwrap.fill(
+        "Groups derived from index_ingredient (+ index_route for oral vs injectable semaglutide); "
+        "heterogeneity_drug.csv carries every agent at every horizon. CRPS, RMSE, and coverage are "
+        "IPCW-weighted over held-out observed rows of the calibrated selected model, and the AUROC "
+        "reads P(BMI < 35) off the same calibrated quantile ladder the headline per-procedure page "
+        "uses. " + SUBGROUP_CAVEAT, 172),
+        fontsize=6.8, color=study.PALETTE["muted"], va="top")
     return figure
 
 
@@ -3319,12 +4075,12 @@ def _page_procedure_heterogeneity(cfg: SecondaryConfig, data: Mapping[str, Any],
 # (selected candidate at origin 0 on HELD_OUT_SPLITS, target_observed, joined to the covariate
 # frame on patient_id), streamed one origin-0 partition at a time. Fairness axes additionally
 # carry a calibration-equity view: coverage and calibration-slope gaps vs the pooled all-patients
-# model for the same (cohort, outcome, horizon). Suppression of n < 11 is the single hardest
+# model for the same (arm, outcome, horizon). Suppression of n < 11 is the single hardest
 # invariant here (many small cells), enforced on the CSV via suppress(...) and on the pages via
 # study.draw_compact_table.
 # --------------------------------------------------------------------------------------------
 SUBGROUPS_TIER2_COLUMNS = (
-    "cohort", "outcome", "target_month", "axis", "subgroup", "n", "ess", "crps", "coverage_80",
+    "arm", "outcome", "target_month", "axis", "subgroup", "n", "ess", "crps", "coverage_80",
     "calibration_slope", "calibration_intercept", "coverage_gap_vs_pooled",
     "calibration_slope_gap_vs_pooled", "powered", "p_value_cov80", "q_value_cov80",
     "skipped_reason",
@@ -3425,68 +4181,68 @@ def _tier2_comorbidity_count_labels(frame: Any) -> Any:
 
 
 def _tier2_axis_specs() -> list[dict[str, Any]]:
-    """The sixteen Tier-2 axes: name, required source columns (audited), the cohorts they apply to,
-    whether they are a fairness axis, a labeler(frame) -> subgroup Series, and the not-populated
-    message. biguanide/sglt2 are the incretin cohort only (concomitant meds)."""
-    both = {"surgery", "incretin"}
+    """The sixteen Tier-2 axes: name, required source columns (audited), the reporting arms they
+    apply to, whether they are a fairness axis, a labeler(frame) -> subgroup Series, and the
+    not-populated message. biguanide/sglt2 are the incretin arm only (concomitant meds)."""
+    both = {arm for arm, _cohort, _procedure in PROCEDURE_AUROC_ARMS}
     incretin_only = {"incretin"}
     return [
-        {"axis": "sex", "columns": ("sex",), "cohorts": both, "fairness": True,
+        {"axis": "sex", "columns": ("sex",), "arms": both, "fairness": True,
          "labeler": lambda f: _tier2_categorical_labels(f["sex"]),
          "message": "sex not populated in this source"},
-        {"axis": "race", "columns": ("race",), "cohorts": both, "fairness": True,
+        {"axis": "race", "columns": ("race",), "arms": both, "fairness": True,
          "labeler": lambda f: _tier2_categorical_labels(f["race"]),
          "message": "race not populated in this source"},
-        {"axis": "ethnicity", "columns": ("ethnicity",), "cohorts": both, "fairness": True,
+        {"axis": "ethnicity", "columns": ("ethnicity",), "arms": both, "fairness": True,
          "labeler": lambda f: _tier2_categorical_labels(f["ethnicity"]),
          "message": "ethnicity not populated in this source"},
-        {"axis": "age_band", "columns": ("age_at_index",), "cohorts": both, "fairness": True,
+        {"axis": "age_band", "columns": ("age_at_index",), "arms": both, "fairness": True,
          "labeler": lambda f: _tier2_age_band_labels(f["age_at_index"]),
          "message": "age_at_index not populated in this source"},
-        {"axis": "diabetes_flag", "columns": ("diabetes_flag",), "cohorts": both, "fairness": False,
+        {"axis": "diabetes_flag", "columns": ("diabetes_flag",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["diabetes_flag"], "yes", "no"),
          "message": "diabetes_flag not populated in this source"},
-        {"axis": "hba1c_band", "columns": ("baseline_hba1c",), "cohorts": both, "fairness": False,
+        {"axis": "hba1c_band", "columns": ("baseline_hba1c",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_hba1c_band_labels(f["baseline_hba1c"]),
          "message": "baseline_hba1c not populated in this source"},
-        {"axis": "insulin", "columns": ("insulin",), "cohorts": both, "fairness": False,
+        {"axis": "insulin", "columns": ("insulin",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["insulin"], "on", "off"),
          "message": "insulin not populated in this source"},
-        {"axis": "hypertension", "columns": ("hypertension",), "cohorts": both, "fairness": False,
+        {"axis": "hypertension", "columns": ("hypertension",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["hypertension"], "yes", "no"),
          "message": "hypertension not populated in this source"},
-        {"axis": "dyslipidemia", "columns": ("dyslipidemia",), "cohorts": both, "fairness": False,
+        {"axis": "dyslipidemia", "columns": ("dyslipidemia",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["dyslipidemia"], "yes", "no"),
          "message": "dyslipidemia not populated in this source"},
-        {"axis": "osa", "columns": ("osa",), "cohorts": both, "fairness": False,
+        {"axis": "osa", "columns": ("osa",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["osa"], "yes", "no"),
          "message": "osa not populated in this source"},
         {"axis": "comorbidity_count", "columns": ("hypertension", "dyslipidemia", "osa"),
-         "cohorts": both, "fairness": False, "labeler": _tier2_comorbidity_count_labels,
+         "arms": both, "fairness": False, "labeler": _tier2_comorbidity_count_labels,
          "message": "comorbidity flags not populated in this source"},
-        {"axis": "biguanide", "columns": ("biguanide",), "cohorts": incretin_only, "fairness": False,
+        {"axis": "biguanide", "columns": ("biguanide",), "arms": incretin_only, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["biguanide"], "yes", "no"),
          "message": "biguanide not populated in this source"},
-        {"axis": "sglt2", "columns": ("sglt2",), "cohorts": incretin_only, "fairness": False,
+        {"axis": "sglt2", "columns": ("sglt2",), "arms": incretin_only, "fairness": False,
          "labeler": lambda f: _tier2_flag_labels(f["sglt2"], "yes", "no"),
          "message": "sglt2 not populated in this source"},
-        {"axis": "obesity_class", "columns": ("baseline_bmi",), "cohorts": both, "fairness": False,
+        {"axis": "obesity_class", "columns": ("baseline_bmi",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_obesity_class_labels(f["baseline_bmi"]),
          "message": "baseline_bmi not populated in this source"},
-        {"axis": "calendar_era", "columns": ("index_year",), "cohorts": both, "fairness": False,
+        {"axis": "calendar_era", "columns": ("index_year",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_calendar_era_labels(f["index_year"]),
          "message": "index_year not populated in this source"},
-        {"axis": "covid_flag", "columns": ("index_year",), "cohorts": both, "fairness": False,
+        {"axis": "covid_flag", "columns": ("index_year",), "arms": both, "fairness": False,
          "labeler": lambda f: _tier2_covid_flag_labels(f["index_year"]),
          "message": "index_year not populated in this source"},
     ]
 
 
-def _tier2_skip_row(cohort: str, outcome: str, axis: str, reason: str) -> dict[str, Any]:
+def _tier2_skip_row(arm: str, outcome: str, axis: str, reason: str) -> dict[str, Any]:
     """A not-populated axis row: labels kept, metrics NA, carrying the skipped_reason (n = 0 so it
     survives disclosure suppression, which only blanks 0 < n < 11)."""
     return {
-        "cohort": cohort, "outcome": outcome, "target_month": np.nan, "axis": axis,
+        "arm": arm, "outcome": outcome, "target_month": np.nan, "axis": axis,
         "subgroup": "", "n": 0, "ess": np.nan, "crps": np.nan, "coverage_80": np.nan,
         "calibration_slope": np.nan, "calibration_intercept": np.nan,
         "coverage_gap_vs_pooled": np.nan, "calibration_slope_gap_vs_pooled": np.nan,
@@ -3496,10 +4252,11 @@ def _tier2_skip_row(cohort: str, outcome: str, axis: str, reason: str) -> dict[s
 
 
 def _tier2_pooled_metrics(frames: Mapping[tuple[str, str], Any]) -> dict[tuple[str, str, int], dict[str, float]]:
-    """Pooled (all-patients) held-out metrics per (cohort, outcome, target_month) - the reference
-    the fairness calibration-equity gaps are measured against."""
+    """Pooled (all-patients) held-out metrics per (arm, outcome, target_month) - the reference the
+    fairness calibration-equity gaps are measured against, so each arm is judged against its OWN
+    pooled model rather than against a cohort its subgroups are not drawn from."""
     pooled: dict[tuple[str, str, int], dict[str, float]] = {}
-    for (cohort, outcome), frame in frames.items():
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)]
         if observed.empty:
             continue
@@ -3508,7 +4265,7 @@ def _tier2_pooled_metrics(frames: Mapping[tuple[str, str], Any]) -> dict[tuple[s
             matrix = _quantile_matrix(cell)
             weight = _cell_weight(cell)
             metrics = _prognostic_metrics(y, matrix, weight)
-            pooled[(cohort, outcome, int(target_month))] = {
+            pooled[(arm, outcome, int(target_month))] = {
                 "coverage_80": float(metrics["coverage_80"]),
                 "cal_slope": float(metrics["cal_slope"]),
                 "n": int(len(cell)),
@@ -3520,28 +4277,28 @@ def _tier2_pooled_metrics(frames: Mapping[tuple[str, str], Any]) -> dict[tuple[s
 def _tier2_subgroup_cells(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any], audit: Any,
                           pooled: Mapping[tuple[str, str, int], Mapping[str, float]]) -> tuple[
                               list[dict[str, Any]], dict[str, bool]]:
-    """Per (cohort, outcome, target_month) x subgroup-cell CRPS / 80 coverage / calibration
+    """Per (arm, outcome, target_month) x subgroup-cell CRPS / 80 coverage / calibration
     slope+intercept / n / ESS across every usable axis, with fairness gaps vs the pooled model.
     Each axis is gated through the column-population audit and degrades to a skipped_reason row
     when its column(s) are absent or not usable. Never crashes on a missing/empty covariate."""
     specs = _tier2_axis_specs()
     axes_usable: dict[str, bool] = {spec["axis"]: False for spec in specs}
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)].copy()
         for spec in specs:
             axis = spec["axis"]
-            if cohort not in spec["cohorts"]:
+            if arm not in spec["arms"]:
                 continue
             present = all(column in observed.columns for column in spec["columns"])
             if not present:
-                rows.append(_tier2_skip_row(cohort, outcome, axis,
+                rows.append(_tier2_skip_row(arm, outcome, axis,
                                             f"{axis}: required columns absent from source"))
                 continue
             usable = audit is not None and all(audit_usable(audit, column) for column in spec["columns"])
             axes_usable[axis] = bool(axes_usable[axis] or usable)
             if not usable:
-                rows.append(_tier2_skip_row(cohort, outcome, axis, spec["message"]))
+                rows.append(_tier2_skip_row(arm, outcome, axis, spec["message"]))
                 continue
             if observed.empty:
                 continue
@@ -3562,14 +4319,14 @@ def _tier2_subgroup_cells(cfg: SecondaryConfig, frames: Mapping[tuple[str, str],
                 coverage_gap = np.nan
                 slope_gap = np.nan
                 if spec["fairness"]:
-                    reference = pooled.get((cohort, outcome, int(target_month)))
+                    reference = pooled.get((arm, outcome, int(target_month)))
                     if reference is not None:
                         if np.isfinite(metrics["coverage_80"]) and np.isfinite(reference["coverage_80"]):
                             coverage_gap = float(metrics["coverage_80"] - reference["coverage_80"])
                         if np.isfinite(metrics["cal_slope"]) and np.isfinite(reference["cal_slope"]):
                             slope_gap = float(metrics["cal_slope"] - reference["cal_slope"])
                 rows.append({
-                    "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                    "arm": arm, "outcome": outcome, "target_month": int(target_month),
                     "axis": axis, "subgroup": str(subgroup), "n": n, "ess": ess,
                     "crps": metrics["crps"], "coverage_80": metrics["coverage_80"],
                     "calibration_slope": metrics["cal_slope"],
@@ -3584,13 +4341,13 @@ def _tier2_subgroup_cells(cfg: SecondaryConfig, frames: Mapping[tuple[str, str],
 
 
 # ----- Tier 2 figure pages (09 fairness, 10 clinical, 11 obesity class + calendar era) ------
-_TIER2_TABLE_COLUMNS = ["axis", "cohort", "outcome", "subgroup", "target_month", "n", "crps",
+_TIER2_TABLE_COLUMNS = ["axis", "arm", "outcome", "subgroup", "target_month", "n", "crps",
                         "coverage_80", "calibration_slope", "powered"]
-_TIER2_TABLE_LABELS = ["Axis", "Cohort", "Outcome", "Subgroup", "Target\nmonth", "N", "CRPS",
+_TIER2_TABLE_LABELS = ["Axis", "Arm", "Outcome", "Subgroup", "Target\nmonth", "N", "CRPS",
                        "Cov 80", "Cal\nslope", "Powered"]
-_TIER2_COMPACT_COLUMNS = ["cohort", "outcome", "subgroup", "target_month", "n", "crps",
+_TIER2_COMPACT_COLUMNS = ["arm", "outcome", "subgroup", "target_month", "n", "crps",
                           "coverage_80", "calibration_slope"]
-_TIER2_COMPACT_LABELS = ["Cohort", "Outcome", "Subgroup", "Target\nmonth", "N", "CRPS", "Cov 80",
+_TIER2_COMPACT_LABELS = ["Arm", "Outcome", "Subgroup", "Target\nmonth", "N", "CRPS", "Cov 80",
                          "Cal\nslope"]
 
 
@@ -3614,6 +4371,20 @@ def _tier2_scored_frame(tier2: Mapping[str, Any]) -> Any:
     return frame.reset_index(drop=True)
 
 
+def _arm_balanced_head(ordered: Any, max_rows: int) -> Any:
+    """The top ``max_rows`` rows shared out ACROSS the arms, in the caller's existing row order.
+
+    A table that sorts by arm and then truncates fills up with whichever arm sorts first, so a
+    three-arm re-cut would render as one arm. Taking a per-arm head first keeps every arm visible
+    (thin arms included - they render as '<11', which is the honest read). ``groupby.head`` is a
+    row filter, so the caller's powered-first ordering and determinism both survive it.
+    """
+    if ordered is None or ordered.empty or "arm" not in ordered.columns:
+        return ordered
+    arms = max(1, int(ordered["arm"].nunique()))
+    return ordered.groupby("arm", sort=False).head(max(1, int(max_rows) // arms))
+
+
 def _tier2_axis_table(axis_obj: Any, frame: Any, axes: Sequence[str], max_rows: int = 14,
                       columns: Sequence[str] | None = None, labels: Sequence[str] | None = None) -> None:
     """Compact per-cell table for one axis group; powered cells sort first, small cells show '<11'."""
@@ -3624,13 +4395,14 @@ def _tier2_axis_table(axis_obj: Any, frame: Any, axes: Sequence[str], max_rows: 
         empty_panel(axis_obj, "Not populated in this source")
         return
     ordered = subset.sort_values(
-        ["powered", "axis", "cohort", "outcome", "target_month", "subgroup"],
+        ["powered", "axis", "arm", "outcome", "target_month", "subgroup"],
         ascending=[False, True, True, True, True, True])
+    ordered = _arm_balanced_head(ordered, max_rows)
     study.draw_compact_table(axis_obj, ordered.loc[:, columns], columns, labels=labels, max_rows=max_rows)
 
 
 def _tier2_single_axis_slice(frame: Any, axis_name: str) -> Any:
-    """The disclosure-safe (n >= 11) (cohort, outcome, target_month) group with the most subgroups
+    """The disclosure-safe (n >= 11) (arm, outcome, target_month) group with the most subgroups
     for one axis - the slice a bar panel plots so no suppressed-cell statistic is drawn."""
     subset = frame.loc[frame["axis"] == axis_name] if frame is not None and not frame.empty else frame
     if subset is None or subset.empty:
@@ -3638,15 +4410,15 @@ def _tier2_single_axis_slice(frame: Any, axis_name: str) -> Any:
     subset = subset.loc[pd.to_numeric(subset["n"], errors="coerce") >= MIN_CELL_SIZE]
     if subset.empty:
         return subset
-    counts = subset.groupby(["cohort", "outcome", "target_month"], sort=False).size()
-    cohort_v, outcome_v, month_v = counts.idxmax()
-    chosen = subset.loc[(subset["cohort"] == cohort_v) & (subset["outcome"] == outcome_v)
+    counts = subset.groupby(["arm", "outcome", "target_month"], sort=False).size()
+    arm_v, outcome_v, month_v = counts.idxmax()
+    chosen = subset.loc[(subset["arm"] == arm_v) & (subset["outcome"] == outcome_v)
                         & (subset["target_month"] == month_v)]
     return chosen.sort_values("subgroup")
 
 
 def _tier2_fairness_gap_slice(fair_frame: Any) -> Any:
-    """The disclosure-safe fairness (axis, cohort, outcome, target_month) group with the most
+    """The disclosure-safe fairness (axis, arm, outcome, target_month) group with the most
     gap-scored cells, for the coverage-gap bar."""
     if fair_frame is None or fair_frame.empty:
         return pd.DataFrame()
@@ -3654,9 +4426,9 @@ def _tier2_fairness_gap_slice(fair_frame: Any) -> Any:
                             & (pd.to_numeric(fair_frame["n"], errors="coerce") >= MIN_CELL_SIZE)]
     if subset.empty:
         return subset
-    counts = subset.groupby(["axis", "cohort", "outcome", "target_month"], sort=False).size()
-    axis_v, cohort_v, outcome_v, month_v = counts.idxmax()
-    chosen = subset.loc[(subset["axis"] == axis_v) & (subset["cohort"] == cohort_v)
+    counts = subset.groupby(["axis", "arm", "outcome", "target_month"], sort=False).size()
+    axis_v, arm_v, outcome_v, month_v = counts.idxmax()
+    chosen = subset.loc[(subset["axis"] == axis_v) & (subset["arm"] == arm_v)
                         & (subset["outcome"] == outcome_v) & (subset["target_month"] == month_v)]
     return chosen.sort_values("subgroup")
 
@@ -3687,13 +4459,13 @@ def _tier2_gap_table(axis_obj: Any, fair_frame: Any) -> None:
     if subset is None or subset.empty:
         empty_panel(axis_obj, "No pooled reference")
         return
-    ordered = subset.sort_values(["axis", "cohort", "outcome", "target_month", "subgroup"])
-    columns = ["axis", "subgroup", "outcome", "target_month", "n", "coverage_gap_vs_pooled",
+    ordered = subset.sort_values(["axis", "arm", "outcome", "target_month", "subgroup"])
+    columns = ["axis", "arm", "subgroup", "outcome", "target_month", "n", "coverage_gap_vs_pooled",
                "calibration_slope_gap_vs_pooled"]
     study.draw_compact_table(
         axis_obj, ordered.loc[:, columns], columns,
-        labels=["Axis", "Subgroup", "Outcome", "Target\nmonth", "N", "Cov 80\ngap", "Cal slope\ngap"],
-        max_rows=14)
+        labels=["Axis", "Arm", "Subgroup", "Outcome", "Target\nmonth", "N", "Cov 80\ngap",
+                "Cal slope\ngap"], max_rows=14)
 
 
 def _tier2_axis_population_note(usable: Mapping[str, bool], axes: Sequence[str]) -> str:
@@ -3752,7 +4524,7 @@ def _page_clinical_subgroups(cfg: SecondaryConfig, data: Mapping[str, Any], numb
     _tier2_axis_table(ax_com, frame, comorbid, max_rows=12)
     usable = tier2.get("axes_usable", {})
     note = _tier2_axis_population_note(usable, glycemic + comorbid) + \
-        " biguanide/sglt2 are scored on the incretin cohort only. " + SUBGROUP_CAVEAT
+        " biguanide/sglt2 are scored on the incretin arm only. " + SUBGROUP_CAVEAT
     figure.text(0.06, 0.075, textwrap.fill(note, 158), fontsize=6.8, color=study.PALETTE["muted"], va="top")
     return figure
 
@@ -3805,7 +4577,7 @@ def _page_obesity_calendar(cfg: SecondaryConfig, data: Mapping[str, Any], number
 # on the checkpoint, in the manifest via the render stage, and visibly on page 12).
 # --------------------------------------------------------------------------------------------
 ROBUSTNESS_POWERED_ONLY_COLUMNS = (
-    "cohort", "outcome", "n", "n_cells_all", "n_cells_powered", "pooled_model_crps_all",
+    "arm", "outcome", "n", "n_cells_all", "n_cells_powered", "pooled_model_crps_all",
     "pooled_baseline_crps_all", "rel_improvement_all", "pooled_model_crps_powered",
     "pooled_baseline_crps_powered", "rel_improvement_powered", "verdict",
 )
@@ -3814,16 +4586,16 @@ ROBUSTNESS_ELIGIBILITY_COLUMNS = (
     "coverage_80", "cal_slope", "powered", "skipped_reason",
 )
 ROBUSTNESS_IPCW_FORM_COLUMNS = (
-    "cohort", "outcome", "target_month", "form", "n", "n_observed", "ess", "weight_mean",
+    "arm", "outcome", "target_month", "form", "n", "n_observed", "ess", "weight_mean",
     "weight_max", "weight_p50", "weight_p90", "weight_p99", "crps", "coverage_80", "cal_slope",
     "powered",
 )
 ROBUSTNESS_BASELINE_WINDOW_COLUMNS = (
-    "cohort", "outcome", "target_month", "window", "n", "ess", "crps", "coverage_80",
+    "arm", "outcome", "target_month", "window", "n", "ess", "crps", "coverage_80",
     "cal_slope", "powered", "skipped_reason",
 )
 ROBUSTNESS_CLUSTER_BOOTSTRAP_COLUMNS = (
-    "cohort", "outcome", "target_month", "n", "n_states", "crps", "patient_ci_low",
+    "arm", "outcome", "target_month", "n", "n_states", "crps", "patient_ci_low",
     "patient_ci_high", "patient_ci_width", "state_ci_low", "state_ci_high", "state_ci_width",
     "width_ratio_state_over_patient", "powered", "skipped_reason",
 )
@@ -3844,11 +4616,13 @@ POWERED_ONLY_NOTE = (
     "Powered-only reanalysis. The pooled CRPS-improvement gate (model CRPS vs the population-change "
     "baseline CRPS = IPCW-weighted MAE around the weighted-mean observed outcome) is computed over "
     "ALL disclosable cells and, separately, over powered-only cells (n >= 200 AND IPCW ESS >= 100), "
-    "per (cohort, outcome). Reporting both prevents a pooled gain from hiding a failed powered "
+    "per (arm, outcome). Reporting both prevents a pooled gain from hiding a failed powered "
     "horizon. verdict: real_ceiling = the model does not beat baseline even where powered (a real "
     "ceiling, not a power artifact); power_artifact = the powered-only improvement exceeds the "
     "all-cells pooled value by >= 0.02 (underpowered cells were masking a real gain); "
-    "stable_real_signal = the two agree; no_powered_cells = no cell reached the powered threshold."
+    "stable_real_signal = the two agree; no_powered_cells = no cell reached the powered threshold; "
+    "no_disclosable_cells = the arm has no cell above the n < 11 floor, so nothing is scored. "
+    + ARM_RECUT_NOTE
 )
 ELIGIBILITY_NOTE = (
     "Incretin eligibility-threshold sweep. Changing the qualifying-months threshold changes the "
@@ -3864,18 +4638,20 @@ IPCW_FORM_NOTE = (
     "two ways - a logistic form (the production propensity family) and a gradient-boosted form - "
     "cross-fitted over 5 patient-clustered folds and truncated at the production (0.01, 0.99) weight "
     "quantiles. Weight distribution, IPCW effective sample size, and headline-metric stability are "
-    "reported for each form, extending production's truncation-only weight sensitivity."
+    "reported for each form, extending production's truncation-only weight sensitivity. "
+    + ARM_RECUT_NOTE
 )
 BASELINE_WINDOW_NOTE = (
     "Baseline-window sensitivity. Held-out accuracy is stratified by baseline-measurement recency "
     "|baseline_bmi_day| (days from index), to show how far-from-index baselines affect accuracy. "
-    "Degrades to a logged skipped_reason when baseline_bmi_day is not populated."
+    "Degrades to a logged skipped_reason when baseline_bmi_day is not populated. " + ARM_RECUT_NOTE
 )
 CLUSTER_BOOTSTRAP_NOTE = (
     "State-cluster bootstrap. Headline CRPS confidence intervals are recomputed resampling whole "
     "states (then all of their patients) instead of resampling patients, and the CI widths are "
     "compared. Wider state-cluster intervals expose within-state correlation the patient bootstrap "
-    "ignores. Skipped with a logged reason when state is not usable."
+    "ignores. Resampling stays index-based, so no frame is copied per replicate. Skipped with a "
+    "logged reason when state is not usable. " + ARM_RECUT_NOTE
 )
 
 
@@ -3904,7 +4680,7 @@ def _powered_only_verdict(rel_all: float, rel_powered: float, n_cells_powered: i
 
 def _tier3_powered_only(frames: Mapping[tuple[str, str], Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)]
         if observed.empty:
             continue
@@ -3934,6 +4710,10 @@ def _tier3_powered_only(frames: Mapping[tuple[str, str], Any]) -> list[dict[str,
                 base_num_pw += base_crps * wsum
                 wsum_pw += wsum
         if n_cells_all == 0:
+            # Named, not dropped: a thin arm (the sleeve arm is the one this fires for) would
+            # otherwise vanish from the headline robustness table with no record.
+            rows.append({"arm": arm, "outcome": outcome, "n": 0, "n_cells_all": 0,
+                         "n_cells_powered": 0, "verdict": "no_disclosable_cells"})
             continue
         pooled_model_all = model_num_all / wsum_all if wsum_all > 0 else float("nan")
         pooled_base_all = base_num_all / wsum_all if wsum_all > 0 else float("nan")
@@ -3947,7 +4727,7 @@ def _tier3_powered_only(frames: Mapping[tuple[str, str], Any]) -> list[dict[str,
         else:
             pooled_model_pw = pooled_base_pw = rel_pw = float("nan")
         rows.append({
-            "cohort": cohort, "outcome": outcome, "n": int(n_all),
+            "arm": arm, "outcome": outcome, "n": int(n_all),
             "n_cells_all": int(n_cells_all), "n_cells_powered": int(n_cells_powered),
             "pooled_model_crps_all": pooled_model_all, "pooled_baseline_crps_all": pooled_base_all,
             "rel_improvement_all": rel_all, "pooled_model_crps_powered": pooled_model_pw,
@@ -4055,7 +4835,11 @@ def _tier3_eligibility_sweep(cfg: SecondaryConfig, frames: Mapping[tuple[str, st
         f"(qualifying = {cfg.incretin_qualifying_months} months); looser thresholds cannot add "
         f"unmodeled patients, so metric cells reflect the intersection with the frozen store."
     )
-    incretin_frames = {outcome: frames.get(("incretin", outcome)) for outcome in OUTCOMES}
+    # The one Section-10 robustness read that is NOT cut over the three arms: the qualifying-months
+    # threshold defines the incretin continuer cohort, so a surgical arm has no eligibility knob to
+    # sweep and intersecting a re-derived incretin id set with it is empty by construction. It still
+    # forms its arm through the shared primitive, so the incretin arm is defined identically here.
+    incretin_frames = {outcome: _arm_view(frames, "incretin", outcome, "")[0] for outcome in OUTCOMES}
     rows: list[dict[str, Any]] = []
     cohort_n_map: dict[int, int | None] = {}
     for months in months_list:
@@ -4162,7 +4946,7 @@ def _crossfit_observation_prob(x: Any, delta: Any, patient_ids: Any, form: str, 
 
 def _tier3_ipcw_form(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         for target_month, raw_cell in frame.groupby("target_month", sort=True):
             cell = raw_cell.drop_duplicates("patient_id").reset_index(drop=True)
             n = int(len(cell))
@@ -4193,7 +4977,7 @@ def _tier3_ipcw_form(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any]
                 metrics = _prognostic_metrics(y[obs_idx], matrix[obs_idx], weight)
                 ess = _effective_sample_size(weight)
                 rows.append({
-                    "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                    "arm": arm, "outcome": outcome, "target_month": int(target_month),
                     "form": form, "n": n, "n_observed": n_observed, "ess": ess,
                     "weight_mean": float(np.mean(weight)), "weight_max": float(np.max(weight)),
                     "weight_p50": float(np.percentile(weight, 50)),
@@ -4223,13 +5007,13 @@ def _tier3_baseline_window(cfg: SecondaryConfig, frames: Mapping[tuple[str, str]
     if not audit_usable(local_audit, "baseline_bmi_day"):
         reason = "baseline_bmi_day not populated in this source; baseline-window sensitivity skipped"
         row = {
-            "cohort": "", "outcome": "", "target_month": np.nan, "window": "", "n": 0, "ess": np.nan,
+            "arm": "", "outcome": "", "target_month": np.nan, "window": "", "n": 0, "ess": np.nan,
             "crps": np.nan, "coverage_80": np.nan, "cal_slope": np.nan, "powered": False,
             "skipped_reason": reason,
         }
         return [row], {"usable": False, "skipped_reason": reason}
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)].copy()
         if observed.empty or "baseline_bmi_day" not in observed.columns:
             continue
@@ -4246,7 +5030,7 @@ def _tier3_baseline_window(cfg: SecondaryConfig, frames: Mapping[tuple[str, str]
             metrics = _prognostic_metrics(y, matrix, weight)
             ess = _effective_sample_size(weight)
             rows.append({
-                "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                "arm": arm, "outcome": outcome, "target_month": int(target_month),
                 "window": str(window), "n": n, "ess": ess, "crps": metrics["crps"],
                 "coverage_80": metrics["coverage_80"], "cal_slope": metrics["cal_slope"],
                 "powered": _is_powered(n, ess), "skipped_reason": "",
@@ -4277,7 +5061,7 @@ def _cluster_bootstrap_crps_ci(y: Any, matrix: Any, weight: Any, cluster_ids: An
 
 def _cluster_bootstrap_skip(reason: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     row = {
-        "cohort": "", "outcome": "", "target_month": np.nan, "n": 0, "n_states": 0, "crps": np.nan,
+        "arm": "", "outcome": "", "target_month": np.nan, "n": 0, "n_states": 0, "crps": np.nan,
         "patient_ci_low": np.nan, "patient_ci_high": np.nan, "patient_ci_width": np.nan,
         "state_ci_low": np.nan, "state_ci_high": np.nan, "state_ci_width": np.nan,
         "width_ratio_state_over_patient": np.nan, "powered": False, "skipped_reason": reason,
@@ -4291,7 +5075,7 @@ def _tier3_cluster_bootstrap(cfg: SecondaryConfig, frames: Mapping[tuple[str, st
         return _cluster_bootstrap_skip("state not usable (audit gate); state-cluster bootstrap skipped")
     reps = int(cfg.bootstrap_replicates)
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)].copy()
         if observed.empty or "state" not in observed.columns:
             continue
@@ -4317,7 +5101,7 @@ def _tier3_cluster_bootstrap(cfg: SecondaryConfig, frames: Mapping[tuple[str, st
             ratio = (s_width / p_width
                      if np.isfinite(s_width) and np.isfinite(p_width) and p_width > 0 else float("nan"))
             rows.append({
-                "cohort": cohort, "outcome": outcome, "target_month": int(target_month), "n": n,
+                "arm": arm, "outcome": outcome, "target_month": int(target_month), "n": n,
                 "n_states": n_states, "crps": crps, "patient_ci_low": p_lo, "patient_ci_high": p_hi,
                 "patient_ci_width": p_width, "state_ci_low": s_lo, "state_ci_high": s_hi,
                 "state_ci_width": s_width, "width_ratio_state_over_patient": ratio,
@@ -4375,7 +5159,10 @@ def _tier3_powered_bar(axis: Any, frame: Any) -> None:
     if frame is None or frame.empty:
         empty_panel(axis, "Not estimable")
         return
-    labels = [f"{row.cohort}/{row.outcome}\n{row.verdict}" for row in frame.itertuples()]
+    # Three arms put six bars in this panel, so the verdict wraps instead of running into its
+    # neighbour's label.
+    labels = [f"{row.arm}/{row.outcome}\n" + textwrap.fill(str(row.verdict).replace("_", " "), 14)
+              for row in frame.itertuples()]
     all_vals = pd.to_numeric(frame["rel_improvement_all"], errors="coerce").to_numpy(float)
     powered_vals = pd.to_numeric(frame["rel_improvement_powered"], errors="coerce").to_numpy(float)
     x = np.arange(len(labels))
@@ -4414,14 +5201,14 @@ def _tier3_ipcw_panel(axis: Any, frame: Any) -> None:
         empty_panel(axis, "Not estimable")
         return
     frame = frame.copy()
-    columns = ["cohort", "outcome", "target_month", "form", "ess", "weight_max", "crps", "coverage_80"]
+    columns = ["arm", "outcome", "target_month", "form", "ess", "weight_max", "crps", "coverage_80"]
     for column in columns:
         if column not in frame.columns:
             frame[column] = np.nan
-    ordered = frame.sort_values(["cohort", "outcome", "target_month", "form"])
+    ordered = frame.sort_values(["arm", "outcome", "target_month", "form"])
     study.draw_compact_table(
         axis, ordered.loc[:, columns], columns,
-        labels=["Cohort", "Outcome", "Target\nmonth", "Form", "IPCW\nESS", "Weight\nmax", "CRPS", "Cov 80"],
+        labels=["Arm", "Outcome", "Target\nmonth", "Form", "IPCW\nESS", "Weight\nmax", "CRPS", "Cov 80"],
         max_rows=10)
 
 
@@ -4435,14 +5222,14 @@ def _tier3_baseline_panel(axis: Any, baseline: Mapping[str, Any]) -> None:
     if scored is None or scored.empty:
         empty_panel(axis, "Not estimable")
         return
-    columns = ["cohort", "outcome", "window", "target_month", "n", "crps", "coverage_80"]
+    columns = ["arm", "outcome", "window", "target_month", "n", "crps", "coverage_80"]
     for column in columns:
         if column not in scored.columns:
             scored[column] = np.nan
-    ordered = scored.sort_values(["cohort", "outcome", "target_month", "window"])
+    ordered = scored.sort_values(["arm", "outcome", "target_month", "window"])
     study.draw_compact_table(
         axis, ordered.loc[:, columns], columns,
-        labels=["Cohort", "Outcome", "Window\n(days)", "Target\nmonth", "N", "CRPS", "Cov 80"],
+        labels=["Arm", "Outcome", "Window\n(days)", "Target\nmonth", "N", "CRPS", "Cov 80"],
         max_rows=10)
 
 
@@ -4456,15 +5243,15 @@ def _tier3_cluster_panel(axis: Any, cluster: Mapping[str, Any]) -> None:
     if scored is None or scored.empty:
         empty_panel(axis, "Not estimable")
         return
-    columns = ["cohort", "outcome", "target_month", "n", "n_states", "patient_ci_width",
+    columns = ["arm", "outcome", "target_month", "n", "n_states", "patient_ci_width",
                "state_ci_width", "width_ratio_state_over_patient"]
     for column in columns:
         if column not in scored.columns:
             scored[column] = np.nan
-    ordered = scored.sort_values(["cohort", "outcome", "target_month"])
+    ordered = scored.sort_values(["arm", "outcome", "target_month"])
     study.draw_compact_table(
         axis, ordered.loc[:, columns], columns,
-        labels=["Cohort", "Outcome", "Target\nmonth", "N", "States", "Patient\nCI width",
+        labels=["Arm", "Outcome", "Target\nmonth", "N", "States", "Patient\nCI width",
                 "State\nCI width", "Width\nratio"],
         max_rows=8)
 
@@ -4543,15 +5330,15 @@ GLP1_SHARED_NUMERIC = (
 GLP1_SHARED_CATEGORICAL = ("sex", "ethnicity", "coverage")
 
 THRESHOLD_PROB_COLUMNS = (
-    "cohort", "outcome", "target_month", "event", "event_label", "n", "ess", "brier", "auroc",
+    "arm", "outcome", "target_month", "event", "event_label", "n", "ess", "brier", "auroc",
     "cal_in_large", "pred_mean", "obs_mean", "powered", "skipped_reason",
 )
 DECISION_CURVE_COLUMNS = (
-    "cohort", "outcome", "target_month", "event", "event_label", "p_t", "n", "net_benefit",
+    "arm", "outcome", "target_month", "event", "event_label", "p_t", "n", "net_benefit",
     "nb_treat_all", "nb_treat_none", "powered",
 )
 PREDICTABILITY_MAP_COLUMNS = (
-    "cohort", "outcome", "target_month", "axis", "subgroup", "n", "ess", "mean_width_80", "crps",
+    "arm", "outcome", "target_month", "axis", "subgroup", "n", "ess", "mean_width_80", "crps",
     "rank_width", "rank_crps", "reliable_flag", "powered",
 )
 GLP1_OVERLAP_COLUMNS = (
@@ -4559,24 +5346,111 @@ GLP1_OVERLAP_COLUMNS = (
     "overlap_weighted_mean_pred_incretin", "standardized_diff", "ess_overlap",
 )
 
+# The three reporting arms of the headline per-procedure AUROC (spec 7.2 / 3): the incretin
+# cohort, plus the shared surgical cohort subset by the stored `procedure` column. Each entry is
+# (arm, store cohort, required procedure or "" for the whole cohort).
+PROCEDURE_AUROC_ARMS = (
+    ("incretin", "incretin", ""),
+    ("rygb", "surgery", "rygb"),
+    ("sleeve", "surgery", "sleeve"),
+)
+PROCEDURE_ARM_LABELS = {"incretin": "Incretin", "rygb": "RYGB", "sleeve": "Sleeve"}
+PROCEDURE_AUROC_MONTHS = (6, 12, 24)
+# ROC curves are stored as true-positive rates on this fixed false-positive grid, so the
+# checkpoint payload stays small and byte-identical across runs regardless of cohort size.
+ROC_FPR_GRID = tuple(round(0.02 * index, 2) for index in range(51))  # 0.00 .. 1.00
+PROCEDURE_AUROC_COLUMNS = (
+    "arm", "cohort", "procedure", "target_month", "n", "ess", "event_rate", "auroc",
+    "auroc_ci_low", "auroc_ci_high", "brier", "cal_in_large", "powered", "suppressed",
+    "skipped_reason",
+)
+PROCEDURE_AUROC_NOTE = (
+    "Headline per-procedure discrimination for P(BMI < 35) at 6, 12, and 24 months, reported "
+    "separately for the incretin cohort and for the shared surgical model subset by procedure "
+    "(RYGB, sleeve). Per-row probabilities are read off the calibrated predictive quantile ladder; "
+    "AUROC, Brier, and calibration-in-the-large (mean predicted minus mean observed event rate) "
+    "are IPCW-weighted over held-out observed rows. The 95% interval is a patient-clustered "
+    "percentile bootstrap. Arm-horizon cells with n < 11 are suppressed, not dropped. Prognostic "
+    "discrimination, not a causal effect."
+)
+PER_ARM_PROGNOSTIC_COLUMNS = (
+    "arm", "cohort", "outcome", "target_month", "n", "ess", "crps", "rmse", "mae", "bias",
+    "coverage_80", "coverage_90", "width_80", "cal_slope", "cal_intercept", "powered",
+    "suppressed", "skipped_reason",
+)
+PER_ARM_PROGNOSTIC_NOTE = (
+    "Per-arm calibration and accuracy of the forecast (spec 7.1), reported for the same three "
+    "reporting arms as the headline discrimination: the incretin cohort, and the shared surgical "
+    "model subset by procedure into RYGB and sleeve. Every metric is IPCW-weighted over held-out "
+    "observed rows at the declared horizon: CRPS against the full 7-quantile ladder; RMSE / MAE / "
+    "bias against the predicted median; 80% and 90% coverage against the q10-q90 and q05-q95 "
+    "intervals; the calibration slope and intercept from a weighted regression of observed on "
+    "predicted median (slope 1 and intercept 0 are perfect). Every declared arm-outcome-horizon "
+    "cell yields a row: cells with n < 11 are suppressed, not dropped. The two surgical arms "
+    "subset one shared model, so RYGB and sleeve are separately calibrated but not separately "
+    "fitted. Prognostic performance, not a causal effect."
+)
+
+# Spec 10's feature-sensitivity science page. The secondary script consumes the FROZEN prediction
+# store, never the trained model, so the forecast cannot be re-run with perturbed inputs. The
+# model-agnostic read that IS available is a surrogate: regress the stored median forecast on the
+# same baseline covariates the model saw, then perturb the surrogate. Everything it reports is a
+# property of the SURROGATE's approximation of the forecast, which is why surrogate_r2 is carried
+# beside every importance and why the page states the read as association, never causation.
+FEATURE_SENSITIVITY_MONTH = 12
+# Floor for fitting at all: every cross-fit fold has to leave a training set above TTE_MIN_MU_FIT
+# (20 rows, the codebase's own too-thin-to-fit threshold), and a design this wide needs at least
+# twice that. It guards against a degenerate fit, not against low power - surrogate_r2 is the
+# honest power read and it is carried beside every importance.
+FEATURE_SENSITIVITY_MIN_N = 50
+FEATURE_SENSITIVITY_TOP_N = 7            # source features the page ranks per outcome
+FEATURE_SWEEP_ROWS = 2000                # seeded subsample the counterfactual sweep averages over
+FEATURE_SWEEP_GRID = tuple(round(0.1 * step, 2) for step in range(1, 10))  # 0.10 .. 0.90
+FEATURE_SENSITIVITY_COLUMNS = (
+    "arm", "cohort", "outcome", "feature", "permutation_importance", "importance_share", "rank",
+    "n", "surrogate_r2", "skipped_reason",
+)
+FEATURE_SENSITIVITY_NOTE = (
+    "Sensitivity of the FORECAST to baseline features, per reporting arm. The frozen store carries "
+    "stored quantiles, not the trained model, so the forecast cannot be re-run with perturbed "
+    "inputs. Instead a seeded, cross-fitted gradient-boosted SURROGATE maps the baseline "
+    f"covariates to the stored median forecast at {FEATURE_SENSITIVITY_MONTH} months on held-out "
+    "rows; importance is the fold-weighted rise in held-out squared error when a source feature's "
+    "encoded columns are permuted together, and surrogate_r2 is the out-of-fold share of the "
+    "forecast the surrogate reproduces, which bounds the read. This is an association between the "
+    "baseline features and the model's own output: NOT a causal feature effect, and NOT a "
+    "statement about the patient's biology."
+)
+# Page-only: the CSV carries the held-out importance rows, not the sweep, so this clause belongs
+# on the page beside panel C rather than in the CSV header note above.
+FEATURE_SWEEP_NOTE = (
+    "Panel C sweeps that same fitted surrogate and is therefore IN-SAMPLE: a partial-dependence "
+    "curve describes a fitted response surface, not a held-out forecast."
+)
+
 THRESHOLD_PROB_NOTE = (
     "Clinical threshold probabilities from the predictive quantile ladder. Each per-row CDF is a "
     "monotone piecewise-linear interpolation of the 7 stored quantiles (value=q_j, prob=level_j); "
     "thresholds outside the ladder clamp to the nearest endpoint. Reliability (predicted vs "
     "observed by decile), Brier score, and AUROC are IPCW-weighted over held-out observed rows; "
-    "AUROC is reported only where the observed label carries both classes. Prognostic, not causal."
+    "AUROC is reported only where the observed label carries both classes. Reported per reporting "
+    "arm: incretin, and the shared surgical model subset by procedure into RYGB and sleeve. "
+    "Arm-event cells with n < 11 are suppressed. Prognostic, not causal."
 )
 DECISION_CURVE_NOTE = (
     "Decision-curve net benefit for the binary threshold events: NB(p_t) = TP/n - (FP/n) * "
     "p_t/(1-p_t) with IPCW-weighted counts, against treat-all and treat-none reference lines. A "
-    "prognostic clinical-utility reframing of the forecasts, not a causal effect."
+    "prognostic clinical-utility reframing of the forecasts, not a causal effect. Reported per "
+    "reporting arm: incretin, and the shared surgical model subset by procedure into RYGB and "
+    "sleeve."
 )
 PREDICTABILITY_NOTE = (
     "Who-is-predictable map: every disclosable subgroup stratum (the Tier-2 axes) ranked WITHIN "
     "its outcome family by mean 80% predictive-interval width (q90-q10) and by CRPS (BMI and HbA1c "
     "are never pooled - their scales differ). reliable_flag marks strata at or below the "
     "within-outcome median on BOTH precision (width) and accuracy (CRPS). This audits "
-    "predictability; it does not establish biological effect modification or rank patient groups."
+    "predictability; it does not establish biological effect modification or rank patient groups. "
+    + ARM_RECUT_NOTE
 )
 GLP1_CAVEAT = (
     "NOT A TREATMENT EFFECT. Overlap-weighted contrast of the model's predicted median "
@@ -4650,6 +5524,25 @@ def _weighted_auroc(label: Any, pred: Any, weight: Any) -> float:
     return float(numerator / (total_pos * total_neg))
 
 
+def _cell_threshold_auroc(cell: Any) -> tuple[float, float]:
+    """IPCW-weighted P(BMI < 35) AUROC and observed event rate for one held-out observed cell.
+
+    The same read the headline per-procedure page makes (calibrated quantile ladder -> per-row
+    CDF -> weighted Mann-Whitney), reduced to the two numbers a heterogeneity row carries. Returns
+    (nan, nan) when the cell has no scorable row; a single-class cell yields a nan AUROC from
+    ``_weighted_auroc`` itself, so it is reported as not estimable rather than as chance.
+    """
+    target = pd.to_numeric(cell["target_value"], errors="coerce").to_numpy(float)
+    pred = _quantile_ladder_cdf(_quantile_matrix(cell), np.full(len(cell), BMI_THRESHOLD_BELOW_35))
+    weight = _cell_weight(cell)
+    keep = np.isfinite(target) & np.isfinite(pred) & np.isfinite(weight) & (weight > 0)
+    if not bool(keep.any()):
+        return float("nan"), float("nan")
+    label = (target[keep] < BMI_THRESHOLD_BELOW_35).astype(float)
+    return (_unit_clamp(_weighted_auroc(label, pred[keep], weight[keep])),
+            float(study.weighted_mean(label, weight[keep])))
+
+
 def _reliability_deciles(pred: Any, label: Any, weight: Any, bins: int = 10) -> list[dict[str, float]]:
     """IPCW-weighted reliability points: within each predicted-probability decile, the weighted
     mean predicted probability (x) and weighted mean observed frequency (y), plus the decile n."""
@@ -4676,6 +5569,353 @@ def _reliability_deciles(pred: Any, label: Any, weight: Any, bins: int = 10) -> 
             "n": int(np.sum(selected)),
         })
     return points
+
+
+# ----- the three reporting arms (one re-cut of the held-out frames, shared by every per-arm read)
+def _arm_view(frames: Mapping[tuple[str, str], Any], cohort: str, outcome: str,
+              procedure: str) -> tuple[Any, str]:
+    """One reporting arm's view of a (cohort, outcome) held-out frame, plus a not-estimable reason.
+
+    A cohort-level arm (procedure "") passes its frame through UNCOPIED, so the 177k-row incretin
+    frame is never duplicated; a procedure arm is an index-based subset of the shared surgical
+    frame. The reason separates an arm absent from the source from an unpopulated procedure column,
+    so a structural gap is never reported as a small-cell suppression. Returns (None, reason) when
+    the arm cannot be formed at all, and (frame, "") otherwise - including an empty subset, which
+    the callers report per horizon rather than as a whole-arm gap.
+    """
+    frame = frames.get((cohort, outcome))
+    if frame is None or frame.empty:
+        return None, f"no held-out {cohort} {outcome} predictions in this source"
+    if not procedure:
+        return frame, ""
+    if "procedure" not in frame.columns:
+        return None, "procedure not populated in this source"
+    # fillna(False) so rows with an unrecorded procedure drop out instead of raising on a
+    # nullable-boolean mask; they are neither a RYGB nor a sleeve patient.
+    recorded = frame["procedure"].astype("string").str.lower()
+    return frame.loc[recorded.eq(procedure).fillna(False)], ""
+
+
+def _reporting_arm_frames(frames: Mapping[tuple[str, str], Any]) -> Iterator[tuple[str, str, Any]]:
+    """The held-out frames re-cut to the three reporting arms, in a fixed arm-then-outcome order.
+
+    Yields (arm, outcome, frame) one arm at a time so at most one procedure subset is alive; arms
+    absent from the source are skipped here, and callers that must document that gap read the
+    reason from ``_arm_view`` directly.
+    """
+    for arm, cohort, procedure in PROCEDURE_AUROC_ARMS:
+        for outcome in OUTCOMES:
+            frame, _reason = _arm_view(frames, cohort, outcome, procedure)
+            if frame is not None and not frame.empty:
+                yield arm, outcome, frame
+
+
+def _arm_formation_gaps(frames: Mapping[tuple[str, str], Any]) -> list[str]:
+    """Reporting arms this source cannot form at all, named once for the omissions ledger.
+
+    Every Section-10 tier cut over the arms reads the SAME held-out frames, so one sweep documents
+    the gap for all of them: an arm ``_arm_view`` cannot form is skipped by ``_reporting_arm_frames``
+    and would otherwise vanish from five tiers with no record. An arm that forms but is EMPTY is not
+    a gap - that is a small-cell story the tiers already report per cell.
+    """
+    return sorted({f"{arm} arm ({outcome}): {reason}"
+                   for arm, cohort, procedure in PROCEDURE_AUROC_ARMS for outcome in OUTCOMES
+                   if (reason := _arm_view(frames, cohort, outcome, procedure)[1])})
+
+
+# ----- headline per-procedure AUROC (spec 7.2) ---------------------------------------------
+def _weighted_roc_curve(label: Any, pred: Any, weight: Any) -> list[float]:
+    """IPCW-weighted ROC as true-positive rates sampled on the fixed ROC_FPR_GRID.
+
+    Scores are swept high to low; the weighted cumulative positives / negatives give the empirical
+    ROC, which is then interpolated onto the shared grid so every stored curve is the same small
+    fixed length. Empty when either class carries no weight.
+    """
+    label = np.asarray(label, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    weight = np.asarray(weight, dtype=float)
+    if label.size == 0:
+        return []
+    order = np.argsort(-pred, kind="mergesort")
+    ordered_label, ordered_weight = label[order], weight[order]
+    true_positive = np.cumsum(ordered_weight * ordered_label)
+    false_positive = np.cumsum(ordered_weight * (1.0 - ordered_label))
+    total_positive, total_negative = float(true_positive[-1]), float(false_positive[-1])
+    if total_positive <= 0.0 or total_negative <= 0.0:
+        return []
+    tpr = np.concatenate([[0.0], true_positive / total_positive])
+    fpr = np.concatenate([[0.0], false_positive / total_negative])
+    return [float(value) for value in np.interp(ROC_FPR_GRID, fpr, tpr)]
+
+
+def _patient_bootstrap_auroc_ci(label: Any, pred: Any, weight: Any, rng: Any,
+                                reps: int) -> tuple[float, float]:
+    """Patient-clustered percentile CI of the IPCW-weighted AUROC.
+
+    The cell is deduplicated to one row per patient upstream, so resampling row INDICES is exactly
+    the patient-clustered bootstrap; only an index vector is drawn per replicate and no frame is
+    ever copied (spec Section 11).
+    """
+    n = int(np.asarray(label).size)
+    if n < MIN_CELL_SIZE or reps <= 0:
+        return float("nan"), float("nan")
+    estimates = np.empty(int(reps), dtype=float)
+    for replicate in range(int(reps)):
+        idx = rng.integers(0, n, size=n)
+        estimates[replicate] = _weighted_auroc(label[idx], pred[idx], weight[idx])
+    finite = estimates[np.isfinite(estimates)]
+    if finite.size < 2:
+        return float("nan"), float("nan")
+    lo, hi = np.percentile(finite, [2.5, 97.5])
+    return float(lo), float(hi)
+
+
+def _unit_clamp(value: Any) -> float:
+    """Clamp a probability-scale statistic into [0, 1]. The weighted Mann-Whitney ratio and its
+    bootstrap percentiles can land a few ULP outside the unit interval; np.clip passes NaN through
+    so a not-estimable cell stays not estimable."""
+    return float(np.clip(value, 0.0, 1.0))
+
+
+def _procedure_auroc_row(arm: str, cohort: str, procedure: str, target_month: int, n: int,
+                         suppressed: bool, reason: str) -> dict[str, Any]:
+    """An unscored arm-horizon cell: the row is always emitted, every metric blank.
+
+    ``suppressed`` separates a disclosure suppression (n < MIN_CELL_SIZE) from an arm whose
+    predictions are absent from the source, so the page never explains a structural gap as a
+    small-cell suppression.
+    """
+    return {
+        "arm": arm, "cohort": cohort, "procedure": procedure, "target_month": int(target_month),
+        "n": int(n), "ess": np.nan, "event_rate": np.nan, "auroc": np.nan,
+        "auroc_ci_low": np.nan, "auroc_ci_high": np.nan, "brier": np.nan, "cal_in_large": np.nan,
+        "powered": False, "suppressed": bool(suppressed), "skipped_reason": reason,
+    }
+
+
+def _procedure_auroc(cfg: SecondaryConfig,
+                     frames: Mapping[tuple[str, str], Any]) -> tuple[list[dict[str, Any]],
+                                                                     list[dict[str, Any]]]:
+    """Per-arm discrimination for P(BMI < 35) at 6 / 12 / 24 months (spec 7.2, the headline).
+
+    Scores the three reporting arms - incretin, and the shared surgical held-out frame subset by
+    ``procedure`` into rygb and sleeve - on held-out observed rows only. Predicted probabilities
+    come from the calibrated quantile ladder; AUROC, Brier, and calibration-in-the-large are
+    IPCW-weighted; the interval is a patient-clustered index-based bootstrap whose seed is derived
+    from the arm and horizon, so a cell's CI never depends on iteration order. Every one of the
+    nine arm-horizon cells yields a row: cells below MIN_CELL_SIZE are emitted suppressed rather
+    than hidden. Returns (csv_rows, roc_curves).
+    """
+    rows: list[dict[str, Any]] = []
+    curves: list[dict[str, Any]] = []
+    reps = int(cfg.bootstrap_replicates)
+    for arm, cohort, procedure in PROCEDURE_AUROC_ARMS:
+        frame, reason = _arm_view(frames, cohort, "bmi", procedure)
+        for month in PROCEDURE_AUROC_MONTHS:
+            if reason:
+                rows.append(_procedure_auroc_row(arm, cohort, procedure, month, 0, False, reason))
+                continue
+            cell = frame.loc[(pd.to_numeric(frame["target_month"], errors="coerce") == month)
+                             & frame["target_observed"].fillna(False).astype(bool)]
+            cell = cell.drop_duplicates("patient_id")
+            target = pd.to_numeric(cell["target_value"], errors="coerce").to_numpy(float)
+            pred = _quantile_ladder_cdf(_quantile_matrix(cell),
+                                        np.full(len(cell), BMI_THRESHOLD_BELOW_35))
+            weight = _cell_weight(cell)
+            keep = np.isfinite(target) & np.isfinite(pred) & np.isfinite(weight) & (weight > 0)
+            label = (target < BMI_THRESHOLD_BELOW_35).astype(float)[keep]
+            pred, weight = pred[keep], weight[keep]
+            n = int(label.size)
+            del cell, target, keep
+            if n < MIN_CELL_SIZE:
+                rows.append(_procedure_auroc_row(
+                    arm, cohort, procedure, month, n, True,
+                    "cell below the n < 11 disclosure floor" if n
+                    else "no held-out observed rows at this horizon"))
+                continue
+            auroc = _unit_clamp(_weighted_auroc(label, pred, weight))
+            seed = int(stable_fraction(f"procedure_auroc|{arm}|{month}", cfg.seed) * (2**32))
+            ci_low, ci_high = (_unit_clamp(bound) for bound in _patient_bootstrap_auroc_ci(
+                label, pred, weight, np.random.default_rng(seed), reps))
+            ess = _effective_sample_size(weight)
+            rows.append({
+                "arm": arm, "cohort": cohort, "procedure": procedure, "target_month": month,
+                "n": n, "ess": ess, "event_rate": float(study.weighted_mean(label, weight)),
+                "auroc": auroc, "auroc_ci_low": ci_low, "auroc_ci_high": ci_high,
+                "brier": float(study.weighted_mean((pred - label) ** 2, weight)),
+                "cal_in_large": float(study.weighted_mean(pred, weight)
+                                      - study.weighted_mean(label, weight)),
+                "powered": _is_powered(n, ess), "suppressed": False, "skipped_reason": "",
+            })
+            curves.append({
+                "arm": arm, "target_month": month, "n": n, "auroc": auroc,
+                "auroc_ci_low": ci_low, "auroc_ci_high": ci_high,
+                "event_rate": rows[-1]["event_rate"],
+                "tpr": _weighted_roc_curve(label, pred, weight),
+            })
+    return rows, curves
+
+
+# ----- per-arm calibration and accuracy (spec 7.1) -----------------------------------------
+def _per_arm_prognostic_row(arm: str, cohort: str, outcome: str, target_month: int, n: int,
+                            suppressed: bool, reason: str) -> dict[str, Any]:
+    """An unscored arm-outcome-horizon cell: the row is always emitted, every metric blank."""
+    return {"arm": arm, "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+            "n": int(n), "ess": np.nan, "powered": False, "suppressed": bool(suppressed),
+            "skipped_reason": reason}
+
+
+def _per_arm_prognostic(cfg: SecondaryConfig,
+                        frames: Mapping[tuple[str, str], Any]) -> list[dict[str, Any]]:
+    """Calibration and accuracy per reporting arm and horizon (spec 7.1 / spec 13's per-arm table).
+
+    Scores the same three arms as the headline discrimination - incretin, and the shared surgical
+    held-out frame subset by ``procedure`` into rygb and sleeve - on held-out observed rows, and
+    reports the FULL prognostic metric set ``_prognostic_metrics`` computes: CRPS, RMSE, MAE, bias,
+    80% and 90% interval coverage, mean 80% width, and the IPCW calibration slope and intercept.
+    Every declared arm-outcome-horizon cell in ``study.TARGET_MONTHS`` yields a row, so a horizon
+    with no held-out rows is documented rather than silently missing; cells below MIN_CELL_SIZE are
+    emitted suppressed. One horizon cell is materialized at a time, never a whole-arm copy.
+    """
+    rows: list[dict[str, Any]] = []
+    for arm, cohort, procedure in PROCEDURE_AUROC_ARMS:
+        for outcome in OUTCOMES:
+            frame, reason = _arm_view(frames, cohort, outcome, procedure)
+            for month in study.TARGET_MONTHS[outcome]:
+                if reason:
+                    rows.append(_per_arm_prognostic_row(arm, cohort, outcome, month, 0, False, reason))
+                    continue
+                cell = frame.loc[(pd.to_numeric(frame["target_month"], errors="coerce") == month)
+                                 & frame["target_observed"].fillna(False).astype(bool)]
+                cell = cell.drop_duplicates("patient_id")
+                y = pd.to_numeric(cell["target_value"], errors="coerce").to_numpy(float)
+                matrix = _quantile_matrix(cell)
+                weight = _cell_weight(cell)
+                keep = (np.isfinite(y) & np.isfinite(weight) & (weight > 0)
+                        & np.isfinite(matrix).all(axis=1))
+                n = int(np.sum(keep))
+                del cell
+                if n < MIN_CELL_SIZE:
+                    rows.append(_per_arm_prognostic_row(
+                        arm, cohort, outcome, month, n, True,
+                        "cell below the n < 11 disclosure floor" if n
+                        else "no held-out observed rows at this horizon"))
+                    continue
+                weight = weight[keep]
+                ess = _effective_sample_size(weight)
+                rows.append({
+                    "arm": arm, "cohort": cohort, "outcome": outcome, "target_month": int(month),
+                    "n": n, "ess": ess, "powered": _is_powered(n, ess), "suppressed": False,
+                    "skipped_reason": "", **_prognostic_metrics(y[keep], matrix[keep], weight),
+                })
+    return rows
+
+
+# ----- feature sensitivity of the forecast (spec 10, surrogate read on the frozen store) ----
+def _feature_sensitivity_row(arm: str, cohort: str, outcome: str, n: int,
+                             reason: str) -> dict[str, Any]:
+    """An unscored arm-outcome cell: the row is always emitted, every metric blank."""
+    return {"arm": arm, "cohort": cohort, "outcome": outcome, "feature": "",
+            "permutation_importance": np.nan, "importance_share": np.nan, "rank": np.nan,
+            "n": int(n), "surrogate_r2": np.nan, "skipped_reason": reason}
+
+
+def _feature_sweep(cfg: SecondaryConfig, X: Any, y: Any, arm: str, name: str,
+                   column: int) -> dict[str, Any]:
+    """Counterfactual sweep of ONE baseline feature across its own deciles, over the surrogate.
+
+    The surrogate is refit once on the whole cell (a partial-dependence sweep describes a fitted
+    response surface, so it is in-sample by construction) and evaluated on a seeded subsample with
+    the swept feature's value column overwritten at each grid point. Only that subsample block is
+    copied, so the sweep never allocates a second full design matrix, and the block is restored and
+    freed before returning.
+    """
+    model = _cate_regressor(cfg.seed)
+    model.fit(X, y)
+    n = int(X.shape[0])
+    rng = np.random.default_rng(int(cfg.seed))
+    index = (np.arange(n) if n <= FEATURE_SWEEP_ROWS
+             else np.sort(rng.choice(n, FEATURE_SWEEP_ROWS, replace=False)))
+    block = X[index]                       # fancy indexing already hands back a private copy
+    values = np.nanpercentile(X[:, column], [100.0 * point for point in FEATURE_SWEEP_GRID])
+    original = block[:, column].copy()
+    forecast = []
+    for value in values:
+        block[:, column] = value
+        forecast.append(float(np.mean(model.predict(block))))
+    block[:, column] = original
+    del model, block
+    return {"arm": arm, "feature": name, "n_swept": int(index.size),
+            "grid": [float(point) for point in FEATURE_SWEEP_GRID],
+            "value": [float(value) for value in values], "forecast": forecast}
+
+
+def _feature_sensitivity(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any],
+                         audit: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Spec 10's feature-sensitivity science read, per reporting arm and outcome.
+
+    For each of the three arms the headline AUROC page reports, regress the STORED MEDIAN FORECAST
+    at ``FEATURE_SENSITIVITY_MONTH`` on the baseline covariates with the DR-learner's own
+    cross-fitted surrogate (``_crossfit_tau``, which returns out-of-fold predictions and per-SOURCE
+    permutation importance in one pass over the folds), then sweep the top numeric feature over the
+    surrogate for the BMI arms. Every held-out row with a finite median counts: the sensitivity of
+    a FORECAST does not depend on that patient's target being observed, so no observed-only filter
+    applies here. Cells too thin to cross-fit are emitted as documented skips, never dropped.
+    Returns (csv_rows, sweeps).
+    """
+    numeric_features = set(CATE_NUMERIC_MODIFIERS) | set(CATE_OPTIONAL_NUMERIC_MODIFIERS)
+    rows: list[dict[str, Any]] = []
+    sweeps: list[dict[str, Any]] = []
+    for arm, cohort, procedure in PROCEDURE_AUROC_ARMS:
+        for outcome in OUTCOMES:
+            frame = frames.get((cohort, outcome))
+            if frame is None or frame.empty:
+                rows.append(_feature_sensitivity_row(
+                    arm, cohort, outcome, 0, f"no held-out {cohort} {outcome} predictions"))
+                continue
+            if procedure and "procedure" not in frame.columns:
+                rows.append(_feature_sensitivity_row(
+                    arm, cohort, outcome, 0, "procedure not populated in this source"))
+                continue
+            select = pd.to_numeric(frame["target_month"], errors="coerce") == FEATURE_SENSITIVITY_MONTH
+            if procedure:
+                select &= frame["procedure"].astype("string").str.lower().eq(procedure).fillna(False)
+            cell = frame.loc[select].drop_duplicates("patient_id")
+            median = _quantile_matrix(cell)[:, 3] if len(cell) else np.zeros(0)
+            keep = np.isfinite(median)
+            cell, median = cell.loc[keep], median[keep]
+            n = int(len(cell))
+            if n < FEATURE_SENSITIVITY_MIN_N:
+                rows.append(_feature_sensitivity_row(
+                    arm, cohort, outcome, n,
+                    # The reason reaches the page-16 ledger and the CSV, so the count it names is
+                    # disclosure-suppressed exactly like the n column beside it.
+                    f"cell has {study.display_count(n)} held-out forecasts, below the "
+                    f"{FEATURE_SENSITIVITY_MIN_N} the cross-fitted surrogate needs"))
+                continue
+            X, groups, _absent = _cate_modifier_design(cell, audit)
+            surrogate, importance = _crossfit_tau(X, median, cell["patient_id"].to_numpy(),
+                                                  cfg.seed, cfg.nuisance_folds, groups)
+            spread = float(np.var(median))
+            r2 = float(1.0 - np.mean((median - surrogate) ** 2) / spread) if spread > 0 else float("nan")
+            positive = np.clip(importance, 0.0, None)
+            total = float(positive.sum())
+            order = sorted(range(len(groups)), key=lambda item: (-float(positive[item]), groups[item][0]))
+            rows.extend({
+                "arm": arm, "cohort": cohort, "outcome": outcome, "feature": groups[position][0],
+                "permutation_importance": float(importance[position]),
+                "importance_share": float(positive[position] / total) if total > 0 else float("nan"),
+                "rank": rank + 1, "n": n, "surrogate_r2": r2, "skipped_reason": "",
+            } for rank, position in enumerate(order))
+            if outcome == "bmi":
+                top = next((position for position in order
+                            if groups[position][0] in numeric_features), None)
+                if top is not None:
+                    sweeps.append(_feature_sweep(cfg, X, median, arm, groups[top][0],
+                                                 groups[top][1][0]))
+            del X, cell, median, surrogate
+            gc.collect()
+    return rows, sweeps
 
 
 def _tier4_cell_events(outcome: str, cell: Any, matrix: Any, enabled: set[str]) -> list[dict[str, Any]]:
@@ -4764,14 +6004,17 @@ _EVENT_LABELS = {
 def _tier4_threshold_probabilities(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any],
                                    audit: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]],
                                                         dict[str, bool]]:
-    """Per (cohort, outcome, target_month, event) threshold-probability metrics on held-out
-    observed rows: IPCW Brier, weighted AUROC, calibration-in-the-large, and the reliability
-    deciles (stored for the page). Returns (csv_rows, reliability_entries, auroc_computable)."""
+    """Per (arm, outcome, target_month, event) threshold-probability metrics on held-out observed
+    rows: IPCW Brier, weighted AUROC, calibration-in-the-large, and the reliability deciles (stored
+    for the page). Keyed by the three reporting arms, not by the two source cohorts, so RYGB and
+    sleeve are reported separately. Returns (csv_rows, reliability_entries, auroc_computable)."""
     enabled, disabled = _tier4_enabled_events(audit)
     rows: list[dict[str, Any]] = []
     reliability: list[dict[str, Any]] = []
     auroc_computable: dict[str, bool] = {}
-    for (cohort, outcome), frame in sorted(frames.items()):
+    arm_outcomes: list[tuple[str, str]] = []
+    for arm, outcome, frame in _reporting_arm_frames(frames):
+        arm_outcomes.append((arm, outcome))
         for target_month, raw_cell in frame.groupby("target_month", sort=True):
             cell = raw_cell.drop_duplicates("patient_id").reset_index(drop=True)
             if cell.empty:
@@ -4795,14 +6038,14 @@ def _tier4_threshold_probabilities(cfg: SecondaryConfig, frames: Mapping[tuple[s
                 if event["kind"] == "binary":
                     brier = float(study.weighted_mean((p - o) ** 2, weight))
                     auroc = _weighted_auroc(o, p, weight)
-                    key = f"{cohort}|{outcome}|{int(target_month)}|{event['event']}"
+                    key = f"{arm}|{outcome}|{int(target_month)}|{event['event']}"
                     auroc_computable[key] = bool(np.isfinite(auroc))
                 else:
                     brier = float("nan")
                     auroc = float("nan")
                 powered = _is_powered(n, ess)
                 rows.append({
-                    "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                    "arm": arm, "outcome": outcome, "target_month": int(target_month),
                     "event": event["event"], "event_label": event["event_label"], "n": n,
                     "ess": ess, "brier": brier, "auroc": auroc,
                     "cal_in_large": float(pred_mean - obs_mean), "pred_mean": pred_mean,
@@ -4816,7 +6059,7 @@ def _tier4_threshold_probabilities(cfg: SecondaryConfig, frames: Mapping[tuple[s
                     points = _reliability_deciles(p, o, weight, bins=decile_bins)
                     if points:
                         reliability.append({
-                            "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                            "arm": arm, "outcome": outcome, "target_month": int(target_month),
                             "event": event["event"], "event_label": event["event_label"], "n": n,
                             "ess": ess, "brier": brier, "auroc": auroc,
                             "cal_in_large": float(pred_mean - obs_mean), "powered": bool(powered),
@@ -4825,11 +6068,11 @@ def _tier4_threshold_probabilities(cfg: SecondaryConfig, frames: Mapping[tuple[s
     # Document disabled events (not-populated covariate) as skipped rows so the CSV is honest.
     for event_key, reason in sorted(disabled.items()):
         target_outcome = _EVENT_OUTCOME[event_key]
-        for (cohort, outcome) in sorted(frames.keys()):
+        for (arm, outcome) in arm_outcomes:
             if outcome != target_outcome:
                 continue
             rows.append({
-                "cohort": cohort, "outcome": outcome, "target_month": np.nan, "event": event_key,
+                "arm": arm, "outcome": outcome, "target_month": np.nan, "event": event_key,
                 "event_label": _EVENT_LABELS[event_key], "n": 0, "ess": np.nan, "brier": np.nan,
                 "auroc": np.nan, "cal_in_large": np.nan, "pred_mean": np.nan, "obs_mean": np.nan,
                 "powered": False, "skipped_reason": reason,
@@ -4840,11 +6083,12 @@ def _tier4_threshold_probabilities(cfg: SecondaryConfig, frames: Mapping[tuple[s
 def _tier4_decision_curves(cfg: SecondaryConfig, frames: Mapping[tuple[str, str], Any],
                            audit: Any) -> list[dict[str, Any]]:
     """Decision-curve net benefit for the binary threshold events across DECISION_PT_GRID, with
-    treat-all and treat-none reference lines, on held-out observed rows (n >= 11 cells only)."""
+    treat-all and treat-none reference lines, on held-out observed rows (n >= 11 cells only).
+    Keyed by the three reporting arms, not by the two source cohorts."""
     enabled, _disabled = _tier4_enabled_events(audit)
     grid = np.asarray(DECISION_PT_GRID, dtype=float)
     rows: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         for target_month, raw_cell in frame.groupby("target_month", sort=True):
             cell = raw_cell.drop_duplicates("patient_id").reset_index(drop=True)
             if cell.empty:
@@ -4876,7 +6120,7 @@ def _tier4_decision_curves(cfg: SecondaryConfig, frames: Mapping[tuple[str, str]
                     false_positive = float(np.sum(weight[treat] * (1.0 - o[treat]))) if bool(np.any(treat)) else 0.0
                     net_benefit = true_positive / total_weight - (false_positive / total_weight) * odds
                     rows.append({
-                        "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                        "arm": arm, "outcome": outcome, "target_month": int(target_month),
                         "event": event["event"], "event_label": event["event_label"],
                         "p_t": float(round(float(p_t), 4)), "n": n, "net_benefit": float(net_benefit),
                         "nb_treat_all": float(prevalence - (1.0 - prevalence) * odds),
@@ -4892,13 +6136,13 @@ def _tier4_predictability_map(cfg: SecondaryConfig, frames: Mapping[tuple[str, s
     flagging strata that are both precise and accurate as reliable."""
     specs = _tier2_axis_specs()
     raw: list[dict[str, Any]] = []
-    for (cohort, outcome), frame in sorted(frames.items()):
+    for arm, outcome, frame in _reporting_arm_frames(frames):
         observed = frame.loc[frame["target_observed"].fillna(False).astype(bool)].copy()
         if observed.empty:
             continue
         for spec in specs:
             axis = spec["axis"]
-            if cohort not in spec["cohorts"]:
+            if arm not in spec["arms"]:
                 continue
             if not all(column in observed.columns for column in spec["columns"]):
                 continue
@@ -4920,7 +6164,7 @@ def _tier4_predictability_map(cfg: SecondaryConfig, frames: Mapping[tuple[str, s
                 metrics = _prognostic_metrics(y, matrix, weight)
                 ess = _effective_sample_size(weight)
                 raw.append({
-                    "cohort": cohort, "outcome": outcome, "target_month": int(target_month),
+                    "arm": arm, "outcome": outcome, "target_month": int(target_month),
                     "axis": axis, "subgroup": str(subgroup), "n": n, "ess": ess,
                     "mean_width_80": float(metrics["width_80"]), "crps": float(metrics["crps"]),
                     "powered": _is_powered(n, ess),
@@ -5065,8 +6309,12 @@ def _draw_reliability(axis: Any, entry: Mapping[str, Any]) -> None:
     auroc = entry.get("auroc")
     brier_text = f"Brier {brier:.3f}" if (brier is not None and np.isfinite(brier)) else "Brier n/a"
     auroc_text = f"AUROC {auroc:.3f}" if (auroc is not None and np.isfinite(auroc)) else "AUROC n/a"
-    axis.text(0.03, 0.97, f"{brier_text} | {auroc_text}\nn={int(entry.get('n', 0))}",
-              transform=axis.transAxes, va="top", ha="left", fontsize=6.2, color=study.PALETTE["ink"])
+    # An arm with no disclosable cell carries no metric annotation at all: the suppression note in
+    # the middle of the frame is the whole read, and an "n=0" corner would misdescribe an arm whose
+    # cells exist but sit under the floor.
+    if entry:
+        axis.text(0.03, 0.97, f"{brier_text} | {auroc_text}\nn={study.display_count(entry.get('n', 0))}",
+                  transform=axis.transAxes, va="top", ha="left", fontsize=6.2, color=study.PALETTE["ink"])
 
 
 @register_page(13)
@@ -5081,21 +6329,21 @@ def _page_threshold_probabilities(cfg: SecondaryConfig, data: Mapping[str, Any],
     table = pd.DataFrame(threshold.get("rows", []))
     if not reliability and table.empty:
         return _tier1_note_page(figure, "Threshold probabilities not estimable in this source")
-    ranked = sorted(reliability,
-                    key=lambda entry: (int(entry.get("n", 0)), bool(entry.get("powered", False))),
-                    reverse=True)
     positions = [[0.065, 0.52, 0.25, 0.29], [0.385, 0.52, 0.25, 0.29], [0.705, 0.52, 0.25, 0.29]]
     letters = ["A", "B", "C"]
-    for index, position in enumerate(positions):
-        axis = figure.add_axes(position)
-        if index < len(ranked):
-            entry = ranked[index]
-            study.panel_label(axis, letters[index],
-                              f"{entry['outcome']} {entry['event_label']} @ {int(entry['target_month'])}mo")
-            _draw_reliability(axis, entry)
-        else:
-            study.panel_label(axis, letters[index], "IPCW reliability")
-            empty_panel(axis, "No further binary event")
+    # One reliability panel per reporting arm: that arm's largest disclosable binary event cell.
+    # ``reliability`` is built in a fixed arm/outcome/horizon/event order, so max() breaks ties on
+    # the first such cell and the panel choice is deterministic.
+    for index, (arm, _cohort, _procedure) in enumerate(PROCEDURE_AUROC_ARMS):
+        axis = figure.add_axes(positions[index])
+        entry = max((item for item in reliability if str(item.get("arm")) == arm),
+                    key=lambda item: (int(item.get("n", 0)), bool(item.get("powered", False))),
+                    default=None)
+        study.panel_label(axis, letters[index], PROCEDURE_ARM_LABELS[arm] + (
+            f", {entry['event_label']} @ {int(entry['target_month'])}mo" if entry else ""))
+        # An arm with no disclosable cell keeps its frame and identity line and carries the
+        # suppression marker, so the gap reads as suppression, not as a missing panel (page 17).
+        _draw_reliability(axis, entry or {})
     ax_table = figure.add_axes([0.065, 0.10, 0.885, 0.32])
     study.panel_label(ax_table, "D", "Threshold-probability metrics (IPCW; n<11 suppressed)")
     if table.empty:
@@ -5103,18 +6351,25 @@ def _page_threshold_probabilities(cfg: SecondaryConfig, data: Mapping[str, Any],
     else:
         scored = table.loc[table.get("skipped_reason", pd.Series("", index=table.index)).astype(str) == ""].copy()
         scored = scored if not scored.empty else table
-        scored = scored.sort_values(["powered", "n"], ascending=[False, False])
-        columns = ["cohort", "outcome", "event", "target_month", "n", "brier", "auroc",
+        # Arm-major, largest cell first, capped at five rows per arm so all three reporting arms
+        # reach the 15-row window instead of the largest arm filling it on its own.
+        order = {arm: index for index, (arm, _cohort, _procedure) in enumerate(PROCEDURE_AUROC_ARMS)}
+        scored = scored.assign(arm_order=scored["arm"].map(order)).sort_values(
+            ["arm_order", "powered", "n"], ascending=[True, False, False])
+        scored = scored.groupby("arm_order", sort=True).head(5)
+        columns = ["arm", "outcome", "event", "target_month", "n", "brier", "auroc",
                    "cal_in_large", "pred_mean", "obs_mean"]
         study.draw_compact_table(
             ax_table, scored.loc[:, columns], columns,
-            labels=["Cohort", "Outcome", "Event", "Target\nmonth", "N", "Brier", "AUROC",
+            labels=["Arm", "Outcome", "Event", "Target\nmonth", "N", "Brier", "AUROC",
                     "Cal-in-\nlarge", "Pred\nmean", "Obs\nmean"], max_rows=15)
     figure.text(0.065, 0.075, textwrap.fill(
         "Per-row P(event) is read off the predictive quantile ladder (monotone piecewise-linear "
         "CDF). Reliability, Brier, and AUROC are IPCW-weighted over held-out observed rows; the "
         "dotted line is perfect calibration. AUROC is shown only where the observed label has both "
-        "classes. Prognostic clinical reframing, not a causal effect.", 185),
+        "classes. Panels A-C are one reporting arm each - incretin, and the shared surgical model "
+        "subset by procedure into RYGB and sleeve - showing that arm's largest disclosable event "
+        "cell. Prognostic clinical reframing, not a causal effect.", 185),
         fontsize=6.8, color=study.PALETTE["muted"], va="top")
     return figure
 
@@ -5149,30 +6404,33 @@ def _page_decision_curves(cfg: SecondaryConfig, data: Mapping[str, Any], number:
     frame = pd.DataFrame(tier4.get("decision", {}).get("rows", []))
     if frame.empty:
         return _tier1_note_page(figure, "Decision curves not estimable in this source")
-    keys = frame[["cohort", "outcome", "target_month", "event", "event_label", "n"]].drop_duplicates()
-    chosen: list[Any] = []
-    for outcome in OUTCOMES:
-        block = keys.loc[keys["outcome"] == outcome]
-        if not block.empty:
-            chosen.append(block.sort_values("n", ascending=False).iloc[0])
-    if not chosen:
-        chosen = [keys.sort_values("n", ascending=False).iloc[0]]
-    positions = [[0.08, 0.30, 0.38, 0.52], [0.57, 0.30, 0.38, 0.52]]
-    letters = ["A", "B"]
-    for index, key in enumerate(chosen[:2]):
+    keys = frame[["arm", "target_month", "event", "event_label", "n"]].drop_duplicates()
+    # Same three-column geometry as page 13, so the two Tier-4 arm pages read as one spread.
+    positions = [[0.065, 0.30, 0.25, 0.52], [0.385, 0.30, 0.25, 0.52], [0.705, 0.30, 0.25, 0.52]]
+    letters = ["A", "B", "C"]
+    # One net-benefit panel per reporting arm: that arm's largest decision-curve cell. The sort
+    # keys after n are the rest of the cell key, so a tie on n resolves deterministically.
+    for index, (arm, _cohort, _procedure) in enumerate(PROCEDURE_AUROC_ARMS):
         axis = figure.add_axes(positions[index])
-        study.panel_label(axis, letters[index],
-                          f"{key['outcome']} {key['event_label']} @ {int(key['target_month'])}mo")
-        sub = frame.loc[(frame["cohort"] == key["cohort"]) & (frame["outcome"] == key["outcome"])
-                        & (frame["target_month"] == key["target_month"]) & (frame["event"] == key["event"])]
+        block = keys.loc[keys["arm"] == arm].sort_values(["n", "event", "target_month"],
+                                                         ascending=[False, True, True])
+        study.panel_label(axis, letters[index], PROCEDURE_ARM_LABELS[arm] + (
+            f", {block.iloc[0]['event_label']} @ {int(block.iloc[0]['target_month'])}mo"
+            if not block.empty else ""))
+        if block.empty:
+            empty_panel(axis, "No cell clears n >= 11")
+            continue
+        key = block.iloc[0]
+        sub = frame.loc[(frame["arm"] == arm) & (frame["target_month"] == key["target_month"])
+                        & (frame["event"] == key["event"])]
         _draw_decision_curve(axis, sub)
-    if len(chosen) < 2:
-        empty_panel(figure.add_axes(positions[1]), "Single outcome estimable")
-    figure.text(0.08, 0.22, textwrap.fill(
+    figure.text(0.065, 0.22, textwrap.fill(
         "Net benefit NB(p_t) = TP/n - (FP/n) * p_t/(1-p_t) with IPCW-weighted counts. The model "
         "curve is clinically useful over the range of threshold probabilities p_t where it sits "
-        "above BOTH the treat-all (dashed) and treat-none (solid grey) reference lines. This is a "
-        "prognostic clinical-utility reframing of the forecasts, not a causal effect.", 158),
+        "above BOTH the treat-all (dashed) and treat-none (solid grey) reference lines. One panel "
+        "per reporting arm - incretin, and the shared surgical model subset by procedure into RYGB "
+        "and sleeve - each showing that arm's largest disclosable event cell (n >= 11). This is a "
+        "prognostic clinical-utility reframing of the forecasts, not a causal effect.", 185),
         fontsize=6.8, color=study.PALETTE["muted"], va="top")
     return figure
 
@@ -5222,11 +6480,11 @@ def _page_predictability_and_glp1(cfg: SecondaryConfig, data: Mapping[str, Any],
     if predictability.empty:
         empty_panel(ax_map, "No disclosable subgroup strata")
     else:
-        columns = ["outcome", "axis", "subgroup", "target_month", "n", "mean_width_80", "crps",
-                   "reliable_flag"]
+        columns = ["arm", "outcome", "axis", "subgroup", "target_month", "n", "mean_width_80",
+                   "crps", "reliable_flag"]
         study.draw_compact_table(
             ax_map, predictability.loc[:, columns], columns,
-            labels=["Outcome", "Axis", "Subgroup", "Target\nmonth", "N", "Width\n80", "CRPS",
+            labels=["Arm", "Outcome", "Axis", "Subgroup", "Target\nmonth", "N", "Width\n80", "CRPS",
                     "Reliable"], max_rows=20)
 
     ax_traj = figure.add_axes([0.57, 0.54, 0.385, 0.28])
@@ -5257,6 +6515,464 @@ def _page_predictability_and_glp1(cfg: SecondaryConfig, data: Mapping[str, Any],
         "(BMI and HbA1c are never pooled). Reliable = at or below the within-outcome median on BOTH "
         "precision and accuracy. Audits predictability, not effect modification.", 118),
         fontsize=6.2, color=study.PALETTE["muted"], va="top")
+    return figure
+
+
+# ----- Page 17: headline per-procedure AUROC (spec 7.2) ------------------------------------
+def _narrow_panel_label(axis: Any, letter: str, title: str) -> None:
+    """The book's panel label, with the title nudged clear of the hanging letter.
+
+    study.panel_label offsets the letter by a fraction of the AXES width; on a narrow panel (the
+    per-procedure ROC grid, the CATE summary and honesty panels) that offset is smaller than the
+    glyph, so the title would start underneath it. The letter keeps the shared styling and only
+    the title's x is restated.
+    """
+    study.panel_label(axis, letter, "")
+    axis.set_title(title, loc="left", x=0.11, pad=8, fontweight="bold", color=study.PALETTE["ink"])
+
+
+def _draw_procedure_roc(axis: Any, curve: Mapping[str, Any] | None, row: Mapping[str, Any]) -> None:
+    """One IPCW-weighted ROC panel: chance diagonal, the AUROC with its bootstrap interval inside
+    the axes, and a small right-aligned context label. A suppressed cell keeps its frame and
+    diagonal and carries a visible marker instead of a curve, so the gap is legible as suppression
+    rather than as a missing panel; its n is rendered through the disclosure formatter."""
+    axis.plot([0.0, 1.0], [0.0, 1.0], color=study.PALETTE["grid"], lw=0.9, ls=":")
+    axis.set_xlim(-0.02, 1.02)
+    axis.set_ylim(-0.03, 1.07)  # headroom so a perfect ROC reads as a curve, not as the top spine
+    axis.set_xticks([0.0, 0.5, 1.0])
+    axis.set_yticks([0.0, 0.5, 1.0])
+    axis.tick_params(labelsize=7.0)
+    tpr = list(curve.get("tpr", [])) if curve else []
+    if tpr:
+        axis.plot(ROC_FPR_GRID, tpr, color=study.PALETTE["blue"], lw=1.4)
+    else:
+        axis.text(0.5, 0.55, "Suppressed (n < 11)" if bool(row.get("suppressed")) else "Not estimable",
+                  transform=axis.transAxes, ha="center", va="center", fontsize=7.0,
+                  color=study.PALETTE["muted"])
+    auroc = row.get("auroc")
+    if auroc is not None and np.isfinite(auroc):
+        low, high = row.get("auroc_ci_low"), row.get("auroc_ci_high")
+        interval = (f" ({low:.3f} to {high:.3f})" if low is not None and high is not None
+                    and np.isfinite(low) and np.isfinite(high) else "")
+        axis.text(0.97, 0.10, f"AUROC {auroc:.3f}{interval}", transform=axis.transAxes,
+                  ha="right", va="bottom", fontsize=7.0, color=study.PALETTE["ink"])
+    rate = row.get("event_rate")
+    context = f"n = {study.display_count(int(row.get('n') or 0))}"
+    if rate is not None and np.isfinite(rate) and not bool(row.get("suppressed")):
+        context += f" | events {rate:.0%}"
+    axis.text(0.97, 0.03, context, transform=axis.transAxes, ha="right", va="bottom",
+              fontsize=6.5, color=study.PALETTE["muted"])
+
+
+@register_page(17)
+def _page_per_procedure_auroc(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
+                              title: str, subtitle: str) -> Any:
+    figure = secondary_new_page(number, title, subtitle)
+    tier4 = _tier4_payload(data)
+    if tier4 is None:
+        return _tier1_note_page(figure, PENDING_NOTE)
+    payload = tier4.get("procedure_auroc", {})
+    table = pd.DataFrame(payload.get("rows", []))
+    if table.empty:
+        return _tier1_note_page(figure, "Per-procedure discrimination not estimable in this source")
+    cells = {(str(row["arm"]), int(row["target_month"])): row for row in payload.get("rows", [])}
+    curves = {(str(item["arm"]), int(item["target_month"])): item for item in payload.get("curves", [])}
+    # ROC grid left, metric table right. The panels are square in PHYSICAL size (the page is
+    # 11 x 8.5 in, so 11 * width = 8.5 * height) to keep the chance diagonal at a true 45 degrees.
+    # Beside the table the grid is width-bound rather than height-bound, so the square is the
+    # widest one that still leaves the right margin a legible six-column table; columns are
+    # gutter-spaced at 28% of a panel.
+    panel_w = 0.1559
+    panel_h = round(panel_w * 11.0 / 8.5, 4)
+    gutter = round(0.28 * panel_w, 4)
+    columns_x = tuple(round(0.115 + index * (panel_w + gutter), 4) for index in range(3))
+    rows_y = tuple(round(0.847 - panel_h - index * (panel_h + 0.038), 4) for index in range(3))
+    letters = "ABCDEFGHI"
+    for row_index, month in enumerate(PROCEDURE_AUROC_MONTHS):
+        for column_index, (arm, _cohort, _procedure) in enumerate(PROCEDURE_AUROC_ARMS):
+            axis = figure.add_axes([columns_x[column_index], rows_y[row_index], panel_w, panel_h])
+            _narrow_panel_label(axis, letters[row_index * len(PROCEDURE_AUROC_ARMS) + column_index],
+                                   f"{PROCEDURE_ARM_LABELS[arm]}, {month} months")
+            _draw_procedure_roc(axis, curves.get((arm, month)), cells.get((arm, month), {}))
+            if row_index == len(PROCEDURE_AUROC_MONTHS) - 1:
+                axis.set_xlabel("False positive rate", fontsize=8.0)
+            else:  # shared axis: only the bottom row is annotated, so the rows can sit closer
+                axis.set_xticklabels([])
+                axis.tick_params(axis="x", length=0)
+            if column_index == 0:
+                axis.set_ylabel("True positive rate", fontsize=8.0)
+            else:
+                axis.set_yticklabels([])
+    ax_table = figure.add_axes([0.700, 0.377, 0.245, 0.470])
+    study.panel_label(ax_table, "J", "Per-arm metrics by horizon")
+    # The six columns spec 7.2 names. ess / powered / the CI bounds stay in per_procedure_auroc.csv;
+    # the CI is annotated in every panel and suppression still reads as "<11" in N.
+    columns = ["arm", "target_month", "n", "auroc", "brier", "cal_in_large"]
+    ordered = table.sort_values(["arm", "target_month"]).loc[:, columns].copy()
+    ordered["arm"] = ordered["arm"].map(lambda value: PROCEDURE_ARM_LABELS.get(str(value), str(value)))
+    study.draw_compact_table(
+        ax_table, ordered, columns,
+        # "Mo" not "Target month": draw_compact_table gives target_month a narrow fixed share and
+        # clips overflow, and renaming the column to win a wider share would cost the structural
+        # label its small-cell protection. The panel J title names the horizon.
+        labels=["Arm", "Mo", "N", "AUROC", "Brier", "Cal-in-\nlarge"],
+        max_rows=len(PROCEDURE_AUROC_ARMS) * len(PROCEDURE_AUROC_MONTHS))
+    figure.text(0.700, 0.347, textwrap.fill(
+        "P(BMI < 35) is read off the calibrated predictive quantile ladder. AUROC, Brier, and "
+        "calibration-in-the-large (mean predicted minus mean observed) are IPCW-weighted over "
+        "held-out observed rows; the interval in each panel is a patient-clustered percentile "
+        "bootstrap. The two surgical arms subset one shared model by procedure, so RYGB and sleeve "
+        "are separately calibrated but not separately fitted. Prognostic discrimination, not a "
+        "causal effect.", 62),
+        fontsize=6.5, color=study.PALETTE["muted"], va="top")
+    return figure
+
+
+def _cate_payload(data: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The CATE block the TTE stage attached to its checkpoint (empty when the stage never ran)."""
+    return (data.get("tte") or {}).get("cate") or {}
+
+
+def _draw_toc_curve(axis: Any, cate: Mapping[str, Any]) -> None:
+    """The primary CATE validation figure: TOC with its patient-clustered bootstrap band, RATE."""
+    grid = np.asarray(cate.get("toc_grid") or [], dtype=float)
+    toc = np.asarray(cate.get("toc") or [], dtype=float)
+    if grid.size == 0 or toc.size != grid.size:
+        empty_panel(axis, "TOC not estimable")
+        return
+    low = np.asarray(cate.get("toc_ci_low") or [], dtype=float)
+    high = np.asarray(cate.get("toc_ci_high") or [], dtype=float)
+    if low.size == grid.size and high.size == grid.size:
+        axis.fill_between(grid, low, high, color=study.PALETTE["blue"], alpha=0.16, lw=0,
+                          label="95% patient-clustered bootstrap")
+    axis.axhline(0.0, color=study.PALETTE["muted"], lw=0.8, ls=":")
+    axis.plot(grid, toc, color=study.PALETTE["blue"], lw=1.6, label="TOC")
+    axis.set_xlabel("Fraction treated, highest predicted benefit first", fontsize=8)
+    axis.set_ylabel("Benefit above population mean (BMI)", fontsize=8)
+    axis.legend(fontsize=6.3, loc="upper right", frameon=False)
+    rate, low_rate, high_rate = cate.get("rate"), cate.get("rate_ci_low"), cate.get("rate_ci_high")
+    if rate is not None and np.isfinite(rate):
+        interval = (f" ({low_rate:.3f} to {high_rate:.3f})"
+                    if low_rate is not None and high_rate is not None
+                    and np.isfinite(low_rate) and np.isfinite(high_rate) else "")
+        axis.text(0.03, 0.05, f"RATE {rate:.3f}{interval} BMI units", transform=axis.transAxes,
+                  ha="left", va="bottom", fontsize=7.2, color=study.PALETTE["ink"])
+
+
+def _draw_benefit_calibration(axis: Any, cate: Mapping[str, Any]) -> None:
+    """Predicted-benefit decile against the AIPW effect actually observed in that decile.
+
+    Both axes are BMI benefit units, so the identity line is the calibration target; deciles below
+    the disclosure floor are dropped rather than plotted.
+    """
+    rows = [row for row in (cate.get("calibration") or [])
+            if int(row.get("n") or 0) >= MIN_CELL_SIZE
+            and np.isfinite(row.get("aipw_benefit", np.nan))]
+    if len(rows) < 2:
+        empty_panel(axis, "Benefit calibration not estimable")
+        return
+    predicted = np.asarray([row["mean_predicted_benefit"] for row in rows], dtype=float)
+    observed = np.asarray([row["aipw_benefit"] for row in rows], dtype=float)
+    low = np.asarray([row["ci_low"] for row in rows], dtype=float)
+    high = np.asarray([row["ci_high"] for row in rows], dtype=float)
+    error = np.vstack([np.nan_to_num(observed - low), np.nan_to_num(high - observed)])
+    axis.errorbar(predicted, observed, yerr=np.clip(error, 0.0, None), fmt="o", ms=4.5, lw=0.0,
+                  elinewidth=0.9, capsize=2, color=study.PALETTE["blue"],
+                  ecolor=study.PALETTE["grid"], zorder=3)
+    span = [float(np.nanmin([predicted.min(), low.min()])), float(np.nanmax([predicted.max(), high.max()]))]
+    axis.plot(span, span, color=study.PALETTE["muted"], lw=0.8, ls=":", zorder=1)
+    axis.set_xlabel("Predicted benefit, decile mean (BMI)", fontsize=8)
+    axis.set_ylabel("Observed AIPW benefit (BMI)", fontsize=8)
+    rho, monotone = cate.get("calibration_rho"), cate.get("monotone_fraction")
+    read = f"{len(rows)} of {CATE_DECILES} deciles estimable"
+    if rho is not None and np.isfinite(rho):
+        read += f"\nrank correlation {rho:+.2f}"
+    if monotone is not None and np.isfinite(monotone):
+        read += f"\n{monotone:.0%} of steps increase"
+    # Inside the axes at lower right: the panel title already owns the space above the frame, and
+    # the deciles run bottom-left to top-right, so this corner is the one that is always clear.
+    axis.text(0.97, 0.04, read, transform=axis.transAxes, ha="right", va="bottom", fontsize=6.6,
+              linespacing=1.4, color=study.PALETTE["muted"])
+
+
+def _cate_summary_lines(cate: Mapping[str, Any]) -> list[tuple[str, str]]:
+    """The c-for-benefit and policy-value read, in the order the summary panel prints it."""
+    policy, treat_all = cate.get("policy_value"), cate.get("treat_all_value")
+    gain = (policy - treat_all if policy is not None and treat_all is not None
+            and np.isfinite(policy) and np.isfinite(treat_all) else float("nan"))
+    return [
+        ("Patients scored", study.display_count(int(cate.get("n") or 0))),
+        ("c-for-benefit", _cate_number(cate.get("c_for_benefit"), 3)),
+        ("Matched pairs", study.display_count(int(cate.get("n_pairs") or 0))),
+        ("Treat-all value", _cate_number(treat_all, 3)),
+        ("Treat-none value", "0.000"),
+        ("Policy value", _cate_number(policy, 3)),
+        ("Policy gain vs treat-all", _cate_number(gain, 3)),
+        ("Fraction sent to RYGB", _cate_number(cate.get("treated_fraction"), 2)),
+    ]
+
+
+def _cate_number(value: Any, digits: int) -> str:
+    return f"{float(value):.{digits}f}" if value is not None and np.isfinite(value) else "not estimable"
+
+
+def _draw_summary_column(axis: Any, letter: str, title: str, lines: Sequence[tuple[str, str]],
+                         footnote: str) -> None:
+    """A label/value readout column: muted labels left, bold values right, footnote at the foot."""
+    _narrow_panel_label(axis, letter, title)
+    axis.axis("off")
+    for position, (label, value) in enumerate(lines):
+        y = 0.96 - 0.105 * position   # eight rows, ending clear of the two-line unit note below
+        axis.text(0.0, y, label, fontsize=7.0, color=study.PALETTE["muted"], va="top",
+                  transform=axis.transAxes)
+        axis.text(1.0, y, value, fontsize=7.6, fontweight="bold", color=study.PALETTE["ink"],
+                  ha="right", va="top", transform=axis.transAxes)
+    axis.text(0.0, 0.0, footnote, fontsize=6.2, color=study.PALETTE["muted"], va="bottom",
+              transform=axis.transAxes)
+
+
+def _draw_cate_summary(axis: Any, cate: Mapping[str, Any]) -> None:
+    """Policy value of treating the predicted benefiters, against treat-all and treat-none."""
+    _draw_summary_column(axis, "D", "Concordance and policy", _cate_summary_lines(cate),
+                         "Values are mean BMI reduction per patient in the\npopulation, from the "
+                         "same pseudo-outcomes.")
+
+
+def _cate_honesty_panel(axis: Any, letter: str, cate: Mapping[str, Any], width: int,
+                        caveat: str = CATE_CAVEAT, structural: str = "surgeon_or_center_id",
+                        tail: str = CAUSAL_FOREST_NOTE) -> None:
+    """The spec 8.3 honesty gate, carried on the page: what this map is not, which modifiers were
+    unavailable, and why the optional causal-forest cross-check is absent. The which-incretin read
+    on page 07 reuses it with its own caveat, its own structural residual, and no forest note."""
+    # This panel is narrow beside the summary and full width in the not-estimable layout, and only
+    # the narrow one needs its title nudged clear of the hanging letter.
+    (_narrow_panel_label if axis.get_position().width < 0.30 else study.panel_label)(
+        axis, letter, "Honesty gate")
+    axis.axis("off")
+    # The same naming M5 uses for L: whatever the audit refused, then the structural identifier
+    # this source never carries. Each is omitted from X rather than encoded as an empty column.
+    absent = list(cate.get("absent_modifiers") or []) + [structural]
+    named = ("Unmeasured or unpopulated here, so absent from X and able to masquerade as effect "
+             "modification: " + ", ".join(absent) + ".")
+    body = " ".join(part for part in (caveat, named, tail) if part)
+    axis.text(0.0, 0.99, textwrap.fill(body, width),
+              va="top", ha="left", fontsize=6.6, linespacing=1.32, color=study.PALETTE["ink"],
+              transform=axis.transAxes)
+
+
+@register_page(18)
+def _page_cate_heterogeneous_benefit(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
+                                     title: str, subtitle: str) -> Any:
+    """Spec 8.3: RATE / TOC with inference, benefit calibration against the observed AIPW effect,
+    the permutation-importance modifier ranking, c-for-benefit and policy value, under the
+    heterogeneity-map honesty gate. A cell without propensity overlap renders the graceful
+    not-estimable state the TTE pages use, never a curve fitted through a degenerate ratio."""
+    figure = secondary_new_page(number, title, subtitle)
+    cate = _cate_payload(data)
+    if str(cate.get("status")) != "done":
+        axis = figure.add_axes([0.075, 0.42, 0.87, 0.42])
+        empty_panel(axis, textwrap.fill(
+            f"CATE not estimable: {cate['skipped_reason']}" if cate.get("skipped_reason")
+            else "CATE not populated in this source", 78))
+        _cate_honesty_panel(figure.add_axes([0.075, 0.11, 0.87, 0.22]), "A", cate, 178)
+        return figure
+
+    ax_toc = figure.add_axes([0.075, 0.505, 0.375, 0.325])
+    study.panel_label(ax_toc, "A", "RATE / TOC: do the top-ranked really benefit more")
+    _draw_toc_curve(ax_toc, cate)
+    ax_cal = figure.add_axes([0.565, 0.505, 0.375, 0.325])
+    study.panel_label(ax_cal, "B", "Benefit calibration by predicted-benefit decile")
+    _draw_benefit_calibration(ax_cal, cate)
+
+    ax_modifiers = figure.add_axes([0.075, 0.115, 0.300, 0.295])
+    study.panel_label(ax_modifiers, "C", "Modifiers driving tau_hat")
+    _draw_modifier_importance(ax_modifiers, cate.get("importance"), 8)
+    _draw_cate_summary(figure.add_axes([0.430, 0.115, 0.190, 0.295]), cate)
+    _cate_honesty_panel(figure.add_axes([0.700, 0.115, 0.245, 0.295]), "E", cate, 56)
+    figure.text(0.075, 0.086, textwrap.fill(
+        "DR-learner: the doubly-robust pseudo-outcome built from the target trial's own "
+        f"cross-fitted propensity, censoring, and outcome nuisances for the {cate.get('outcome')} "
+        f"{int(cate.get('target_month') or 0)}-month cell, regressed on the measured modifiers with "
+        "a cross-fitted gradient-boosted model over the same patient folds. Benefit is stated as "
+        "BMI reduction from RYGB rather than sleeve, so a positive number favors RYGB.", 178),
+        fontsize=6.5, color=study.PALETTE["muted"], va="top")
+    return figure
+
+
+ARM_COLORS = (study.PALETTE["blue"], study.PALETTE["sky"], study.PALETTE["green"])
+
+
+def _draw_sensitivity_bars(axis: Any, rows: Sequence[Mapping[str, Any]], outcome: str) -> None:
+    """Top source features by surrogate permutation-importance share, one bar group per arm.
+
+    Features are ranked by their share POOLED over the arms so all three read the same rows, and
+    an arm that never scored a feature shows an absent bar rather than a fabricated zero rank.
+    """
+    scored = [row for row in rows if str(row.get("outcome")) == outcome
+              and str(row.get("feature")) and np.isfinite(row.get("importance_share", np.nan))]
+    if not scored:
+        empty_panel(axis, "Surrogate not estimable")
+        return
+    pooled: dict[str, float] = {}
+    for row in scored:
+        pooled[str(row["feature"])] = pooled.get(str(row["feature"]), 0.0) + float(row["importance_share"])
+    features = [name for name, _share in
+                sorted(pooled.items(), key=lambda item: (-item[1], item[0]))][:FEATURE_SENSITIVITY_TOP_N]
+    share = {(str(row["arm"]), str(row["feature"])): float(row["importance_share"]) for row in scored}
+    # Only arms this outcome actually scored get a bar series: an arm whose cell fell below the
+    # surrogate floor is absent from the panel, never drawn as a row of honest-looking zeros.
+    arms = [(position, arm) for position, (arm, _cohort, _procedure) in enumerate(PROCEDURE_AUROC_ARMS)
+            if any(key[0] == arm for key in share)]
+    y = np.arange(len(features))[::-1].astype(float)
+    height = 0.78 / len(arms)
+    for offset, (position, arm) in enumerate(arms):
+        axis.barh(y + (offset - (len(arms) - 1) / 2.0) * height,
+                  [share.get((arm, name), np.nan) for name in features], height=height,
+                  color=ARM_COLORS[position], alpha=0.9, label=PROCEDURE_ARM_LABELS[arm])
+    axis.set_yticks(y)
+    axis.set_yticklabels([_feature_label(name) for name in features], fontsize=6.8)
+    axis.set_xlabel("Share of surrogate permutation importance", fontsize=8)
+    axis.legend(fontsize=6.3, loc="lower right", frameon=False)
+
+
+def _draw_sensitivity_sweep(axis: Any, sweeps: Sequence[Mapping[str, Any]]) -> None:
+    """Counterfactual sweep: the mean surrogate-predicted BMI as each arm's most influential
+    baseline feature is moved across its own deciles, every other covariate held as observed.
+
+    The arms swing different features over different units, so the shared x axis is the swept
+    feature's own percentile and the legend names the feature each line belongs to.
+    """
+    arms = {arm: position for position, (arm, _cohort, _procedure) in enumerate(PROCEDURE_AUROC_ARMS)}
+    drawn = 0
+    for item in sorted(sweeps, key=lambda entry: arms.get(str(entry.get("arm")), 99)):
+        grid = np.asarray(item.get("grid") or [], dtype=float)
+        forecast = np.asarray(item.get("forecast") or [], dtype=float)
+        arm = str(item.get("arm"))
+        if grid.size == 0 or forecast.size != grid.size or arm not in arms:
+            continue
+        axis.plot(grid, forecast, marker="o", ms=3.2, lw=1.5, color=ARM_COLORS[arms[arm]],
+                  label=f"{PROCEDURE_ARM_LABELS[arm]}: {_feature_label(str(item.get('feature')))}")
+        drawn += 1
+    if not drawn:
+        empty_panel(axis, "Counterfactual sweep not estimable")
+        return
+    axis.set_xlabel("Percentile of the swept baseline feature", fontsize=8)
+    axis.set_ylabel(f"Mean predicted BMI at {FEATURE_SENSITIVITY_MONTH} mo", fontsize=8)
+    axis.legend(fontsize=6.3, loc="best", frameon=False)
+
+
+def _sensitivity_top_rows(rows: Sequence[Mapping[str, Any]]) -> Any:
+    """One row per (arm, outcome): its top-ranked feature, or a visible not-estimable marker.
+
+    The full reason a cell was not scored stays in forecast_feature_sensitivity.csv and in the
+    page-16 omissions ledger; truncating it into a table cell would render it unreadable, so the
+    table says only that the cell is not estimable and points at the sources that say why.
+    """
+    best: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for row in rows:
+        if str(row.get("skipped_reason")) or int(row.get("rank") or 0) == 1:
+            best[(str(row.get("arm")), str(row.get("outcome")))] = row
+    ordered = []
+    for arm, _cohort, _procedure in PROCEDURE_AUROC_ARMS:
+        for outcome in OUTCOMES:
+            row = best.get((arm, outcome))
+            if row is None:
+                continue
+            ordered.append({
+                "arm": PROCEDURE_ARM_LABELS.get(arm, arm), "outcome": outcome,
+                "n": int(row.get("n") or 0), "surrogate_r2": row.get("surrogate_r2"),
+                "feature": _feature_label(str(row.get("feature"))) if row.get("feature") else "not estimable",
+                "importance_share": row.get("importance_share"),
+            })
+    return pd.DataFrame(ordered)
+
+
+@register_page(19)
+def _page_feature_sensitivity(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
+                              title: str, subtitle: str) -> Any:
+    """Spec 10's feature-sensitivity science page. The frozen store has no trained model to
+    re-run, so sensitivity is read off a cross-fitted surrogate of the stored median forecast:
+    permutation importance per source feature (A, B) and a counterfactual sweep of the top feature
+    over that surrogate (C), with the surrogate's own out-of-fold fidelity beside every read (D)."""
+    figure = secondary_new_page(number, title, subtitle)
+    tier4 = _tier4_payload(data)
+    if tier4 is None:
+        return _tier1_note_page(figure, PENDING_NOTE)
+    payload = tier4.get("feature_sensitivity", {})
+    rows = list(payload.get("rows", []))
+    if not rows:
+        return _tier1_note_page(figure, "Forecast feature sensitivity not estimable in this source")
+    month = int(payload.get("target_month") or FEATURE_SENSITIVITY_MONTH)
+    ax_bmi = figure.add_axes([0.115, 0.500, 0.340, 0.295])
+    study.panel_label(ax_bmi, "A", f"BMI forecast at {month} months")
+    _draw_sensitivity_bars(ax_bmi, rows, "bmi")
+    ax_hba1c = figure.add_axes([0.605, 0.500, 0.340, 0.295])
+    study.panel_label(ax_hba1c, "B", f"HbA1c forecast at {month} months")
+    _draw_sensitivity_bars(ax_hba1c, rows, "hba1c")
+
+    ax_sweep = figure.add_axes([0.115, 0.165, 0.335, 0.245])
+    study.panel_label(ax_sweep, "C", "Counterfactual sweep of the top feature")
+    _draw_sensitivity_sweep(ax_sweep, list(payload.get("sweeps", [])))
+    ax_table = figure.add_axes([0.530, 0.165, 0.415, 0.245])
+    study.panel_label(ax_table, "D", "Top feature and surrogate fidelity by arm")
+    columns = ["arm", "outcome", "n", "feature", "importance_share", "surrogate_r2"]
+    study.draw_compact_table(
+        ax_table, _sensitivity_top_rows(rows), columns,
+        labels=["Arm", "Outcome", "N", "Top feature", "Share", "Surrogate\nR2"], max_rows=6)
+    # One line taller than the note it replaced, so it starts one line higher and keeps the same
+    # clearance above the page footer.
+    figure.text(0.075, 0.108, textwrap.fill(FEATURE_SENSITIVITY_NOTE + " " + FEATURE_SWEEP_NOTE, 188),
+                fontsize=6.5, color=study.PALETTE["muted"], va="top")
+    return figure
+
+
+# ----- Page 20: per-arm calibration and accuracy (spec 7.1) --------------------------------
+# Single-line headers: a full-height 22-row table gives the header row the same height as a data
+# row, which is too short for the book's usual two-line column labels.
+PER_ARM_TABLE_COLUMNS = ("arm", "target_month", "n", "ess", "crps", "rmse", "mae", "bias",
+                         "coverage_80", "coverage_90", "width_80", "cal_slope")
+PER_ARM_TABLE_LABELS = ["Arm", "Mo", "N", "ESS", "CRPS", "RMSE", "MAE", "Bias", "80% cov.",
+                        "90% cov.", "80% width", "Cal. slope"]
+
+
+def _draw_per_arm_table(axis: Any, frame: Any, outcome: str) -> None:
+    """The full per-arm metric set for one outcome, arm-major and horizon-ordered. n < 11 cells
+    keep their row: draw_compact_table renders the count as "<11" and blanks that row's metrics."""
+    sub = frame.loc[frame["outcome"].astype(str) == outcome].copy()
+    if sub.empty:
+        empty_panel(axis, "Not estimable")
+        return
+    sub["arm_order"] = sub["arm"].map({arm: index for index, (arm, _cohort, _procedure)
+                                       in enumerate(PROCEDURE_AUROC_ARMS)})
+    sub = sub.sort_values(["arm_order", "target_month"])
+    sub["arm"] = sub["arm"].map(lambda value: PROCEDURE_ARM_LABELS.get(str(value), str(value)))
+    study.draw_compact_table(axis, sub.loc[:, list(PER_ARM_TABLE_COLUMNS)],
+                             list(PER_ARM_TABLE_COLUMNS), labels=PER_ARM_TABLE_LABELS,
+                             max_rows=len(PROCEDURE_AUROC_ARMS) * len(study.TARGET_MONTHS[outcome]))
+
+
+@register_page(20)
+def _page_per_arm_calibration(cfg: SecondaryConfig, data: Mapping[str, Any], number: int,
+                              title: str, subtitle: str) -> Any:
+    """Spec 7.1's per-arm calibration and accuracy table: the complete prognostic metric set for
+    each of the three reporting arms at every declared horizon, one table per outcome. The pooled
+    two-cohort read is deliberately not shown - RYGB and sleeve share one fitted model but are
+    separately calibrated, and pooling them hides exactly that."""
+    figure = secondary_new_page(number, title, subtitle)
+    tier4 = _tier4_payload(data)
+    if tier4 is None:
+        return _tier1_note_page(figure, PENDING_NOTE)
+    frame = pd.DataFrame(tier4.get("per_arm_prognostic", {}).get("rows", []))
+    if frame.empty:
+        return _tier1_note_page(figure, "Per-arm calibration not estimable in this source")
+    ax_bmi = figure.add_axes([0.045, 0.450, 0.915, 0.390])
+    study.panel_label(ax_bmi, "A", "BMI: calibration and accuracy by arm and horizon")
+    _draw_per_arm_table(ax_bmi, frame, "bmi")
+    ax_hba1c = figure.add_axes([0.045, 0.135, 0.915, 0.275])
+    study.panel_label(ax_hba1c, "B", "HbA1c: calibration and accuracy by arm and horizon")
+    _draw_per_arm_table(ax_hba1c, frame, "hba1c")
+    figure.text(0.045, 0.108, textwrap.fill(PER_ARM_PROGNOSTIC_NOTE, 188),
+                fontsize=6.5, color=study.PALETTE["muted"], va="top")
     return figure
 
 
@@ -5362,6 +7078,26 @@ def _collect_figure_data(cfg: SecondaryConfig) -> dict[str, Any]:
 # --------------------------------------------------------------------------------------------
 # Manifest and results bundle
 # --------------------------------------------------------------------------------------------
+def _stage_peak_rss(cfg: SecondaryConfig) -> dict[str, float]:
+    """Per-stage peak RSS for the manifest, read back from each stage's checkpoint metadata.
+
+    Section 11 wants the probe in the manifest so a memory regression is visible in the returned
+    artifacts rather than only in a console log nobody kept. Every stage already wrote its own
+    peak beside its checkpoint, from inside its own process, so this holds whether the run was
+    orchestrated or in-process. ``render`` is measured live: it is the stage writing this file,
+    and by now it has done the whole figure book, which is its expensive part.
+    """
+    peaks: dict[str, float] = {}
+    for stage in STAGE_SEQUENCE:
+        value = (study.read_json(cfg.checkpoints_dir / f"{stage}.json", {}) or {}).get("peak_rss_gb")
+        if value is not None:
+            peaks[stage] = float(value)
+    live = _peak_rss_gb()
+    if live is not None:
+        peaks["render"] = live
+    return peaks
+
+
 def write_manifest(cfg: SecondaryConfig, data: Mapping[str, Any]) -> None:
     assemble = data.get("assemble", {})
     audit = assemble.get("audit")
@@ -5376,6 +7112,7 @@ def write_manifest(cfg: SecondaryConfig, data: Mapping[str, Any]) -> None:
     # positivity outcomes, the powered-vs-all robustness verdicts, and which axes were usable or
     # skipped. Plus the aggregated omissions ledger (M6 stores an omissions list; surface it here).
     tte_summary = _tte_summary(data)
+    cate = _cate_payload(data)
     tier1 = data.get("tier1") or {}
     tier2 = data.get("tier2") or {}
     tier3 = data.get("tier3") or {}
@@ -5392,9 +7129,17 @@ def write_manifest(cfg: SecondaryConfig, data: Mapping[str, Any]) -> None:
             "e_value_low": _json_float(tte_summary["e_value_low"]),
             "e_value_high": _json_float(tte_summary["e_value_high"]),
             "outcome_model": tte_summary["outcome_model"],
+            "confounders": (data.get("tte") or {}).get("confounders") or {},
+            "absent_confounders": _tte_absent_confounders(data),
+        },
+        "cate": {
+            "status": str(cate.get("status", "absent")), "n": cate.get("n"),
+            "rate": _json_float(cate.get("rate", float("nan"))),
+            "absent_modifiers": list(cate.get("absent_modifiers") or []),
+            "skipped_reason": str(cate.get("skipped_reason", "")),
         },
         "robustness_verdicts": [
-            {"cohort": row.get("cohort"), "outcome": row.get("outcome"), "verdict": row.get("verdict")}
+            {"arm": row.get("arm"), "outcome": row.get("outcome"), "verdict": row.get("verdict")}
             for row in tier3.get("powered_only", [])
         ],
         "robustness_verdict_summary": _verdict_summary(verdicts),
@@ -5432,6 +7177,7 @@ def write_manifest(cfg: SecondaryConfig, data: Mapping[str, Any]) -> None:
         "gate_summary": gate_summary,
         "omissions": omissions,
         "upstream_changes_requested": [],
+        "peak_rss_gb_by_stage": _stage_peak_rss(cfg),
         "wall_clock_utc": study.utc_now(),
     }
     study.atomic_json(cfg.secondary_dir / "manifest.json", manifest)
@@ -5759,8 +7505,500 @@ def run_self_tests() -> dict[str, Any]:
               and int(join_detail["joined"]) == 24,
               f"rate={join_rate:.4f} joined={join_detail['joined']}/{join_detail['distinct_prediction_patients']}")
 
+    # 14 - the headline per-procedure AUROC matches a HAND-COMPUTED value, subsets the three arms
+    # correctly, and suppresses every n < 11 arm-horizon cell. The ladder is built so the BMI<35
+    # threshold lands exactly on a stored quantile, making each row's predicted probability an
+    # exact QUANTILE_LEVELS entry: baseline medians 33/34/35/36/37 give 0.90/0.75/0.50/0.25/0.10.
+    # Twelve unit-weight patients per estimable arm (six with target 34 -> label 1, six with 36 ->
+    # label 0) give the weighted Mann-Whitney sum 6+6+6+6+5.5+4 = 33.5 over 6*6 discordant pairs.
+    def _auroc_fixture(medians: Sequence[float], targets: Sequence[float],
+                       procedures: Sequence[str] | None) -> Any:
+        ladder = (np.asarray(medians, dtype=float)[:, None]
+                  + np.asarray([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])[None, :])
+        frame = pd.DataFrame({
+            "patient_id": [f"F{index}" for index in range(len(medians))],
+            "target_month": [12] * len(medians), "target_observed": [True] * len(medians),
+            "target_value": list(targets), "analysis_weight": [1.0] * len(medians),
+        })
+        for index, column in enumerate(QUANTILE_COLS):
+            frame[column] = ladder[:, index]
+        if procedures is not None:
+            frame["procedure"] = list(procedures)
+        return frame
+
+    scored_medians = [33.0, 33.0, 34.0, 34.0, 35.0, 36.0, 35.0, 36.0, 36.0, 37.0, 37.0, 37.0]
+    scored_targets = ([34.0] * 6) + ([36.0] * 6)  # below / above the BMI 35 threshold
+    auroc_cfg = SecondaryConfig(mode="self-test", output_dir=".", bootstrap_replicates=64)
+    auroc_rows, auroc_curves = _procedure_auroc(auroc_cfg, {
+        ("incretin", "bmi"): _auroc_fixture(scored_medians, scored_targets, None),
+        ("surgery", "bmi"): _auroc_fixture(
+            scored_medians + [33.0, 34.0, 35.0, 36.0, 37.0],
+            scored_targets + [34.0, 34.0, 36.0, 36.0, 36.0],
+            (["rygb"] * 12) + (["sleeve"] * 5)),
+    })
+    repeat_rows, _repeat_curves = _procedure_auroc(auroc_cfg, {
+        ("incretin", "bmi"): _auroc_fixture(scored_medians, scored_targets, None),
+        ("surgery", "bmi"): _auroc_fixture(
+            scored_medians + [33.0, 34.0, 35.0, 36.0, 37.0],
+            scored_targets + [34.0, 34.0, 36.0, 36.0, 36.0],
+            (["rygb"] * 12) + (["sleeve"] * 5)),
+    })
+    absent_rows, _absent_curves = _procedure_auroc(auroc_cfg, {})  # no predictions for any arm
+    by_cell = {(row["arm"], row["target_month"]): row for row in auroc_rows}
+    incretin_cell, rygb_cell, sleeve_cell = (by_cell[("incretin", 12)], by_cell[("rygb", 12)],
+                                             by_cell[("sleeve", 12)])
+    small = [row for row in auroc_rows if int(row["n"]) < MIN_CELL_SIZE]
+    check("14_per_procedure_auroc_and_suppression",
+          len(auroc_rows) == len(PROCEDURE_AUROC_ARMS) * len(PROCEDURE_AUROC_MONTHS)
+          and abs(incretin_cell["auroc"] - 33.5 / 36.0) < 1e-9
+          and abs(rygb_cell["auroc"] - 33.5 / 36.0) < 1e-9
+          and int(incretin_cell["n"]) == 12 and int(rygb_cell["n"]) == 12
+          and abs(incretin_cell["brier"] - 1.3625 / 12.0) < 1e-9
+          and abs(incretin_cell["cal_in_large"] - (5.35 / 12.0 - 0.5)) < 1e-9
+          and int(sleeve_cell["n"]) == 5 and bool(sleeve_cell["suppressed"])
+          and not np.isfinite(sleeve_cell["auroc"])
+          and len(small) == 7 and all(bool(row["suppressed"]) for row in small)
+          and not any(np.isfinite(row["auroc"]) for row in small)
+          and len(auroc_curves) == 2 and len(auroc_curves[0]["tpr"]) == len(ROC_FPR_GRID)
+          # an arm absent from the source is reported as not estimable, never as a suppression
+          and len(absent_rows) == 9 and not any(bool(row["suppressed"]) for row in absent_rows)
+          and all(str(row["skipped_reason"]) for row in absent_rows)
+          and repr(repeat_rows) == repr(auroc_rows),
+          f"auroc={incretin_cell['auroc']:.6f} (=33.5/36) rygb_n={int(rygb_cell['n'])} "
+          f"sleeve_n={int(sleeve_cell['n'])} suppressed={len(small)}/9 curves={len(auroc_curves)}")
+
+    # 15 - the enriched confounder set is audit-gated (Section 9). Creatinine/eGFR are populated so
+    # they join L and the balance/positivity re-audit covers them; GERD and the lab panel are absent
+    # from this source, so they are OMITTED from L (never an all-NaN confounder) and come back as
+    # named absent confounders. The fixture keeps sex non-collinear with the arm so the re-audited
+    # positivity gate is a real read rather than the smoke bundle's degenerate one.
+    n = 120
+    enriched = pd.DataFrame({
+        "patient_id": [f"E{index}" for index in range(n)],
+        "cohort": ["surgery"] * n,
+        "procedure": ["rygb" if index % 2 else "sleeve" for index in range(n)],
+        "baseline_bmi": [40.0 + (index % 7) for index in range(n)],
+        "age_at_index": [35.0 + (index % 20) for index in range(n)],
+        "sex": ["F" if index % 3 else "M" for index in range(n)],
+        "creatinine_baseline": [0.7 + 0.01 * (index % 9) for index in range(n)],
+        "egfr_baseline": [90.0 - (index % 25) for index in range(n)],
+        "gerd_baseline": [None] * n,
+    })
+    enriched_audit = column_population_audit(enriched)
+    numeric_L, categorical_L, absent_L = _tte_confounder_lists(enriched_audit)
+    L, A, encoded, _enc = build_wide_L_A(enriched, "bmi", enriched_audit)
+    ps, degenerate = _crossfit_propensity(L, A, enriched["patient_id"].to_numpy(), SEED, NUISANCE_FOLDS)
+    gate = positivity_gate(ps, A, degenerate=degenerate)
+    smd = dict(zip(encoded, tte.standardized_mean_diff(L, A)))
+    all_nan = [name for name, column in zip(encoded, np.asarray(L, dtype=float).T)
+               if not np.isfinite(column).any()]
+    named = _tte_absent_confounders({"assemble": {"audit": enriched_audit}})
+    check("15_enriched_L_audit_gated",
+          {"creatinine_baseline", "egfr_baseline"}.issubset(numeric_L)
+          and {"creatinine_baseline", "egfr_baseline"}.issubset(encoded)
+          and "gerd_baseline" not in numeric_L and "gerd_baseline" not in encoded
+          # exactly the optional confounders this fixture leaves unpopulated, in a fixed order
+          and absent_L == sorted(set(TTE_OPTIONAL_NUMERIC_CONFOUNDERS
+                                     + TTE_OPTIONAL_CATEGORICAL_CONFOUNDERS)
+                                 - {"creatinine_baseline", "egfr_baseline"})
+          and not all_nan
+          and named == absent_L + ["surgeon_or_center_id"]
+          and np.isfinite(smd["creatinine_baseline"]) and np.isfinite(smd["egfr_baseline"])
+          and len(smd) == L.shape[1] and int(gate["n"]) == n and np.isfinite(gate["ess_iptw"]),
+          f"L={len(numeric_L)}n+{len(categorical_L)}c -> {L.shape[1]} encoded; absent={len(absent_L)}; "
+          f"ess={gate['ess_iptw']:.1f} min_ps={gate['min_ps']:.4f}")
+
+    # 16 - the DR-learner recovers a KNOWN CATE (spec 12). The fixture randomizes the arm inside
+    # each (BMI level, fold) stratum (ps = 0.5, exact overlap) and plants tau(x) =
+    # -(1 + 0.3 (BMI - 40)), so RYGB helps the heavier patient more, while the outcome nuisance is
+    # handed the MARGINAL effect only (mu1 - mu0 = mean tau for everyone) and so contributes no
+    # effect modification at all: nothing but the augmentation term can carry the heterogeneity.
+    # Recovery is judged against the planted tau, the modifier that drives it must top the
+    # permutation importance, an unpopulated modifier must be named absent rather than encoded,
+    # and a cell without propensity overlap must refuse to fit at all.
+    fixture = _cate_fixture()
+    cate_cfg = SecondaryConfig(mode="self-test", output_dir=".", bootstrap_replicates=200)
+    psi = _dr_pseudo_outcome(fixture["Y"], fixture["A"], fixture["delta"], fixture["ps"],
+                             fixture["pc"], fixture["mu1"], fixture["mu0"])
+    design, groups, absent_modifiers = _cate_modifier_design(fixture["rows"], fixture["audit"])
+    tau_hat, importance = _crossfit_tau(design, psi, fixture["patient_ids"], SEED, NUISANCE_FOLDS,
+                                        groups)
+    recovery = float(np.corrcoef(tau_hat, fixture["tau"])[0, 1])
+    top_modifier = groups[int(np.argmax(importance))][0]
+    arguments = (cate_cfg, fixture["rows"], fixture["audit"], fixture["Y"], fixture["A"],
+                 fixture["delta"], fixture["ps"], fixture["pc"], fixture["mu1"], fixture["mu0"],
+                 fixture["patient_ids"])
+    planted = _cate_dr_learner(*arguments, {"positivity_fail": False, "min_ps": 0.5, "ess_iptw": 800.0})
+    blocked = _cate_dr_learner(*arguments, {"positivity_fail": True, "min_ps": 1e-6, "ess_iptw": 3.0})
+    check("16_dr_learner_recovers_known_cate",
+          planted["status"] == "done" and recovery > 0.7
+          and abs(float(np.mean(tau_hat)) - float(np.mean(fixture["tau"]))) < 0.5
+          and top_modifier == "baseline_bmi"
+          and absent_modifiers == sorted(CATE_OPTIONAL_NUMERIC_MODIFIERS)
+          and planted["absent_modifiers"] == absent_modifiers
+          and not np.isnan(np.asarray(design, dtype=float)).all(axis=0).any()
+          and blocked["status"] == "not_estimable" and "positivity" in blocked["skipped_reason"],
+          f"corr(tau_hat, tau)={recovery:.3f} mean={np.mean(tau_hat):.3f} (planted "
+          f"{np.mean(fixture['tau']):.3f}) top={top_modifier} absent={len(absent_modifiers)}")
+
+    # 17 - the RATE / TOC curve is monotone on that planted signal: the patients the DR-learner
+    # ranks high-benefit really do benefit more, the curve decays to exactly zero once everyone is
+    # treated, the bootstrap interval excludes zero, and the benefit-calibration deciles rise.
+    toc = np.asarray(planted["toc"], dtype=float)
+    toc_grid = np.asarray(planted["toc_grid"], dtype=float)
+    decile_benefit = np.asarray([row["aipw_benefit"] for row in planted["calibration"]], dtype=float)
+    check("17_rate_and_toc_monotone_on_planted_signal",
+          planted["rate"] > 0.0 and planted["rate_ci_low"] > 0.0
+          and float(np.corrcoef(toc_grid, toc)[0, 1]) < -0.9
+          and toc[0] > toc[-1] and abs(toc[-1]) < 1e-9
+          and len(planted["toc_ci_low"]) == toc_grid.size == len(planted["toc_ci_high"])
+          and planted["calibration_rho"] > 0.8 and decile_benefit[-1] > decile_benefit[0]
+          and len(planted["calibration"]) == CATE_DECILES
+          and planted["policy_value"] >= planted["treat_all_value"],
+          f"rate={planted['rate']:.3f} ({planted['rate_ci_low']:.3f} to "
+          f"{planted['rate_ci_high']:.3f}) toc {toc[0]:.3f} -> {toc[-1]:.3f} "
+          f"rho={planted['calibration_rho']:.2f} deciles {decile_benefit[0]:.2f} -> "
+          f"{decile_benefit[-1]:.2f}")
+
+    # 18 - c-for-benefit is sign-matched to the metric on BOTH pages. tte.c_for_benefit builds the
+    # observed pair benefit as Y[control] - Y[treated] (higher is better) but takes the predicted
+    # vector as handed over, so feeding it tau = mu1 - mu0 raw (negative IS the benefit) scores a
+    # PERFECT predictor near 0.08 rather than near 0.92. This fixture plants a perfect predictor
+    # with an X-informative propensity, so nearest-PS matching pairs like with like and the metric
+    # can actually see the effect; the raw-tau orientation must stay on the losing side of 0.5.
+    size = 200
+    row = np.arange(size)
+    band_bmi = 35.0 + (row % 20) * 0.75
+    planted_tau = -(1.0 + 0.30 * (band_bmi - 40.0))
+    band_ps = 0.30 + 0.40 * (band_bmi - 35.0) / 14.25
+    band_arm = np.zeros(size, dtype=int)
+    for band in range(20):
+        members = np.where((row % 20) == band)[0]
+        band_arm[members[1::2]] = 1
+    band_y = 0.85 * band_bmi + band_arm * planted_tau + 0.40 * np.sin(row.astype(float))
+    corrected = _c_for_benefit(planted_tau, band_arm, band_y, band_ps)["c_for_benefit"]
+    raw_tau = tte.c_for_benefit(planted_tau, band_arm, band_y, band_ps,
+                                lower_is_better=True)["c_for_benefit"]
+    check("18_c_for_benefit_orientation",
+          corrected > 0.8 and raw_tau < 0.2 and corrected > raw_tau
+          # the CATE payload routes through the same helper, so its value moves with this one
+          and planted["c_for_benefit"] > 0.5,
+          f"perfect predictor: corrected={corrected:.4f} vs raw-tau={raw_tau:.4f}; "
+          f"planted-fixture CATE c-for-benefit={planted['c_for_benefit']:.4f}")
+
+    # 19 - the which-incretin contrast (spec 10) is gated exactly like the CATE and flagged
+    # prognostic. The CATE fixture's stratified-randomized arm is relabelled as the agent, so the
+    # healthy cell has real overlap and must FIT; collapsing it onto one agent must refuse on
+    # positivity rather than fit over a clipped ratio; a source without incretin predictions must
+    # refuse structurally. Every branch carries the agent names and the prognostic caveat, the
+    # rygb/sleeve arm counts are gone, and two identical calls agree byte for byte.
+    incretin_frame = _incretin_heldout_fixture()
+    incretin_audit = column_population_audit(incretin_frame)
+    which_cfg = SecondaryConfig(mode="self-test", output_dir=".", bootstrap_replicates=64)
+    healthy = _within_incretin_dr_read(which_cfg, {("incretin", "bmi"): incretin_frame},
+                                       incretin_audit)
+    repeated = _within_incretin_dr_read(which_cfg, {("incretin", "bmi"): incretin_frame},
+                                        incretin_audit)
+    one_armed = _within_incretin_dr_read(
+        which_cfg, {("incretin", "bmi"): incretin_frame.assign(index_ingredient="tirzepatide")},
+        incretin_audit)
+    no_source = _within_incretin_dr_read(which_cfg, {}, incretin_audit)
+    branches = (healthy, one_armed, no_source)
+    check("19_which_incretin_gated_and_prognostic",
+          str(healthy["status"]) == "done"
+          and int(healthy["n_treated"]) + int(healthy["n_comparator"]) == int(healthy["n"]) == 800
+          and "n_rygb" not in healthy and "n_sleeve" not in healthy
+          and bool(healthy["importance"]) and np.isfinite(healthy["c_for_benefit"])
+          # a one-agent cell has no propensity overlap: refused, never fitted
+          and str(one_armed["status"]) == "not_estimable"
+          and "positivity" in str(one_armed["skipped_reason"])
+          and int(one_armed["n_comparator"]) == 0
+          and str(no_source["status"]) == "not_estimable" and int(no_source["n"]) == 0
+          # the prognostic-not-causal flag rides on EVERY branch, estimable or not
+          and all(str(item.get("treated_agent")) == WITHIN_INCRETIN_TREATED
+                  and str(item.get("comparator_agent")) == WITHIN_INCRETIN_COMPARATOR
+                  for item in branches)
+          # no default: the key itself has to be on every branch, since page 07 renders it
+          and all("NOT A CAUSAL TREATMENT EFFECT" in str(item["caveat"]) for item in branches)
+          and repr(repeated) == repr(healthy),
+          f"done n={int(healthy['n'])} ({int(healthy['n_treated'])} vs "
+          f"{int(healthy['n_comparator'])}) rate={healthy['rate']:.4f} "
+          f"c-for-benefit={healthy['c_for_benefit']:.4f}; one-agent and no-source both refused")
+
+    # 20 - the feature-sensitivity surrogate (spec 10) ranks a PLANTED dominant feature first. The
+    # stored median is made an almost-pure function of baseline_bmi, while every other covariate
+    # cycles on a coprime modulus and so cannot stand in for it. The surrogate must recover it as
+    # rank 1 with almost all the importance share and near-perfect out-of-fold fidelity, the
+    # counterfactual sweep must climb with it, arms absent from the source must come back as
+    # documented skips rather than vanish, and two identical calls must agree byte for byte.
+    sensitivity_frames = {("incretin", "bmi"): incretin_frame}
+    sensitivity_rows, sweeps = _feature_sensitivity(which_cfg, sensitivity_frames, incretin_audit)
+    sensitivity_repeat, _repeat_sweeps = _feature_sensitivity(which_cfg, sensitivity_frames,
+                                                              incretin_audit)
+    scored = [row for row in sensitivity_rows if not row["skipped_reason"]]
+    skipped = [row for row in sensitivity_rows if row["skipped_reason"]]
+    top = next(row for row in scored if int(row["rank"]) == 1)
+    sweep_forecast = np.asarray(sweeps[0]["forecast"], dtype=float) if sweeps else np.zeros(0)
+    check("20_feature_sensitivity_ranks_planted_feature",
+          str(top["feature"]) == "baseline_bmi" and float(top["importance_share"]) > 0.5
+          and float(top["surrogate_r2"]) > 0.95 and int(top["n"]) == 800
+          and sorted(int(row["rank"]) for row in scored) == list(range(1, len(scored) + 1))
+          # the five (arm, outcome) cells this fixture cannot score are documented, not dropped
+          and len(skipped) == 5 and all(not row["feature"] for row in skipped)
+          and all(not np.isfinite(row["permutation_importance"]) for row in skipped)
+          and len(sweeps) == 1 and str(sweeps[0]["feature"]) == "baseline_bmi"
+          and sweep_forecast.size == len(FEATURE_SWEEP_GRID)
+          and bool(np.all(np.diff(sweep_forecast) >= 0.0))
+          and float(sweep_forecast[-1] - sweep_forecast[0]) > 5.0
+          and repr(sensitivity_repeat) == repr(sensitivity_rows),
+          f"rank 1 = {top['feature']} share={float(top['importance_share']):.3f} "
+          f"r2={float(top['surrogate_r2']):.4f}; sweep {sweep_forecast[0]:.2f} -> "
+          f"{sweep_forecast[-1]:.2f}; {len(skipped)} documented skips")
+
+    # 21 - the PRIMARY prognostic reporting re-cut from the two source cohorts to the THREE
+    # reporting arms. The incretin frame passes through UNCOPIED (identity, not equality - the
+    # 177k-row arm must never be duplicated), the shared surgical frame splits into rygb + sleeve
+    # whose counts add back up to it, every declared arm-outcome-horizon cell yields a row, and
+    # the RYGB arm carries the full metric set at hand-computed values. The 12 residuals are
+    # chosen ORTHOGONAL to the predicted median, so the weighted calibration slope is exactly 1
+    # and its intercept is exactly the bias; a 5-row sleeve arm exercises the suppression floor.
+    arm_medians = [30.0, 35.0, 31.0, 34.0, 32.0, 33.0, 30.0, 35.0, 31.0, 34.0, 32.0, 33.0]
+    arm_targets = [32.0, 37.0, 33.0, 36.0, 31.0, 32.0, 29.0, 34.0, 34.0, 37.0, 28.0, 29.0]
+    incretin_frame = _auroc_fixture(arm_medians, arm_targets, None)
+    surgical_frame = _auroc_fixture(arm_medians + arm_medians[:5], arm_targets + arm_targets[:5],
+                                    (["rygb"] * 12) + (["sleeve"] * 5))
+    arm_frames = {("incretin", "bmi"): incretin_frame, ("surgery", "bmi"): surgical_frame}
+    arm_cfg = SecondaryConfig(mode="self-test", output_dir=".")
+    per_arm = _per_arm_prognostic(arm_cfg, arm_frames)
+    per_arm_cells = {(row["arm"], row["outcome"], row["target_month"]): row for row in per_arm}
+    rygb_cell, sleeve_cell = per_arm_cells[("rygb", "bmi", 12)], per_arm_cells[("sleeve", "bmi", 12)]
+    spec_metrics = ("crps", "rmse", "mae", "bias", "coverage_80", "coverage_90", "cal_slope")
+    rygb_view, sleeve_view = (_arm_view(arm_frames, "surgery", "bmi", "rygb")[0],
+                              _arm_view(arm_frames, "surgery", "bmi", "sleeve")[0])
+    threshold_rows, _arm_rel, _arm_computable = _tier4_threshold_probabilities(arm_cfg, arm_frames, None)
+    decision_rows = _tier4_decision_curves(arm_cfg, arm_frames, None)
+    threshold_n = {(str(row["arm"]), str(row["event"])): int(row["n"]) for row in threshold_rows}
+    # The page-00 census must dedup decision cells on the ARM dimension. Keying it on the dropped
+    # `cohort` returns None for every row and silently folds rygb onto incretin, so assert the
+    # consumer's own output: two arms scoring one event-horizon must read as two cells, not one.
+    highlights = _executive_highlights({"tier4": {"threshold": {"rows": threshold_rows},
+                                                  "decision": {"rows": decision_rows}}})
+    decision_line = next(line for line in highlights if line.startswith("- Decision curves:"))
+    check("21_per_arm_recut_forms_three_arms",
+          # the arms: incretin passes through uncopied; the surgical frame splits and adds back up
+          _arm_view(arm_frames, "incretin", "bmi", "")[0] is incretin_frame
+          and len(rygb_view) == 12 and len(sleeve_view) == 5
+          and len(rygb_view) + len(sleeve_view) == len(surgical_frame)
+          # every declared arm-outcome-horizon cell yields a row; the absent hba1c arms are named
+          and len(per_arm) == len(PROCEDURE_AUROC_ARMS) * sum(len(study.TARGET_MONTHS[outcome])
+                                                              for outcome in OUTCOMES)
+          and all(str(row["skipped_reason"]) for row in per_arm if str(row["outcome"]) == "hba1c")
+          # the per-arm metric set is complete, and hand-computed for the RYGB arm
+          and all(column in PER_ARM_PROGNOSTIC_COLUMNS for column in spec_metrics)
+          and all(np.isfinite(rygb_cell[column]) for column in spec_metrics)
+          and int(rygb_cell["n"]) == 12 and abs(rygb_cell["bias"] - 1.0 / 6.0) < 1e-9
+          and abs(rygb_cell["mae"] - 26.0 / 12.0) < 1e-9
+          and abs(rygb_cell["rmse"] - math.sqrt(70.0 / 12.0)) < 1e-9
+          and abs(rygb_cell["coverage_80"] - 8.0 / 12.0) < 1e-9
+          and abs(rygb_cell["coverage_90"] - 10.0 / 12.0) < 1e-9
+          and abs(rygb_cell["cal_slope"] - 1.0) < 1e-9
+          and abs(rygb_cell["cal_intercept"] - 1.0 / 6.0) < 1e-9
+          # the thin sleeve arm-horizon cell is suppressed, not dropped, and never scored
+          and int(sleeve_cell["n"]) == 5 and bool(sleeve_cell["suppressed"])
+          and not np.isfinite(sleeve_cell.get("crps", np.nan))
+          # threshold + decision reporting is keyed by arm, and the sub-11 arm gets no curve
+          and sorted({str(row["arm"]) for row in threshold_rows}) == ["incretin", "rygb", "sleeve"]
+          and not any("cohort" in row for row in threshold_rows + decision_rows)
+          and threshold_n[("sleeve", "bmi_lt_35")] == 5
+          and sorted({str(row["arm"]) for row in decision_rows}) == ["incretin", "rygb"]
+          # the page-00 census keeps the arm dimension (2 arms x 1 event-horizon, not 1 pooled cell)
+          and decision_line == "- Decision curves: 2 event-cells scored (net benefit).",
+          f"rygb={len(rygb_view)} + sleeve={len(sleeve_view)} = {len(surgical_frame)}; "
+          f"{len(per_arm)} arm-horizon cells; rygb bias={rygb_cell['bias']:.4f} "
+          f"mae={rygb_cell['mae']:.4f} slope={rygb_cell['cal_slope']:.4f}; "
+          f"threshold arms={len({str(row['arm']) for row in threshold_rows})}; "
+          f"census '{decision_line.strip('- ')}'")
+
+    # 22 - the SECTION-10 tiers re-cut over those SAME three arms. Transportability stands in for
+    # the whole tier family: they all iterate the one `_reporting_arm_frames` primitive, so forming
+    # the arms is tested once. The incretin arm is scored whole, the surgical frame splits into
+    # rygb + sleeve whose stratum counts add back up to it, the 5-patient sleeve stratum is blanked
+    # by the disclosure floor rather than published, and no row still carries the dropped `cohort`
+    # key. The GLP-1-vs-surgery overlap is the one read that must NOT be re-cut - it is inherently
+    # a cross-cohort contrast - so it is asserted on frames whose surgical ARMS cannot be formed at
+    # all: the per-arm tier loses the surgical read and records the gap, the overlap still scores.
+    # One state per arm, so each arm contributes exactly one stratum and the ONLY sub-11 cell in
+    # the tier is the 5-patient sleeve arm.
+    recut_frames = {
+        ("incretin", "bmi"): incretin_frame.assign(state="DE", baseline_bmi=arm_medians),
+        ("surgery", "bmi"): surgical_frame.assign(state=(["NJ"] * 12) + (["PA"] * 5),
+                                                  baseline_bmi=arm_medians + arm_medians[:5]),
+    }
+    recut_audit = column_population_audit(recut_frames[("surgery", "bmi")], ["state"])
+    transport_rows, _recut_meta = _tier1_transportability(arm_cfg, recut_frames, recut_audit)
+    n_by_arm: dict[str, int] = {}
+    for row in (item for item in transport_rows if str(item["stratum"])):
+        n_by_arm[str(row["arm"])] = n_by_arm.get(str(row["arm"]), 0) + int(row["n"])
+    published = suppress(_rows_to_frame(transport_rows, TRANSPORTABILITY_COLUMNS), ["n"])
+    thin = published.loc[published["small_cell_suppressed"]]
+    armless = {key: value.drop(columns=["procedure"]) if "procedure" in value else value
+               for key, value in recut_frames.items()}
+    armless_rows, _armless_meta = _tier1_transportability(arm_cfg, armless, recut_audit)
+    glp1_rows, glp1_trajectory = _tier4_glp1_overlap(arm_cfg, armless)
+    # A truncated subgroup table must still show every arm, and n_censored is a count like any
+    # other: censored_fraction times n recovers it, so a sub-11 censored cell takes its row.
+    wide = pd.DataFrame({"arm": (["incretin"] * 10) + (["rygb"] * 10) + (["sleeve"] * 10),
+                         "axis": ["sex"] * 30, "n": [50] * 30})
+    censored = _rows_to_frame([{"arm": "rygb", "outcome": "bmi", "target_month": 12, "n": 54,
+                                "n_censored": 7, "censored_fraction": 7 / 54},
+                               {"arm": "incretin", "outcome": "bmi", "target_month": 12, "n": 54,
+                                "n_censored": 20, "censored_fraction": 20 / 54}],
+                              TIPPING_POINT_COLUMNS)
+    censored = suppress(censored, list(ATTRITION_COUNT_COLUMNS))
+    check("22_section10_tiers_recut_over_three_arms",
+          # the tier sees exactly the three arms, and the surgical arms partition their source frame
+          sorted(n_by_arm) == ["incretin", "rygb", "sleeve"]
+          and n_by_arm["incretin"] == len(incretin_frame) and n_by_arm["sleeve"] == 5
+          and n_by_arm["rygb"] + n_by_arm["sleeve"] == len(surgical_frame)
+          and not any("cohort" in row for row in transport_rows)
+          # the one sub-11 arm-cell is blanked - neither its count nor its statistic is published
+          and len(thin) == 1 and not np.isfinite(float(thin["n"].iloc[0]))
+          and not np.isfinite(float(thin["crps"].iloc[0]))
+          # an unformable arm is dropped from the per-arm tiers but NAMED in the omissions ledger
+          and {str(row["arm"]) for row in armless_rows} == {"incretin"}
+          and sum(1 for gap in _arm_formation_gaps(armless)
+                  if "procedure not populated" in gap) == 2
+          # the GLP-1 overlap stays the 2-cohort contrast: it scores with no arm formable at all
+          and bool(glp1_rows) and all(set(row) == set(GLP1_OVERLAP_COLUMNS) for row in glp1_rows)
+          and sorted(glp1_trajectory["bmi"]) == ["incretin", "surgery"]
+          # a 12-row truncated subgroup table still reaches all three arms, 4 rows each
+          and sorted(_arm_balanced_head(wide, 12)["arm"].unique()) == ["incretin", "rygb", "sleeve"]
+          and len(_arm_balanced_head(wide, 12)) == 12
+          # the sub-11 censored cell is suppressed; the 20-censored cell is published intact
+          and bool(censored["small_cell_suppressed"].iloc[0])
+          and not np.isfinite(float(censored["censored_fraction"].iloc[0]))
+          and not bool(censored["small_cell_suppressed"].iloc[1])
+          and int(censored["n_censored"].iloc[1]) == 20,
+          f"arms {n_by_arm}; rygb+sleeve={n_by_arm['rygb'] + n_by_arm['sleeve']}"
+          f"={len(surgical_frame)}; {len(thin)} sub-11 cell blanked; armless tier arms="
+          f"{sorted({str(row['arm']) for row in armless_rows})} with "
+          f"{len(_arm_formation_gaps(armless))} gaps named; GLP-1 overlap {len(glp1_rows)} "
+          f"cross-cohort contrasts; 12-row table reaches "
+          f"{_arm_balanced_head(wide, 12)['arm'].nunique()} arms; n_censored=7 row suppressed")
+
     return {"status": "passed", "tests": results,
             "passed": sum(item["passed"] for item in results), "total": len(results)}
+
+
+def _incretin_heldout_fixture() -> Any:
+    """A held-out incretin BMI frame with EXACT agent overlap and two independent plants.
+
+    Shaped like what ``_tier1_heldout_frames`` hands the Tier-1 analyses: one row per patient at
+    the CATE horizon, the index-agent columns the drug grouping reads, and a quantile ladder at the
+    same +/- 3 spacing the AUROC fixture uses. Nothing draws from an RNG.
+
+    Each row's covariates are fixed by two INDEPENDENT coordinates of its profile: ``bmi_level``
+    sets baseline BMI and ``block`` sets everything else, so no other covariate can stand in for
+    BMI. The agent alternates inside every (profile, cross-fit fold) stratum exactly as the CATE
+    fixture's arm does, so P(agent | covariates) is 0.5 in every training subset and no classifier
+    can beat the base rate out of fold: the overlap this cell needs is a property of the fixture,
+    not of the fit. The two plants ride on separate channels - the observed target carries an
+    agent-by-BMI interaction for the DR read, the stored median is an almost-pure function of
+    baseline BMI for the surrogate read - so neither test can pass on the other's signal.
+    """
+    n, profiles = 800, 40
+    index = np.arange(n)
+    profile = index % profiles
+    bmi = 34.0 + 2.0 * (profile % 8)
+    block = profile // 8
+    patient_ids = np.array([f"I{item}" for item in index])
+    fold_ids = patient_folds(patient_ids, SEED, NUISANCE_FOLDS)
+    arm = np.zeros(n, dtype=int)
+    for stratum in range(profiles * NUISANCE_FOLDS):
+        members = np.where((profile == stratum // NUISANCE_FOLDS)
+                           & (fold_ids == stratum % NUISANCE_FOLDS))[0]
+        arm[members[1::2]] = 1
+    tau = -(1.0 + 0.30 * (bmi - 40.0))
+    ripple = np.sin(index.astype(float))
+    rows = pd.DataFrame({
+        "patient_id": patient_ids,
+        "cohort": ["incretin"] * n,
+        "index_ingredient": np.where(arm == 1, "tirzepatide", "semaglutide"),
+        "index_route": ["injection"] * n,
+        "baseline_bmi": bmi,
+        "baseline_hba1c": 5.4 + 0.4 * block,
+        "age_at_index": 32.0 + 4.0 * (block % 4),
+        "sex": np.where(block % 2 == 0, "M", "F"),
+        "diabetes_flag": (block % 3 == 0).astype(float),
+        "hypertension": (block % 4 == 1).astype(float),
+        "dyslipidemia": (block % 5 == 2).astype(float),
+        "osa": (block % 3 == 1).astype(float),
+        "insulin": (block % 4 == 2).astype(float),
+        "biguanide": (block % 5 == 3).astype(float),
+        "sglt2": (block % 3 == 2).astype(float),
+        "target_month": CATE_TARGET_MONTH,
+        "target_observed": True,
+        "target_value": 0.85 * bmi + arm * tau + 0.15 * ripple,
+        "analysis_weight": 1.0,
+    })
+    ladder = ((0.9 * bmi + 0.05 * ripple)[:, None]
+              + np.asarray([-3.0, -2.0, -1.0, 0.0, 1.0, 2.0, 3.0])[None, :])
+    for position, column in enumerate(QUANTILE_COLS):
+        rows[column] = ladder[:, position]
+    return rows
+
+
+def _cate_fixture() -> dict[str, Any]:
+    """A planted-CATE cell: stratified-randomized arm, perfect overlap, and a known tau(x).
+
+    Y = 0.85 * BMI + A * tau(BMI) + a deterministic ripple, with tau(BMI) = -(1 + 0.3 (BMI - 40)):
+    RYGB lowers BMI more for heavier patients, so the planted BENEFIT (-tau) rises from about -0.5
+    to +3.8 kg/m^2 across the BMI range. The outcome nuisance is handed the MARGINAL effect only
+    (mu1 - mu0 = mean tau for everyone), so it contributes no effect modification at all and the
+    augmentation term has to supply every bit of the heterogeneity the DR-learner recovers.
+
+    The arm is randomized WITHIN each (BMI level, cross-fit fold) stratum rather than at random, so
+    every fold sees the same arm mix at every X. Fold-level arm-fraction noise would otherwise leak
+    into an out-of-fold prediction (a fold rich in treated rows depresses the prediction its own
+    members receive), which is a small-fixture artifact rather than anything the estimator does.
+    Every covariate cycles on a modulus coprime to the BMI modulus, so no other modifier can stand
+    in for the real one, and nothing draws from an RNG: each value is a closed form of the row index.
+    """
+    n = 800
+    index = np.arange(n)
+    level = index % 20
+    bmi = 35.0 + level * 0.75
+    tau = -(1.0 + 0.30 * (bmi - 40.0))
+    patient_ids = np.array([f"C{item}" for item in index])
+    fold_ids = patient_folds(patient_ids, SEED, NUISANCE_FOLDS)
+    arm = np.zeros(n, dtype=int)
+    for stratum in range(20 * NUISANCE_FOLDS):
+        members = np.where((level == stratum // NUISANCE_FOLDS) & (fold_ids == stratum % NUISANCE_FOLDS))[0]
+        arm[members[1::2]] = 1
+    mu0 = 0.85 * bmi
+    mu1 = mu0 + float(np.mean(tau))
+    rows = pd.DataFrame({
+        "patient_id": patient_ids,
+        "cohort": ["surgery"] * n,
+        "procedure": np.where(arm == 1, "rygb", "sleeve"),
+        "baseline_bmi": bmi,
+        "baseline_hba1c": 5.5 + (index % 7) * 0.3,
+        "age_at_index": 30.0 + (index % 13),
+        "sex": np.where(index % 3 == 0, "M", "F"),
+        "diabetes_flag": (index % 9 == 0).astype(float),
+        "hypertension": (index % 11 == 0).astype(float),
+        "dyslipidemia": (index % 17 == 0).astype(float),
+        "osa": (index % 19 == 0).astype(float),
+        "insulin": (index % 21 == 0).astype(float),
+        "biguanide": (index % 23 == 0).astype(float),
+        "sglt2": (index % 3 == 1).astype(float),
+    })
+    return {
+        "rows": rows, "audit": column_population_audit(rows), "tau": tau, "mu1": mu1, "mu0": mu0,
+        "Y": mu0 + arm * tau + 0.15 * np.sin(index.astype(float)),
+        "A": arm, "delta": np.ones(n, dtype=int), "ps": np.full(n, 0.5), "pc": np.ones(n),
+        "patient_ids": patient_ids,
+    }
 
 
 def _fixture_prediction_frame() -> Any:
