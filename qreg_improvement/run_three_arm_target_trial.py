@@ -67,6 +67,7 @@ FIGURE_FILES = (
     "07_policy_value_and_claims.png",
 )
 FIGURE_BOOK = "three_arm_figure_book.pdf"
+DIAGNOSTIC_FIGURE_DIRECTORY = "DIAGNOSTIC_SCHEMA_FIGURES"
 AGGREGATE_FILES = (
     "design_diagnostic.csv",
     "cohort_funnel.csv",
@@ -473,6 +474,15 @@ def source_design_diagnostic(connect: bool = True) -> tuple[Any, dict[str, Any]]
     facts["wide_schema_available"] = schema_ok
     facts["wide_exact_index_columns"] = exact_dates
     return pd.DataFrame(rows), facts
+
+
+def acquire_schema_diagnostic_report() -> dict[str, Any]:
+    """Read SQL Server metadata only; no patient rows or values are requested."""
+    connection = study.connect_cosmos()
+    try:
+        return study.discover_cosmos_schema(connection)
+    finally:
+        connection.close()
 
 
 def hard_gates_pass(diagnostic: Any) -> bool:
@@ -2081,6 +2091,36 @@ def _clean_contract_files(export: Path) -> None:
         if temporary.exists() and temporary.is_file():temporary.unlink()
 
 
+def render_schema_diagnostic_figures(cfg: TrialConfig, report: Mapping[str, Any]) -> list[Path]:
+    """Render the production metadata-only schema inventory as deterministic portable figures."""
+    export=cfg.run_dir/DIAGNOSTIC_FIGURE_DIRECTORY
+    export.mkdir(parents=True,exist_ok=True)
+    expected_names=tuple(study.SCHEMA_DISCOVERY_PAGE_FILES)
+    expected=set(expected_names)|{"schema_discovery_figure_book.pdf"}
+    for name in expected:
+        path=export/name
+        if path.exists() and path.is_file():path.unlink()
+        temporary=export/(name+".tmp")
+        if temporary.exists() and temporary.is_file():temporary.unlink()
+    unexpected={path.name for path in export.iterdir() if path.is_file()}-expected
+    if unexpected:
+        raise RuntimeError("Diagnostic schema figure directory contains non-contract files: "+", ".join(sorted(unexpected)))
+    study.configure_figure_style()
+    pdf_tmp=export/"schema_discovery_figure_book.pdf.tmp";written=[]
+    metadata={"Title":"Cosmos Raw-Source Schema Discovery","Author":"Shin Lab",
+              "CreationDate":datetime(2000,1,1),"ModDate":datetime(2000,1,1)}
+    with PdfPages(pdf_tmp,metadata=metadata) as pdf:
+        for name,renderer in zip(expected_names,study.schema_discovery_renderers(report),strict=True):
+            figure=renderer();temporary=export/(name+".tmp")
+            figure.savefig(temporary,format="png",dpi=220,facecolor=figure.get_facecolor(),metadata={"Software":VERSION})
+            study.replace_file(temporary,export/name);pdf.savefig(figure,dpi=220,facecolor=figure.get_facecolor());plt.close(figure)
+            written.append(export/name)
+    study.replace_file(pdf_tmp,export/"schema_discovery_figure_book.pdf");written.append(export/"schema_discovery_figure_book.pdf")
+    present={path.name for path in export.iterdir() if path.is_file()}
+    if present!=expected:raise RuntimeError("Diagnostic schema figure export contract is incomplete")
+    return written
+
+
 def render_figure_book(cfg: TrialConfig, data: Mapping[str,Any], status_only: bool=False) -> list[Path]:
     configure_style();cfg.export.mkdir(parents=True,exist_ok=True);_clean_contract_files(cfg.export)
     renderers=PAGE_RENDERERS[:1] if status_only else PAGE_RENDERERS
@@ -2132,7 +2172,11 @@ def write_manifest(cfg: TrialConfig, render_data: Mapping[str,Any], protocol: Ma
                    status_only: bool=False) -> dict[str,Any]:
     outputs=render_data["outputs"];diagnostic=outputs.get("design_diagnostic",pd.DataFrame())
     missing=[name for name in FROZEN_CONFOUNDERS if name not in set(render_data.get("available_confounders",[]))]
-    figures={path.name:sha256_file(path) for path in sorted(cfg.export.iterdir()) if path.is_file()}
+    figures={f"FIGURES_TO_EXPORT/{path.name}":sha256_file(path) for path in sorted(cfg.export.iterdir()) if path.is_file()}
+    diagnostic_export=cfg.run_dir/DIAGNOSTIC_FIGURE_DIRECTORY
+    if diagnostic_export.exists():
+        figures.update({f"{DIAGNOSTIC_FIGURE_DIRECTORY}/{path.name}":sha256_file(path)
+                        for path in sorted(diagnostic_export.iterdir()) if path.is_file()})
     manifest={
         "version":VERSION,"generated_utc":utc_now(),"mode":cfg.mode,"script_sha256":sha256_file(SCRIPT_PATH),
         "query_fingerprint":render_data.get("query_fingerprint","not_applicable"),"source_fingerprint":render_data.get("source_fingerprint","not_applicable"),
@@ -2156,6 +2200,10 @@ def write_bundle(cfg: TrialConfig) -> Path:
         if path.exists():members.append((name,path))
     for path in sorted(cfg.export.iterdir()):
         if path.is_file():members.append((f"FIGURES_TO_EXPORT/{path.name}",path))
+    diagnostic_export=cfg.run_dir/DIAGNOSTIC_FIGURE_DIRECTORY
+    if diagnostic_export.exists():
+        for path in sorted(diagnostic_export.iterdir()):
+            if path.is_file():members.append((f"{DIAGNOSTIC_FIGURE_DIRECTORY}/{path.name}",path))
     fd,temp_name=tempfile.mkstemp(prefix=destination.name+".",suffix=".tmp",dir=destination.parent);os.close(fd)
     try:
         with zipfile.ZipFile(temp_name,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=9) as archive:
@@ -2197,7 +2245,7 @@ def _render_data(cfg: TrialConfig, outputs: Mapping[str,Any], protocol: Mapping[
 
 def publish(cfg: TrialConfig, outputs: Mapping[str,Any], protocol: Mapping[str,Any],
             aggregate: Mapping[str,Any], metadata: Mapping[str,Any] | None=None,
-            status_only: bool=False) -> Path:
+            status_only: bool=False, schema_report: Mapping[str,Any] | None=None) -> Path:
     write_output_frames(cfg,outputs)
     # Re-read exactly what was disclosure controlled and released; figures and plot-only
     # checkpoint therefore cannot accidentally retain a suppressed value.
@@ -2206,7 +2254,11 @@ def publish(cfg: TrialConfig, outputs: Mapping[str,Any], protocol: Mapping[str,A
         if name.endswith(".csv"):
             released[name[:-4]]=read_csv_or_empty(cfg.run_dir/name)
     data=_render_data(cfg,released,protocol,aggregate,metadata)
+    if schema_report is not None:
+        data["schema_diagnostic_report"]=dict(schema_report)
     render_figure_book(cfg,data,status_only=status_only)
+    if schema_report is not None:
+        render_schema_diagnostic_figures(cfg,schema_report)
     write_manifest(cfg,data,protocol,status_only=status_only)
     write_aggregate_checkpoint(cfg,data,status_only)
     write_bundle(cfg)
@@ -2216,10 +2268,19 @@ def publish(cfg: TrialConfig, outputs: Mapping[str,Any], protocol: Mapping[str,A
 def run_diagnose(cfg: TrialConfig) -> Path:
     ensure_directories(cfg)
     diagnostic,facts=source_design_diagnostic(connect=True)
+    schema_report=acquire_schema_diagnostic_report()
+    database=schema_report.get("database",pd.DataFrame())
+    facts["schema_discovery_summary"]={
+        "database":str(database["DATABASE_NAME"].iloc[0]) if len(database) and "DATABASE_NAME" in database else "unavailable",
+        "objects":int(schema_report["columns"][["TABLE_SCHEMA","TABLE_NAME"]].drop_duplicates().shape[0]),
+        "columns":int(len(schema_report["columns"])),
+        "candidate_objects":int(len(schema_report["candidates"])),
+        "warnings":list(schema_report.get("warnings",[])),
+    }
     protocol=write_protocol(cfg,facts)
     outputs=empty_outputs();outputs["design_diagnostic"]=diagnostic
     aggregate={"claim_status":claim_status(diagnostic),"source_mode":facts.get("source_mode"),"available_confounders":[]}
-    return publish(cfg,outputs,protocol,aggregate,facts,status_only=True)
+    return publish(cfg,outputs,protocol,aggregate,facts,status_only=True,schema_report=schema_report)
 
 
 def run_full(cfg: TrialConfig) -> Path:
@@ -2271,6 +2332,8 @@ def run_plot_only(cfg: TrialConfig) -> Path:
     ensure_directories(cfg)
     data,status_only=load_aggregate_checkpoint(cfg)
     render_figure_book(cfg,data,status_only=status_only)
+    if data.get("schema_diagnostic_report") is not None:
+        render_schema_diagnostic_figures(cfg,data["schema_diagnostic_report"])
     write_manifest(cfg,data,data.get("protocol",{}),status_only=status_only)
     write_bundle(cfg)
     return cfg.run_dir
@@ -2283,6 +2346,42 @@ def _selftest_render_data(cfg: TrialConfig) -> dict[str,Any]:
     protocol=trial_protocol(cfg,{"source_mode":"synthetic_raw_events"})
     atomic_json(cfg.run_dir/"three_arm_trial_protocol.json",protocol)
     return _render_data(cfg,outputs,protocol,{"claim_status":"EXPLORATORY CAUSAL","available_confounders":list(FROZEN_CONFOUNDERS)},{"source_mode":"synthetic_raw_events"})
+
+
+def _selftest_schema_report() -> dict[str,Any]:
+    object_columns={
+        "Patient":["PatientID","CenterID","BirthDate","Sex","Race","Ethnicity","ObservationStartDate","ObservationEndDate"],
+        "Procedure":["ProcedureID","PatientID","CenterID","ProcedureDate","ProcedureCode"],
+        "Medication":["MedicationID","PatientID","FillDate","Ingredient","MedicationConcept","DaysSupply"],
+        "Measurement":["MeasurementID","PatientID","MeasurementDate","RawValue","Unit","SourceConcept"],
+        "Encounter":["EncounterID","PatientID","CenterID","EncounterDate"],
+        "Diagnosis":["DiagnosisID","PatientID","EncounterID","DiagnosisDate","DiagnosisCode"],
+    }
+    rows=[]
+    for table_name,column_names in object_columns.items():
+        for position,column_name in enumerate(column_names,1):
+            rows.append({
+                "TABLE_CATALOG":"ProjectD332AFD","TABLE_SCHEMA":"raw","TABLE_NAME":table_name,
+                "TABLE_TYPE":"BASE TABLE","COLUMN_NAME":column_name,"ORDINAL_POSITION":position,
+                "DATA_TYPE":"datetime2" if column_name.lower().endswith("date") else "varchar",
+                "CHARACTER_MAXIMUM_LENGTH":100,"NUMERIC_PRECISION":np.nan,"NUMERIC_SCALE":np.nan,
+                "IS_NULLABLE":"NO" if column_name in {"PatientID","ProcedureID"} else "YES",
+            })
+    columns=pd.DataFrame(rows)
+    keys=pd.DataFrame([
+        {"TABLE_SCHEMA":"raw","TABLE_NAME":table_name,"COLUMN_NAME":column_names[0],
+         "CONSTRAINT_TYPE":"PRIMARY KEY","CONSTRAINT_NAME":f"PK_{table_name}","ORDINAL_POSITION":1}
+        for table_name,column_names in object_columns.items()
+    ])
+    candidates,candidate_columns=study.build_schema_discovery_candidates(columns,keys)
+    return {
+        "version":study.SCHEMA_DISCOVERY_VERSION,
+        "database":pd.DataFrame([{"DATABASE_NAME":"ProjectD332AFD"}]),
+        "columns":columns,"keys":keys,"foreign_keys":pd.DataFrame(),"synonyms":pd.DataFrame(),
+        "cohort_modules":pd.DataFrame(),"object_dependencies":pd.DataFrame(),
+        "candidates":candidates,"candidate_columns":candidate_columns,
+        "shared_keys":study.build_shared_key_hints(columns),"warnings":[],
+    }
 
 
 def run_self_tests() -> dict[str,Any]:
@@ -2336,6 +2435,23 @@ def run_self_tests() -> dict[str,Any]:
             names={path.name for path in temp_cfg.export.iterdir() if path.is_file()}
             check("14_figure_contract_"+Path(directory).name,names==set(FIGURE_FILES)|{FIGURE_BOOK},str(sorted(names)))
         check("13_repeated_figure_hashes",hashes[0]==hashes[1])
+    with tempfile.TemporaryDirectory(prefix="three-arm-schema-") as directory:
+        temp_cfg=TrialConfig("self-test",directory,seed=SEED,bootstrap_replicates=20)
+        ensure_directories(temp_cfg);schema_report=_selftest_schema_report()
+        protocol=write_protocol(temp_cfg,{"source_mode":"synthetic_schema_metadata"})
+        outputs=empty_outputs();outputs["design_diagnostic"]=pd.DataFrame(
+            [gate_row("hard",gate,False,"synthetic metadata diagnostic") for gate in HARD_GATE_LABELS]
+        )
+        publish(temp_cfg,outputs,protocol,{"claim_status":"SCIENTIFIC FAILURE","source_mode":"synthetic_schema_metadata"},
+                {"source_mode":"synthetic_schema_metadata"},status_only=True,schema_report=schema_report)
+        run_plot_only(temp_cfg)
+        schema_names={path.name for path in (temp_cfg.run_dir/DIAGNOSTIC_FIGURE_DIRECTORY).iterdir() if path.is_file()}
+        expected_schema=set(study.SCHEMA_DISCOVERY_PAGE_FILES)|{"schema_discovery_figure_book.pdf"}
+        check("15_schema_diagnostic_figure_contract",schema_names==expected_schema,str(sorted(schema_names)))
+        with zipfile.ZipFile(temp_cfg.run_dir/"three_arm_results_bundle.zip") as archive:
+            bundled=set(archive.namelist())
+        check("16_schema_figures_in_portable_bundle",
+              all(f"{DIAGNOSTIC_FIGURE_DIRECTORY}/{name}" in bundled for name in expected_schema))
     return {"version":VERSION,"seed":SEED,"passed":True,"tests":results}
 
 
@@ -2350,7 +2466,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser=argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     modes=parser.add_mutually_exclusive_group(required=True)
     modes.add_argument("--descriptive-from-run",metavar="RUN_DIR",help="Produce noncausal held-out prognostic comparison without Cosmos")
-    modes.add_argument("--diagnose",action="store_true",help="Query only aggregate/schema facts and render the design eligibility report")
+    modes.add_argument("--diagnose",action="store_true",help="Query metadata/aggregate facts and render design plus seven schema diagnostic pages")
     modes.add_argument("--full",action="store_true",help="Acquire the full raw eligible cohort and run the gated target trial")
     modes.add_argument("--plot-only",metavar="RUN_DIR",help="Rebuild figures from a verified aggregate checkpoint")
     modes.add_argument("--self-test",action="store_true",help="Run embedded deterministic synthetic tests; no Cosmos connection")
@@ -2404,6 +2520,10 @@ def main(argv: Sequence[str] | None=None) -> int:
         return 2
     print(f"[three-arm] completed: {run_dir}")
     print(f"[three-arm] figures: {run_dir/'FIGURES_TO_EXPORT'}")
+    diagnostic_figures=run_dir/DIAGNOSTIC_FIGURE_DIRECTORY
+    if diagnostic_figures.exists():
+        print(f"[three-arm] schema diagnostic figures: {diagnostic_figures}")
+    print(f"[three-arm] portable bundle: {run_dir/'three_arm_results_bundle.zip'}")
     return 0
 
 
