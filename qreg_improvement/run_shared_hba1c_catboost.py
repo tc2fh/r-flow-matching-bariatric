@@ -312,15 +312,139 @@ def source_context(study: Any, source_run: Path) -> tuple[Any, Any, dict[str, An
     return weights["rows"], calibration, metadata
 
 
-def rebuild_source_rows(study: Any, source_run: Path, cfg: Config) -> tuple[Any, Any, dict[str, Any]]:
-    """Reconstruct weighted HbA1c prediction rows at cfg.horizons from a completed run's retained data.
+def _early_hba1c_wide_fields(months: Sequence[int]) -> tuple[tuple[str, int, tuple[str, ...], str], ...]:
+    """Wide-column contract entries for early HbA1c horizons, mirroring the BMI 3m/6m entries.
 
-    The trajectory study only pre-builds HbA1c targets at 12/24/36/48/60 months, so training on the
-    BMI model's 3/6/12-month horizons requires building those rows here. The run's cohorts checkpoint
-    retains the raw per-patient BMI/HbA1c measurements and global_splits retains the patient splits and
-    baselines, so the study's own audited row builder and cross-fitted weighting are reused verbatim -
-    only the target-month set is temporarily narrowed to the requested horizons at origin 0. No source
-    re-query is performed, and the source run is not modified (rebuilt stores live under the output dir).
+    The source cohort tables expose ``BMI3mPostEvent``/``BMI6mPostEvent`` but the study's default
+    ``WIDE_TARGET_FIELDS`` lists only annual HbA1c. Appending the parallel ``HbA1c{m}mPostEvent``
+    columns lets the study's own wide extraction surface them where the source actually has them; a
+    column the source lacks is left unresolved by ``resolve_wide_fields`` and simply yields no rows.
+    """
+    return tuple((OUTCOME, int(m), (f"HbA1c{int(m)}mPostEvent",), "%")
+                 for m in sorted({int(x) for x in months}))
+
+
+def _require_source_hba1c_columns(study: Any, months: Sequence[int]) -> None:
+    """Cheap ``SELECT TOP (0)`` probe: fail fast if the source lacks the requested HbA1c columns.
+
+    Reuses the study's own connection, schema-probe SQL, and column resolver so a full Cosmos
+    re-query is not paid only to discover the columns are absent. WIDE_TARGET_FIELDS must already be
+    extended (by the caller) so the resolver looks for the early-horizon columns.
+    """
+    schema, mbs_table, glp1_table = study.direct_source_names()
+    connection = study.connect_cosmos()
+    resolvable: set = set()
+    try:
+        for logical_name, table in (("MBSCohort", mbs_table), ("GLP1Cohort", glp1_table)):
+            probe = study.build_direct_schema_probe_sql(schema, table)
+            schema_frame = study.pd.read_sql_query(probe, connection)
+            resolved = study.resolve_wide_fields(schema_frame, logical_name)
+            resolvable |= {int(m) for m in months if f"target_{OUTCOME}_{int(m)}" in resolved}
+    finally:
+        connection.close()
+    absent = [int(m) for m in sorted({int(x) for x in months}) if int(m) not in resolvable]
+    if absent:
+        columns = ", ".join(f"HbA1c{m}mPostEvent" for m in absent)
+        raise RuntimeError(
+            f"[hba1c] the source cohort tables ({schema}.{mbs_table} / {schema}.{glp1_table}) do not "
+            f"expose HbA1c at horizon(s) {absent} month(s) (looked for {columns}). HbA1c in this "
+            f"registry is collected at baseline and annually only - 3/6-month HbA1c is not measured "
+            f"(only BMI/weight are) - so these horizons cannot be extracted from source. Re-run with "
+            f"--horizons restricted to available months, or add those columns to the source tables.")
+
+
+def _reacquire_cohorts_measurements(study: Any, context_cfg: Any, is_synthetic: bool,
+                                    missing: Sequence[int], seed: int) -> tuple[Any, Any]:
+    """Re-extract cohorts + split-assigned measurements from source, requesting the missing horizons.
+
+    Reuses the study's own acquire exactly as run_secondary_analyses.py does: the deterministic
+    synthetic fixture under smoke, the streaming wide/Cosmos query otherwise. ``TARGET_MONTHS``
+    (synthetic generation) and ``WIDE_TARGET_FIELDS`` (wide extraction) are temporarily extended so
+    the missing HbA1c horizons are surfaced at acquisition, then restored. Splits are re-derived
+    deterministically from the same seed, so they reproduce the source run's partitions.
+    """
+    saved_targets = dict(study.TARGET_MONTHS)
+    saved_wide = tuple(study.WIDE_TARGET_FIELDS)
+    try:
+        study.TARGET_MONTHS = {
+            **saved_targets,
+            OUTCOME: tuple(sorted(set(saved_targets[OUTCOME]) | {int(m) for m in missing})),
+        }
+        study.WIDE_TARGET_FIELDS = saved_wide + _early_hba1c_wide_fields(missing)
+        if is_synthetic:
+            bundle = study.synthetic_data_bundle(context_cfg)
+            artifacts = study.construct_cohorts(bundle)
+        else:
+            _require_source_hba1c_columns(study, missing)
+            artifacts, _bundle = study.stream_wide_acquire(context_cfg)
+    finally:
+        study.TARGET_MONTHS = saved_targets
+        study.WIDE_TARGET_FIELDS = saved_wide
+    cohorts, _split_meta = study.assign_global_splits(artifacts["cohorts"], seed=seed)
+    return cohorts, artifacts["measurements"]
+
+
+def _build_weighted(study: Any, cohorts: Any, measurements: Any, horizons: Sequence[int], seed: int) -> Any:
+    """Build baseline-origin HbA1c prediction rows at ``horizons`` and cross-fit their weights.
+
+    Reuses the study's audited row builder and IPCW weighting; only the target-month set is narrowed
+    to the requested horizons at origin 0 for the duration of the build. Rebuilt stores are
+    intermediate and read fully into memory downstream, so they live in a temp dir.
+    """
+    rebuild_root = Path(tempfile.mkdtemp(prefix="hba1c_build_"))
+    saved_targets, saved_landmarks = dict(study.TARGET_MONTHS), study.LANDMARK_MONTHS
+    try:
+        study.TARGET_MONTHS = {"bmi": (), OUTCOME: tuple(int(h) for h in horizons)}
+        study.LANDMARK_MONTHS = (0,)
+        unweighted = study.build_prediction_rows(cohorts, measurements, study.RowStore(rebuild_root / "unweighted"))
+        weighted, _ = study.estimate_weights_over_store(
+            unweighted, study.RowStore(rebuild_root / "weighted"), seed)
+    finally:
+        study.TARGET_MONTHS, study.LANDMARK_MONTHS = saved_targets, saved_landmarks
+    return weighted
+
+
+def _observed_by_horizon(study: Any, rows: Any, horizons: Sequence[int]) -> dict:
+    dev = rows.loc[
+        rows["split"].astype(str).isin(DEVELOPMENT)
+        & rows["target_observed"].fillna(False).astype(bool)
+    ]
+    months = study.pd.to_numeric(dev["target_month"], errors="coerce")
+    return {int(h): int((months == int(h)).sum()) for h in horizons}
+
+
+def _assert_horizons_observed(study: Any, rows: Any, horizons: Sequence[int]) -> None:
+    """Fail loud if any requested horizon has no observed development HbA1c after extraction."""
+    observed = _observed_by_horizon(study, rows, horizons)
+    absent = [int(h) for h in horizons if observed.get(int(h), 0) == 0]
+    if not absent:
+        return
+    present = sorted(int(h) for h in horizons if observed.get(int(h), 0) > 0)
+    registry = sorted({int(m) for outcome, m, *_ in study.WIDE_TARGET_FIELDS
+                       if outcome == OUTCOME and int(m) > 0})
+    columns = "/".join(f"HbA1c{m}mPostEvent" for m in absent)
+    raise RuntimeError(
+        f"[hba1c] source extraction produced no observed HbA1c targets at horizon(s) {absent} "
+        f"month(s) (observed by horizon: {observed}). HbA1c in this registry is collected at baseline "
+        f"and then annually ({registry} months); it is not measured at {absent} month(s) - only "
+        f"BMI/weight are - so those horizons cannot be extracted from source or reconstructed. Re-run "
+        f"with --horizons among {present or registry}, or add the source columns {columns} and re-extract.")
+
+
+def rebuild_source_rows(study: Any, source_run: Path, cfg: Config) -> tuple[Any, Any, dict[str, Any]]:
+    """Re-extract weighted HbA1c prediction rows at cfg.horizons from source for horizons the run lacks.
+
+    The trajectory study pre-builds HbA1c targets only at 12/24/36/48/60 months, so early horizons
+    (3, 6) are not in a completed run's stores and cannot be recovered from its retained measurements.
+    Rather than silently emit empty rows, this re-runs the study's OWN acquire - the synthetic fixture
+    under smoke, the streaming wide/Cosmos query otherwise (the same re-acquire pattern
+    run_secondary_analyses.py uses) - with the wide contract and synthetic generator temporarily
+    extended to request the missing HbA1c horizons (mirroring the BMI 3m/6m columns). It then rebuilds
+    baseline-origin rows and cross-fitted weights with the study's audited builders; the old roster is
+    still read from the completed run for the benchmark. If the source genuinely lacks a horizon (the
+    production registry has no 3/6-month HbA1c columns), the wide pre-query fails fast and the
+    post-build gate raises a precise error instead of shipping a horizon with no data. The source run
+    is not modified.
     """
     manifest = study.read_json(source_run / "run_manifest.json", {}) or {}
     configuration = manifest.get("configuration", {}) or {}
@@ -334,35 +458,33 @@ def rebuild_source_rows(study: Any, source_run: Path, cfg: Config) -> tuple[Any,
             "incretin_qualifying_months", study.INCRETIN_QUALIFYING_MONTHS)))
     context_cfg = replace(context_cfg, seed=source_seed)
     context = study.load_run_context(context_cfg)
-    cohorts = study.require_checkpoint(context, "global_splits")["cohorts"]
-    measurements = study.require_checkpoint(context, "cohorts")["measurements"]
     calibration = study.require_checkpoint(context, "calibration")
     repair_store_root(calibration["calibrated"], source_run / "INTERNAL" / "predictions" / "calibrated")
 
-    # Rebuilt stores are intermediate and are read fully into memory by collect_source_rows, so keep
-    # them in a temp dir: writing under the output dir would trip run_pipeline's "not empty" guard, and
-    # the source run stays read-only.
-    rebuild_root = Path(tempfile.mkdtemp(prefix="hba1c_rebuild_"))
-    saved_targets, saved_landmarks = dict(study.TARGET_MONTHS), study.LANDMARK_MONTHS
-    try:
-        # Build only the requested HbA1c horizons at baseline origin; skip BMI and other origins.
-        study.TARGET_MONTHS = {"bmi": (), OUTCOME: tuple(cfg.horizons)}
-        study.LANDMARK_MONTHS = (0,)
-        unweighted = study.build_prediction_rows(cohorts, measurements, study.RowStore(rebuild_root / "unweighted"))
-        weighted, _ = study.estimate_weights_over_store(
-            unweighted, study.RowStore(rebuild_root / "weighted"), source_seed)
-    finally:
-        study.TARGET_MONTHS, study.LANDMARK_MONTHS = saved_targets, saved_landmarks
+    # Horizons the completed run did not pre-build (its HbA1c targets are the annual TARGET_MONTHS)
+    # must be re-extracted from source; the main dispatch only routes non-subset horizons here.
+    missing = [int(h) for h in cfg.horizons if int(h) not in set(study.TARGET_MONTHS[OUTCOME])]
+    pyodbc_ok = importlib.util.find_spec("pyodbc") is not None
+    is_synthetic = bool(context_cfg.smoke) and not study.use_real_smoke_source({"pyodbc_importable": pyodbc_ok})
+    print(f"[hba1c] re-extracting HbA1c horizon(s) {missing} from source "
+          f"({'synthetic fixture' if is_synthetic else 'wide/Cosmos direct query'}); "
+          f"reusing the study's own acquire (source run not modified)", flush=True)
+    cohorts, measurements = _reacquire_cohorts_measurements(
+        study, context_cfg, is_synthetic, missing, source_seed)
 
+    weighted = _build_weighted(study, cohorts, measurements, cfg.horizons, source_seed)
     all_rows = study.concat_frames([weighted.read(key) for key in weighted.keys()])
-    print(f"[hba1c] rebuilt {len(all_rows):,} weighted HbA1c rows at horizons "
-          f"{','.join(map(str, cfg.horizons))} from retained measurements (no source re-query)", flush=True)
+    _assert_horizons_observed(study, all_rows, cfg.horizons)
+    observed = _observed_by_horizon(study, all_rows, cfg.horizons)
+    print(f"[hba1c] rebuilt {len(all_rows):,} weighted HbA1c rows from re-extracted source; "
+          f"observed development targets by horizon: {observed}", flush=True)
     metadata = {
         "manifest": manifest,
         "source_manifest_sha256": sha256_file(source_run / "run_manifest.json"),
         "source_seed": source_seed,
         "scale_map": study.development_iqr_scale_map(all_rows),
         "rebuilt_horizons": list(cfg.horizons),
+        "reextracted_horizons": missing,
     }
     return weighted, calibration, metadata
 
@@ -1707,14 +1829,52 @@ def synthetic_fixture(study: Any, cfg: Config) -> tuple[dict[str, Any], Any, dic
     return data, reference, {"source_manifest_sha256": "synthetic"}
 
 
+def _self_test_reconstruction(study: Any) -> None:
+    """Exercise the source re-extraction and fail-loud gate offline on the synthetic fixture.
+
+    Proves (a) building the early horizons from a source that does NOT provide them raises the
+    fail-loud gate rather than emitting empty rows, and (b) re-extracting from source (here the
+    synthetic generator, which can supply 3/6-month HbA1c) populates every requested horizon. Uses
+    the study's real acquire, cohort construction, split assignment, row builder, and weighting - no
+    database and no torch - so it validates the exact reconstruction path a --from-run invocation takes.
+    """
+    study_cfg = study.RunConfig.create("smoke", None, False)
+    horizons = (3, 6, 12)
+
+    # (a) A source lacking 3/6-month HbA1c (the default contract) must fail loud, not emit empty rows.
+    bundle = study.synthetic_data_bundle(study_cfg)
+    artifacts = study.construct_cohorts(bundle)
+    cohorts, _meta = study.assign_global_splits(artifacts["cohorts"], seed=study_cfg.seed)
+    weighted = _build_weighted(study, cohorts, artifacts["measurements"], horizons, study_cfg.seed)
+    rows = study.concat_frames([weighted.read(key) for key in weighted.keys()])
+    try:
+        _assert_horizons_observed(study, rows, horizons)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected fail-loud when 3/6-month HbA1c is absent from source")
+
+    # (b) Re-extracting from source (synthetic here) must populate every requested horizon.
+    cohorts2, measurements2 = _reacquire_cohorts_measurements(study, study_cfg, True, [3, 6], study_cfg.seed)
+    weighted2 = _build_weighted(study, cohorts2, measurements2, horizons, study_cfg.seed)
+    rows2 = study.concat_frames([weighted2.read(key) for key in weighted2.keys()])
+    _assert_horizons_observed(study, rows2, horizons)
+    observed = _observed_by_horizon(study, rows2, horizons)
+    if not all(observed.get(int(h), 0) > 0 for h in horizons):
+        raise AssertionError(f"source re-extraction did not populate all horizons: {observed}")
+    print(f"SELF-TEST (reconstruction): fail-loud on absent 3/6-month HbA1c OK; "
+          f"source re-extraction populated horizons {observed}", flush=True)
+
+
 def run_self_test(study: Any, cfg: Config) -> int:
+    _self_test_reconstruction(study)
     with tempfile.TemporaryDirectory(prefix="shared-hba1c-selftest-") as directory:
         temp = Path(directory)
         test_cfg = replace(
             cfg,
             source_run=temp / "source",
             output_dir=temp / "output",
-            horizons=(12, 24),
+            horizons=(3, 6, 12),
             iterations=80,
             max_training_rows=5000,
             domain_training_rows=5000,
@@ -1781,7 +1941,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scripts-dir", help="Directory containing the study script")
     parser.add_argument("--horizons", default=",".join(map(str, DEFAULT_HORIZONS)),
                         help="Comma-separated HbA1c horizons (default 3,6,12); horizons the source run "
-                             "did not pre-build are reconstructed from its retained measurements")
+                             "did not pre-build (e.g. 3, 6) are re-extracted from source by re-running "
+                             "the study's own acquire, and fail loudly if the source lacks them")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help="Calibrated P(HbA1c < threshold); default 7.0")
     parser.add_argument("--seed", type=int, default=None, help="Default: source run seed")
