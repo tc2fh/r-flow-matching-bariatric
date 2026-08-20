@@ -1185,6 +1185,51 @@ def heldout_profiles(study: Any, weighted_rows: Any, selection_month: int) -> An
     return study.pd.concat(pieces, ignore_index=True).drop_duplicates(["patient_id", "cohort"]).reset_index(drop=True)
 
 
+def observed_factual_trajectories(study: Any, weighted_rows: Any, selected: Any,
+                                  horizons: Sequence[int]) -> Any:
+    """Observed held-out factual BMI for the selected profiles at each forecast horizon.
+
+    Returns one row per (profile, observed horizon) carrying the realized BMI, for overlay on the
+    factual-arm scenario curve. Only genuinely observed held-out rows are emitted; switched
+    (counterfactual) arms have no observed value by construction.
+    """
+    columns = ["profile_label", "patient_id", "cohort", "target_month", "observed_value"]
+    if selected is None or not len(selected):
+        return study.pd.DataFrame(columns=columns)
+    label_by_key = {(str(patient), str(cohort)): str(label) for patient, cohort, label in
+                    zip(selected["patient_id"], selected["cohort"], selected["profile_label"])}
+    months = [int(h) for h in horizons]
+    pieces = []
+    for key in (("surgery", "bmi", 0), ("incretin", "bmi", 0)):
+        if key not in weighted_rows.keys():
+            continue
+        frame = weighted_rows.read(key)
+        frame = frame.loc[
+            frame["split"].astype(str).isin(HELD_OUT)
+            & study.pd.to_numeric(frame["target_month"], errors="coerce").isin(months)
+            & frame["target_observed"].fillna(False).astype(bool)
+        ].copy()
+        if frame.empty:
+            continue
+        kept = [pair in label_by_key
+                for pair in zip(frame["patient_id"].astype(str), frame["cohort"].astype(str))]
+        frame = frame.loc[kept].copy()
+        if frame.empty:
+            continue
+        frame["profile_label"] = [label_by_key[pair] for pair
+                                  in zip(frame["patient_id"].astype(str), frame["cohort"].astype(str))]
+        frame["observed_value"] = study.pd.to_numeric(frame["target_value"], errors="coerce")
+        frame["target_month"] = study.pd.to_numeric(frame["target_month"], errors="coerce").astype(int)
+        pieces.append(frame[columns])
+    if not pieces:
+        return study.pd.DataFrame(columns=columns)
+    return (study.pd.concat(pieces, ignore_index=True)
+            .dropna(subset=["observed_value"])
+            .drop_duplicates(["profile_label", "target_month"])
+            .sort_values(["profile_label", "target_month"])
+            .reset_index(drop=True))
+
+
 def stable_token(value: str, seed: int) -> str:
     return hashlib.sha256(f"{seed}|{value}".encode()).hexdigest()
 
@@ -1517,7 +1562,8 @@ def render_public_architecture_book(study: Any, out: Path, validation: Any, summ
 
 
 def render_internal_scenario_book(study: Any, out: Path, selected: Any, scenarios: Any,
-                                  medians: Mapping[str, float], gate_passed: bool) -> list[Path]:
+                                  observed_trajectories: Any, medians: Mapping[str, float],
+                                  gate_passed: bool) -> list[Path]:
     from matplotlib.backends.backend_pdf import PdfPages
     out.mkdir(parents=True, exist_ok=True)
     pages = []
@@ -1576,6 +1622,14 @@ def render_internal_scenario_book(study: Any, out: Path, selected: Any, scenario
                 low = study.np.r_[baseline, rows["q10"].to_numpy(float)]
                 high = study.np.r_[baseline, rows["q90"].to_numpy(float)]
                 axis.fill_between(x, low, high, color=colors[scenario_arm], alpha=.18 if factual else .06)
+            observed = (observed_trajectories.loc[observed_trajectories["profile_label"].eq(profile.profile_label)]
+                        .sort_values("target_month")
+                        if observed_trajectories is not None and len(observed_trajectories) else None)
+            if observed is not None and len(observed):
+                axis.scatter(observed["target_month"].to_numpy(float),
+                             observed["observed_value"].to_numpy(float),
+                             marker="X", s=62, color=colors[observed_arm], edgecolor="black",
+                             linewidths=.7, zorder=6, label="observed BMI (factual)")
             domain = patient_rows.groupby("scenario_arm")["domain_score"].first().to_dict()
             axis.set_title(
                 f"{profile.profile_label}: baseline {baseline:.2f}; target {profile.bmi_match_target:.2f}; "
@@ -1584,10 +1638,11 @@ def render_internal_scenario_book(study: Any, out: Path, selected: Any, scenario
                 loc="left", fontsize=8)
             axis.set_ylabel("BMI")
         axes[-1, 0].set_xlabel("Months from factual index")
-        axes[0, 0].legend(frameon=False, ncol=3, fontsize=7)
+        axes[0, 0].legend(frameon=False, ncol=4, fontsize=6.6)
         figure.text(.05, .02,
-                    "Solid band: factual-arm calibrated forecast. Dashed switched bands: receiving-arm-adjusted "
-                    "model-based scenario intervals; transported coverage is not established. "
+                    "Lines/bands: factual-arm calibrated forecast (solid) and receiving-arm-adjusted switched "
+                    "scenario projections (dashed); transported coverage is not established. Black-edged X markers "
+                    "are the patient's observed held-out BMI on the factual arm. "
                     f"Shared validation gate={'PASS' if gate_passed else 'NOT PASSED'}.", fontsize=7)
         figure.tight_layout(rect=[0, .04, 1, .94])
         pages.append((f"{page_number:02d}_scenario_profiles_{observed_arm}.png", figure))
@@ -1611,6 +1666,7 @@ def worker_scenarios(args: argparse.Namespace, study: Any) -> int:
     profiles = heldout_profiles(study, weighted_rows, min(horizons))
     selected, medians = select_bmi_matched_profiles(
         study, profiles, args.patients_per_arm, args.bmi_match_caliper, args.seed)
+    observed_trajectories = observed_factual_trajectories(study, weighted_rows, selected, horizons)
 
     scores = domain_scores(study, deployment["domain_model"], selected)
     for index, arm in enumerate(ARMS):
@@ -1695,6 +1751,7 @@ def worker_scenarios(args: argparse.Namespace, study: Any) -> int:
     study.atomic_pickle(internal / "patient_scenario_projections.pkl", scenarios)
     scenarios.to_csv(internal / "patient_scenario_projections.csv", index=False)
     selected.to_csv(internal / "bmi_matching_audit.csv", index=False)
+    observed_trajectories.to_csv(internal / "observed_factual_trajectories.csv", index=False)
     bmi35_metrics.to_csv(internal / "bmi35_heldout_probability_metrics_unsuppressed.csv", index=False)
     study.atomic_json(internal / "manifest.json", {
         "created_utc": study.utc_now(), "selection": "BMI-only nearest profiles",
@@ -1746,7 +1803,7 @@ def worker_scenarios(args: argparse.Namespace, study: Any) -> int:
                                     public_heldout, matching_reference,
                                     public_bmi35_metrics, bmi35_curves,
                                     deployment["selected_candidate"], deployment["selection_gate_passed"])
-    render_internal_scenario_book(study, figures, selected, scenarios, medians,
+    render_internal_scenario_book(study, figures, selected, scenarios, observed_trajectories, medians,
                                   deployment["selection_gate_passed"])
     return 0
 

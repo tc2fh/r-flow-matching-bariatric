@@ -1,0 +1,35 @@
+[project]
+name = "qreg-metabolic-scripts"
+version = "0.0.0"
+description = "Local uv environment for developing and testing the qreg_improvement metabolic-trajectory study scripts, so no external (pixi) interpreter is needed."
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    # Core stack required by every study script (see REQUIRED_DISTRIBUTIONS in the scripts).
+    # numpy/pandas are capped below the 2.3/3.0 majors: pandas 3.0 Copy-on-Write makes the
+    # scripts' in-place quantile-matrix mutation (apply_conformal) fail with "assignment
+    # destination is read-only". Pin to the 2.x line the scripts were written against.
+    "numpy>=1.26,<2.3",
+    "pandas>=2.0,<2.3",
+    "scipy>=1.9",
+    "scikit-learn>=1.2",
+    "matplotlib>=3.6",
+    "catboost>=1.2",
+    # Parquet store path (the study falls back to pickle when pyarrow is absent).
+    "pyarrow>=14",
+    # Neural candidates and run_metabolic_trajectory_study.py --self-test hard-require torch;
+    # the shared/CatBoost scripts do not, but this makes the env able to test every script here.
+    "torch>=2.2",
+]
+
+# This repo is a collection of scripts, not an installable package: don't try to build it.
+[tool.uv]
+package = false
+
+# Pull torch from the CPU-only wheel index so no CUDA download is attempted.
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
