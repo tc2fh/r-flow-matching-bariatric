@@ -53,7 +53,7 @@ ARMS = ("sleeve", "rygb", "incretin")
 HELD_OUT = ("temporal_test", "geographic_test")
 DEVELOPMENT = ("train", "validation", "calibration")
 OUTCOME = "hba1c"
-DEFAULT_HORIZONS = (3, 6, 12)
+DEFAULT_HORIZONS = (12, 24, 36)
 DEFAULT_THRESHOLD = 7.0
 MODEL_VERSION = "shared-hba1c-catboost-1.0.0"
 MODEL_CANDIDATE = "shared_hba1c_catboost"
@@ -1874,7 +1874,7 @@ def run_self_test(study: Any, cfg: Config) -> int:
             cfg,
             source_run=temp / "source",
             output_dir=temp / "output",
-            horizons=(3, 6, 12),
+            horizons=DEFAULT_HORIZONS,
             iterations=80,
             max_training_rows=5000,
             domain_training_rows=5000,
@@ -1940,9 +1940,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--study-script", help="Path to run_metabolic_trajectory_study.py")
     parser.add_argument("--scripts-dir", help="Directory containing the study script")
     parser.add_argument("--horizons", default=",".join(map(str, DEFAULT_HORIZONS)),
-                        help="Comma-separated HbA1c horizons (default 3,6,12); horizons the source run "
-                             "did not pre-build (e.g. 3, 6) are re-extracted from source by re-running "
-                             "the study's own acquire, and fail loudly if the source lacks them")
+                        help="Comma-separated HbA1c horizons (default 12,24,36; HbA1c is measured at "
+                             "12/24/36/48/60 months). Horizons the source run did not pre-build (e.g. 3, "
+                             "6) are re-extracted from source by re-running the study's own acquire, and "
+                             "fail loudly if the source lacks them")
     parser.add_argument("--threshold", type=float, default=DEFAULT_THRESHOLD,
                         help="Calibrated P(HbA1c < threshold); default 7.0")
     parser.add_argument("--seed", type=int, default=None, help="Default: source run seed")
