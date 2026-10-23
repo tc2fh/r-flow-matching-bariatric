@@ -6,7 +6,7 @@ therapy cohorts.
 Run on the Cosmos VM after the study has finished (one command, no arguments needed):
 
     python qreg_improvement/run_table1.py
-    python qreg_improvement/run_table1.py --bundle "Z:\\Project D33AFD\\results\\<run>\\final_study_bundle.zip"
+    python qreg_improvement/run_table1.py --bundle "Z:\\Project D332AFD\\results\\<run>\\final_study_bundle.zip"
     python qreg_improvement/run_table1.py --self-test            # deterministic checks, ~30 s
     python qreg_improvement/run_table1.py --render-from-csv table1_cohort_characteristics.csv
 
@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import ast
 import csv
+import difflib
 import gc
 import hashlib
 import importlib.util
@@ -72,9 +73,9 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.patches import Rectangle  # noqa: E402
 
-THIS_FILE = Path(__file__).resolve()
+THIS_FILE = Path(os.path.abspath(__file__))  # not resolve(); see absolute_path()
 STUDY_SCRIPT = "run_metabolic_trajectory_study.py"
-DEFAULT_BUNDLE = r"Z:\Project D33AFD\results\shared_three_arm_scenario_20260813_101808\final_study_bundle.zip"
+DEFAULT_BUNDLE = r"Z:\Project D332AFD\results\shared_three_arm_scenario_20260813_101808\final_study_bundle.zip"
 TABLE_STEM = "table1_cohort_characteristics"
 BUNDLE_FOLDER = "table1"
 # run_final_study.py pins every bundle member's mtime to this so identical bundles stay identical.
@@ -1978,6 +1979,20 @@ def run_self_tests() -> int:
         check("11_frozen_loader_verifies_inputs", loaded_ok and short_rejected and tamper_rejected,
               f"loaded={loaded_ok}; row-count mismatch rejected={short_rejected}; hash mismatch rejected={tamper_rejected}")
 
+        # 15 A mistyped bundle path names the missing folder, its near misses, and the bundles
+        #    that do exist, so the error says what to pass instead.
+        drive = workspace / "drive"
+        real = drive / "Project D332AFD" / "results" / "shared_run" / "final_study_bundle.zip"
+        real.parent.mkdir(parents=True)
+        real.write_bytes(b"zip")
+        (drive / "Project D33EAB5").mkdir()
+        (drive / "Unrelated").mkdir()
+        hints = missing_bundle_hints(drive / "Project D33AFD" / "results" / "shared_run" / real.name, ())
+        named = bool(hints) and "'Project D33AFD'" in hints[0] and "'Project D332AFD'" in hints[0] \
+            and "Unrelated" not in hints[0]
+        check("15_missing_bundle_hints", named and f"  {real}" in hints and absolute_path("x").is_absolute(),
+              " / ".join(hints))
+
     # 09 The constants mirrored from the study still match it (skipped where it is not present).
     study_path = THIS_FILE.parent / STUDY_SCRIPT
     if study_path.is_file():
@@ -2005,7 +2020,7 @@ def run_self_tests() -> int:
             imported.extend(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.append(node.module)
-    allowed = {"__future__", "argparse", "ast", "csv", "gc", "hashlib", "importlib", "io", "itertools", "json",
+    allowed = {"__future__", "argparse", "ast", "csv", "difflib", "gc", "hashlib", "importlib", "io", "itertools", "json",
                "math", "os", "pickle", "re", "shutil", "sys", "tempfile", "textwrap", "time", "zipfile",
                "collections", "dataclasses", "datetime", "pathlib", "typing", "numpy", "pandas", "matplotlib",
                "pyarrow", "scipy"}
@@ -2025,6 +2040,41 @@ def run_self_tests() -> int:
 # ======================================================================================
 # 10. CLI
 # ======================================================================================
+
+
+def absolute_path(text: str | os.PathLike) -> Path:
+    """An absolute path that keeps the drive letter as typed. Path.resolve() would rewrite a mapped
+    network drive (Z:) to its share (\\\\server\\share\\...), so messages would stop matching the
+    paths the user sees in Explorer and in their prompt."""
+    return Path(os.path.abspath(os.path.expanduser(text)))
+
+
+def missing_bundle_hints(bundle: Path, search_roots: Sequence[Path]) -> list[str]:
+    """Why a bundle path does not exist: the first missing folder on it, the closest existing
+    names, and the bundles of that name that do exist nearby (one level below the deepest
+    existing folder, the search roots, and their results folders)."""
+    existing = bundle.parent
+    while not existing.is_dir() and existing.parent != existing:
+        existing = existing.parent
+    if not existing.is_dir():
+        return [f"{existing} is not reachable; is the drive mapped on this machine?"]
+    parts = bundle.relative_to(existing).parts
+    found: set[Path] = set()
+    try:
+        close = difflib.get_close_matches(parts[0], [child.name for child in existing.iterdir()], n=3, cutoff=0.8)
+        found.update(existing.joinpath(name, *parts[1:]) for name in close)
+        for root in (existing, *search_roots):
+            for folder in (root, root / "results"):
+                found.update(folder.glob(f"*/{bundle.name}"))
+    except OSError:
+        close = []
+    hints = [f"{existing} has no {parts[0]!r}" + ("; closest: " + ", ".join(map(repr, close)) if close else "")]
+    found = {path for path in found if path.is_file()}
+    if found:
+        hints.append(f"{bundle.name} files that do exist:")
+        hints += [f"  {path}" for path in sorted(found)[:10]]
+        hints.append('re-run with --bundle "<one of these paths>"')
+    return hints
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2055,15 +2105,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.self_test:
         return run_self_tests()
     if args.render_from_csv:
-        source = Path(args.render_from_csv).expanduser().resolve()
+        source = absolute_path(args.render_from_csv)
         destination = source.with_suffix(".png")
         render_table_png(read_table_csv(source), destination)
         log(f"rendered {destination}")
         return 0
 
-    bundle = Path(args.bundle).expanduser().resolve()
+    bundle = absolute_path(args.bundle)
     if not bundle.is_file():
         log(f"ERROR: bundle not found: {bundle}")
+        for hint in missing_bundle_hints(bundle, (THIS_FILE.parent.parent, Path.cwd())):
+            log(f"  {hint}")
         return 2
     try:
         with zipfile.ZipFile(bundle) as archive:
@@ -2071,12 +2123,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     except zipfile.BadZipFile as error:
         log(f"ERROR: {bundle} is not a readable zip archive ({error})")
         return 2
-    run_dir = Path(args.run_dir).expanduser().resolve() if args.run_dir else bundle.parent
-    output_dir = Path(args.output_dir).expanduser().resolve() if args.output_dir else run_dir / BUNDLE_FOLDER
+    run_dir = absolute_path(args.run_dir) if args.run_dir else bundle.parent
+    output_dir = absolute_path(args.output_dir) if args.output_dir else run_dir / BUNDLE_FOLDER
     work_dir = output_dir / "_cosmos_work"
     log(f"run directory: {run_dir}")
     try:
-        data = load_study_data(run_dir, args.source, Path(args.scripts_dir).expanduser().resolve(), work_dir)
+        data = load_study_data(run_dir, args.source, absolute_path(args.scripts_dir), work_dir)
         generated = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         model, warnings = build_table(data, generated)
     except (SourceUnavailable, DisclosureError, RuntimeError, ValueError) as error:
